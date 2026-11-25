@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VortexDL</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="header">
+    <div class="brand">
+      <span class="logo-dot"></span>
+      <strong>VORTEX DL</strong>
+    </div>
+    <span id="statusBadge" class="badge offline">Offline</span>
+  </header>
+
+  <section class="card">
+    <label class="toggle-row">
+      <span>Interceptar downloads automaticamente</span>
+      <input type="checkbox" id="interceptToggle" />
+    </label>
+  </section>
+
+  <section class="card actions">
+    <button id="btnDownloadPageVideo" class="btn primary">Baixar Vídeo desta Página (yt-dlp)</button>
+    <button id="btnGrabAllLinks" class="btn secondary">Enviar Links da Página ao LinkGrabber</button>
+  </section>
+
+  <section class="card">
+    <div class="section-title">
+      <span>Mídias / Streams Detectados nesta Aba</span>
+      <span id="mediaCount" class="count-pill">0</span>
+    </div>
+    <div id="mediaList" class="media-list">
+      <p class="empty">Reproduza um vídeo ou recarregue a aba para capturar streams (.m3u8, .mp4, .mpd).</p>
+    </div>
+  </section>
+
+  <footer id="feedback" class="feedback"></footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -69,6 +69,7 @@ pub fn apply_theme(ctx: &egui::Context, theme: &ThemeConfig) {
 
     let mut style = Style::default();
     style.visuals = visuals;
+    style.interaction.selectable_labels = false;
     let s = theme.font_scale.clamp(0.8, 1.4);
     style.text_styles = [
         (TextStyle::Small, FontId::proportional(11.5 * s)),

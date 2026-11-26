@@ -305,124 +305,182 @@ impl VortexApp {
                 Frame::new()
                     .fill(to_c32(theme.bg_secondary))
                     .stroke(Stroke::new(1.0, to_c32(theme.border)))
-                    .inner_margin(Margin::symmetric(16, 10)),
+                    .inner_margin(Margin::symmetric(14, 9)),
             )
             .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new("VORTEX DL")
+                let avail_w = ui.available_width();
+                let scale = theme.font_scale.clamp(0.8, 1.4);
+                let single_row_needed = 1090.0 * scale;
+
+                if avail_w >= single_row_needed {
+                    ui.horizontal(|ui| {
+                        self.render_top_bar_left(ui, theme);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            self.render_top_bar_right(ui, snap, theme, true);
+                        });
+                    });
+                } else {
+                    ui.vertical(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            self.render_top_bar_left(ui, theme);
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            self.render_top_bar_right(ui, snap, theme, false);
+                        });
+                    });
+                }
+            });
+    }
+
+    fn render_top_bar_left(&mut self, ui: &mut egui::Ui, theme: &ThemeConfig) {
+        ui.label(
+            RichText::new("VORTEX DL")
+                .strong()
+                .size(16.5)
+                .color(to_c32(theme.accent)),
+        );
+        ui.add_space(8.0);
+
+        if accent_button(ui, "+ Novo Download", theme).clicked() {
+            self.show_new_http_modal = true;
+        }
+        if ui
+            .button("LinkGrabber")
+            .on_hover_text("LinkGrabber (Multi-Parte)")
+            .clicked()
+        {
+            self.active_tab = NavTab::LinkGrabber;
+        }
+        if ui
+            .button("Mídia")
+            .on_hover_text("Vídeos & Mídias")
+            .clicked()
+        {
+            self.active_tab = NavTab::Media;
+        }
+        if ui
+            .button("+ Torrent")
+            .on_hover_text("Adicionar Torrent ou Magnet")
+            .clicked()
+        {
+            self.show_new_torrent_modal = true;
+        }
+
+        ui.separator();
+        if ui
+            .button("Pausar")
+            .on_hover_text("Pausar todos os downloads")
+            .clicked()
+        {
+            self.manager.pause_all();
+        }
+        if ui
+            .button("Retomar")
+            .on_hover_text("Retomar todos os downloads")
+            .clicked()
+        {
+            self.manager.resume_all();
+        }
+    }
+
+    fn render_top_bar_right(
+        &mut self,
+        ui: &mut egui::Ui,
+        snap: &ManagerSnapshot,
+        theme: &ThemeConfig,
+        rtl: bool,
+    ) {
+        let draw_theme_combo = |ui: &mut egui::Ui, manager: &Arc<DownloadManager>| {
+            let current_theme_name = theme.name.clone();
+            egui::ComboBox::from_id_salt("quick_theme")
+                .selected_text(format!("Tema: {current_theme_name}"))
+                .width(148.0)
+                .show_ui(ui, |ui| {
+                    for preset in ThemeConfig::presets() {
+                        if ui
+                            .selectable_label(preset.preset_id == theme.preset_id, &preset.name)
+                            .clicked()
+                        {
+                            manager.settings.write().theme = preset;
+                            let _ = manager.save_current_settings();
+                        }
+                    }
+                    let custom = manager.settings.read().custom_themes.clone();
+                    for ct in custom {
+                        if ui
+                            .selectable_label(ct.name == theme.name, format!("* {}", ct.name))
+                            .clicked()
+                        {
+                            manager.settings.write().theme = ct;
+                            let _ = manager.save_current_settings();
+                        }
+                    }
+                });
+        };
+
+        let draw_limit_combo = |ui: &mut egui::Ui, manager: &Arc<DownloadManager>| {
+            let mut limit_kbps = manager.settings.read().speed_limit_kbps;
+            let limit_label = if limit_kbps == 0 {
+                "Limite: Ilimitado".to_string()
+            } else {
+                format!("Limite: {} KB/s", limit_kbps)
+            };
+            egui::ComboBox::from_id_salt("quick_limit")
+                .selected_text(limit_label)
+                .width(128.0)
+                .show_ui(ui, |ui| {
+                    for (lbl, val) in [
+                        ("Ilimitado", 0u64),
+                        ("512 KB/s", 512),
+                        ("2 MB/s", 2048),
+                        ("5 MB/s", 5120),
+                        ("10 MB/s", 10240),
+                        ("25 MB/s", 25600),
+                    ] {
+                        if ui.selectable_value(&mut limit_kbps, val, lbl).clicked() {
+                            manager.settings.write().speed_limit_kbps = limit_kbps;
+                            let _ = manager.save_current_settings();
+                        }
+                    }
+                });
+        };
+
+        let draw_speed_pill = |ui: &mut egui::Ui| {
+            Frame::new()
+                .fill(to_c32(theme.bg_card))
+                .stroke(Stroke::new(1.0, to_c32(theme.border)))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(10, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "DL {}",
+                                format_speed(snap.total_download_bps)
+                            ))
                             .strong()
-                            .size(17.0)
+                            .color(to_c32(theme.success)),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "UL {}",
+                                format_speed(snap.total_upload_bps)
+                            ))
                             .color(to_c32(theme.accent)),
-                    );
-                    ui.add_space(10.0);
-
-                    if accent_button(ui, "+ Novo Download", theme).clicked() {
-                        self.show_new_http_modal = true;
-                    }
-                    if ui.button("LinkGrabber (Multi-Parte)").clicked() {
-                        self.active_tab = NavTab::LinkGrabber;
-                    }
-                    if ui.button("Mídia / Vídeo").clicked() {
-                        self.active_tab = NavTab::Media;
-                    }
-                    if ui.button("+ Torrent / Magnet").clicked() {
-                        self.show_new_torrent_modal = true;
-                    }
-
-                    ui.separator();
-                    if ui.button("Pausar Tudo").clicked() {
-                        self.manager.pause_all();
-                    }
-                    if ui.button("Retomar Tudo").clicked() {
-                        self.manager.resume_all();
-                    }
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // Theme quick switcher
-                        let current_theme_name = theme.name.clone();
-                        egui::ComboBox::from_id_salt("quick_theme")
-                            .selected_text(format!("Tema: {current_theme_name}"))
-                            .width(150.0)
-                            .show_ui(ui, |ui| {
-                                for preset in ThemeConfig::presets() {
-                                    if ui
-                                        .selectable_label(
-                                            preset.preset_id == theme.preset_id,
-                                            &preset.name,
-                                        )
-                                        .clicked()
-                                    {
-                                        self.manager.settings.write().theme = preset;
-                                        let _ = self.manager.save_current_settings();
-                                    }
-                                }
-                                let custom = self.manager.settings.read().custom_themes.clone();
-                                for ct in custom {
-                                    if ui
-                                        .selectable_label(ct.name == theme.name, format!("* {}", ct.name))
-                                        .clicked()
-                                    {
-                                        self.manager.settings.write().theme = ct;
-                                        let _ = self.manager.save_current_settings();
-                                    }
-                                }
-                            });
-
-                        // Speed limit quick pill
-                        let mut limit_kbps = self.manager.settings.read().speed_limit_kbps;
-                        let limit_label = if limit_kbps == 0 {
-                            "Limite: Ilimitado".to_string()
-                        } else {
-                            format!("Limite: {} KB/s", limit_kbps)
-                        };
-                        egui::ComboBox::from_id_salt("quick_limit")
-                            .selected_text(limit_label)
-                            .width(135.0)
-                            .show_ui(ui, |ui| {
-                                for (lbl, val) in [
-                                    ("Ilimitado", 0u64),
-                                    ("512 KB/s", 512),
-                                    ("2 MB/s", 2048),
-                                    ("5 MB/s", 5120),
-                                    ("10 MB/s", 10240),
-                                    ("25 MB/s", 25600),
-                                ] {
-                                    if ui.selectable_value(&mut limit_kbps, val, lbl).clicked() {
-                                        self.manager.settings.write().speed_limit_kbps = limit_kbps;
-                                        let _ = self.manager.save_current_settings();
-                                    }
-                                }
-                            });
-
-                        // Live throughput pill
-                        Frame::new()
-                            .fill(to_c32(theme.bg_card))
-                            .stroke(Stroke::new(1.0, to_c32(theme.border)))
-                            .corner_radius(CornerRadius::same(8))
-                            .inner_margin(Margin::symmetric(10, 4))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "DL {}",
-                                            format_speed(snap.total_download_bps)
-                                        ))
-                                        .strong()
-                                        .color(to_c32(theme.success)),
-                                    );
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "UL {}",
-                                            format_speed(snap.total_upload_bps)
-                                        ))
-                                        .color(to_c32(theme.accent)),
-                                    );
-                                });
-                            });
+                        );
                     });
                 });
-            });
+        };
+
+        if rtl {
+            draw_theme_combo(ui, &self.manager);
+            draw_limit_combo(ui, &self.manager);
+            draw_speed_pill(ui);
+        } else {
+            draw_speed_pill(ui);
+            draw_limit_combo(ui, &self.manager);
+            draw_theme_combo(ui, &self.manager);
+        }
     }
 
     fn render_sidebar(&mut self, ui: &mut egui::Ui, snap: &ManagerSnapshot, theme: &ThemeConfig) {
@@ -2038,9 +2096,13 @@ fn nav_item(
     theme: &ThemeConfig,
 ) {
     let selected = *current == tab;
+    let id = ui.make_persistent_id(("nav_item", label));
+    let hovered = ui.ctx().read_response(id).is_some_and(|r| r.hovered());
     let fill = if selected {
         let a = to_c32(theme.accent);
         Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 42)
+    } else if hovered {
+        to_c32(theme.bg_hover)
     } else {
         Color32::TRANSPARENT
     };
@@ -2050,14 +2112,17 @@ fn nav_item(
         to_c32(theme.text_primary)
     };
 
-    let resp = Frame::new()
+    let inner = Frame::new()
         .fill(fill)
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(10, 7))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new(label).color(text_color).strong());
+                ui.add(
+                    egui::Label::new(RichText::new(label).color(text_color).strong())
+                        .selectable(false),
+                );
                 if let Some(count) = badge.filter(|&c| c > 0) {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         Frame::new()
@@ -2065,14 +2130,23 @@ fn nav_item(
                             .corner_radius(CornerRadius::same(10))
                             .inner_margin(Margin::symmetric(6, 1))
                             .show(ui, |ui| {
-                                ui.label(RichText::new(count.to_string()).small().color(to_c32(theme.text_muted)));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(count.to_string())
+                                            .small()
+                                            .color(to_c32(theme.text_muted)),
+                                    )
+                                    .selectable(false),
+                                );
                             });
                     });
                 }
             });
-        })
-        .response
-        .interact(Sense::click());
+        });
+
+    let resp = ui
+        .interact(inner.response.rect, id, Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
 
     if resp.clicked() {
         *current = tab;

@@ -41,12 +41,12 @@ async function sendToVortex(endpoint, payload) {
   return new Promise((resolve) => {
     try {
       const action =
-        endpoint === "/api/download"
+        endpoint === "/api/downloads"
           ? "download"
           : endpoint === "/api/media"
           ? "media"
-          : endpoint === "/api/grab/batch"
-          ? "grab_batch"
+          : endpoint === "/api/grab"
+          ? "grab"
           : "ping";
       chrome.runtime.sendNativeMessage(NATIVE_HOST, { action, payload }, (res) => {
         if (chrome.runtime.lastError) {
@@ -182,35 +182,55 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   }
 });
 
-// Intercept browser downloads and hand off to VortexDL
-chrome.downloads.onCreated.addListener(async (item) => {
-  const url = item.finalUrl || item.url;
-  if (!url || !url.startsWith("http")) return;
-  if (bypassUrls.has(url)) {
-    bypassUrls.delete(url);
-    return;
-  }
+function extractDownloadFilename(item) {
+  return (item.filename || "").split(/[/\\]/).pop() || "";
+}
 
-  const settings = await getSettings();
-  if (!settings.interceptDownloads) return;
-
-  const lowerUrl = url.toLowerCase().split("?")[0];
-  const filename = (item.filename || "").split(/[/\\]/).pop() || "";
+function shouldInterceptDownload(item, settings) {
+  const url = item.finalUrl || item.url || "";
+  const filename = extractDownloadFilename(item);
   const extFromName = filename.includes(".") ? filename.split(".").pop().toLowerCase() : "";
-  const extFromUrl = lowerUrl.includes(".") ? lowerUrl.split(".").pop() : "";
+  const urlPath = url.toLowerCase().split("?")[0].split("#")[0];
+  const lastSeg = urlPath.split("/").pop() || "";
+  const extFromUrl = lastSeg.includes(".") ? lastSeg.split(".").pop() : "";
   const ext = extFromName || extFromUrl;
 
-  const matchesExt = settings.interceptExtensions.includes(ext) || /^r\d{2}$/.test(ext) || /^\d{3}$/.test(ext);
+  const ignoredWebExts = ["html", "htm", "css", "js", "mjs", "json", "xml", "svg", "txt"];
+  if (ext && ignoredWebExts.includes(ext)) {
+    return false;
+  }
+
+  const matchesExt =
+    Boolean(ext) &&
+    (settings.interceptExtensions.includes(ext) || /^r\d{2}$/.test(ext) || /^\d{3}$/.test(ext));
+
+  const mime = (item.mime || "").toLowerCase();
+  const matchesMime =
+    mime.startsWith("video/") ||
+    mime.startsWith("audio/") ||
+    mime.includes("zip") ||
+    mime.includes("rar") ||
+    mime.includes("7z") ||
+    mime.includes("tar") ||
+    mime.includes("gzip") ||
+    mime.includes("x-bzip2") ||
+    mime.includes("x-xz") ||
+    mime.includes("x-msdownload") ||
+    mime.includes("x-msi") ||
+    mime.includes("iso9660") ||
+    mime.includes("bittorrent") ||
+    mime.includes("android.package-archive") ||
+    mime === "application/octet-stream" ||
+    mime === "application/pdf" ||
+    mime === "application/epub+zip";
+
   const largeEnough = item.fileSize > 0 && item.fileSize >= settings.minSizeBytes;
-  if (!matchesExt && !largeEnough) return;
+  return matchesExt || matchesMime || largeEnough;
+}
 
-  // Cancel native browser download and pass to VortexDL with cookies & referer
-  try {
-    await chrome.downloads.cancel(item.id);
-    await chrome.downloads.erase({ id: item.id });
-  } catch (_) {}
-
-  const headers = { ...(recentHeaders.get(url) || {}) };
+async function buildDownloadHeaders(item, url) {
+  const cached = recentHeaders.get(item.finalUrl) || recentHeaders.get(item.url) || recentHeaders.get(url) || {};
+  const headers = { ...cached };
   if (item.referrer && !headers.Referer) {
     headers.Referer = item.referrer;
   }
@@ -218,20 +238,94 @@ chrome.downloads.onCreated.addListener(async (item) => {
   if (cookieStr && !headers.Cookie) {
     headers.Cookie = cookieStr;
   }
+  return headers;
+}
 
-  const res = await sendToVortex("/api/download", {
-    url,
-    filename: filename || null,
-    headers,
-    start_immediately: true,
+if (chrome.downloads.onDeterminingFilename) {
+  // Prefer onDeterminingFilename on Chromium so Content-Disposition filename, MIME, finalUrl, and fileSize are known
+  chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+    const url = item.finalUrl || item.url;
+    if (!url || !url.startsWith("http") || item.byExtensionId) {
+      suggest();
+      return false;
+    }
+
+    (async () => {
+      try {
+        if (bypassUrls.has(url)) {
+          bypassUrls.delete(url);
+          suggest();
+          return;
+        }
+
+        const settings = await getSettings();
+        if (!settings.interceptDownloads || !shouldInterceptDownload(item, settings)) {
+          suggest();
+          return;
+        }
+
+        const filename = extractDownloadFilename(item);
+        const headers = await buildDownloadHeaders(item, url);
+        const res = await sendToVortex("/api/downloads", {
+          url,
+          filename: filename || null,
+          headers,
+          start_immediately: true,
+        });
+
+        if (res && res.ok !== false) {
+          try {
+            await chrome.downloads.cancel(item.id);
+          } catch (_) {}
+          try {
+            await chrome.downloads.erase({ id: item.id });
+          } catch (_) {}
+        } else {
+          bypassUrls.add(url);
+          suggest();
+        }
+      } catch (_) {
+        try {
+          suggest();
+        } catch (_) {}
+      }
+    })();
+
+    return true;
   });
+} else {
+  // Fallback for browsers without onDeterminingFilename (e.g. Firefox)
+  chrome.downloads.onCreated.addListener(async (item) => {
+    const url = item.finalUrl || item.url;
+    if (!url || !url.startsWith("http") || item.byExtensionId) return;
+    if (bypassUrls.has(url)) {
+      bypassUrls.delete(url);
+      return;
+    }
 
-  if (!res || res.ok === false) {
-    // If VortexDL wasn't reachable, fall back cleanly so the user doesn't lose the download
-    bypassUrls.add(url);
-    chrome.downloads.download({ url });
-  }
-});
+    const settings = await getSettings();
+    if (!settings.interceptDownloads || !shouldInterceptDownload(item, settings)) return;
+
+    try {
+      await chrome.downloads.cancel(item.id);
+      await chrome.downloads.erase({ id: item.id });
+    } catch (_) {}
+
+    const filename = extractDownloadFilename(item);
+    const headers = await buildDownloadHeaders(item, url);
+    const res = await sendToVortex("/api/downloads", {
+      url,
+      filename: filename || null,
+      headers,
+      start_immediately: true,
+    });
+
+    if (!res || res.ok === false) {
+      bypassUrls.add(url);
+      chrome.downloads.download({ url });
+    }
+  });
+}
 
 // Context menus
 chrome.runtime.onInstalled.addListener(() => {
@@ -260,7 +354,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     const headers = {};
     if (info.pageUrl) headers.Referer = info.pageUrl;
     if (cookie) headers.Cookie = cookie;
-    await sendToVortex("/api/download", { url: targetUrl, headers, start_immediately: true });
+    await sendToVortex("/api/downloads", { url: targetUrl, headers, start_immediately: true });
   } else if (info.menuItemId === "vortex-download-media") {
     const targetUrl = info.linkUrl || info.srcUrl || info.pageUrl;
     if (!targetUrl) return;
@@ -282,7 +376,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         const headers = {};
         if (tab.url) headers.Referer = tab.url;
         if (cookie) headers.Cookie = cookie;
-        await sendToVortex("/api/grab/batch", { urls: res.urls, headers });
+        await sendToVortex("/api/grab", { urls: res.urls, headers });
       }
     });
   }
@@ -298,7 +392,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const cookie = await collectCookiesHeader(msg.url);
       const headers = { ...(msg.headers || {}) };
       if (cookie && !headers.Cookie) headers.Cookie = cookie;
-      const res = await sendToVortex("/api/download", {
+      const res = await sendToVortex("/api/downloads", {
         url: msg.url,
         headers,
         start_immediately: true,
@@ -321,7 +415,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const headers = {};
       if (msg.pageUrl) headers.Referer = msg.pageUrl;
       if (cookie) headers.Cookie = cookie;
-      const res = await sendToVortex("/api/grab/batch", { urls: msg.urls, headers });
+      const res = await sendToVortex("/api/grab", { urls: msg.urls, headers });
       sendResponse(res);
     } else if (msg.type === "CHECK_STATUS") {
       try {

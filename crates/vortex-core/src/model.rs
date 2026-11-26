@@ -579,6 +579,7 @@ pub struct NewDownloadRequest {
     pub filename: Option<String>,
     pub save_dir: Option<PathBuf>,
     pub connections: Option<usize>,
+    #[serde(default)]
     pub headers: HashMap<String, String>,
     pub checksum: Option<String>,
     pub auto_extract: Option<bool>,
@@ -593,10 +594,15 @@ pub struct NewMediaRequest {
     pub save_dir: Option<PathBuf>,
     pub format_id: Option<String>,
     pub quality_label: Option<String>,
+    #[serde(default)]
     pub audio_only: bool,
+    #[serde(default)]
     pub embed_subtitles: bool,
+    #[serde(default)]
     pub headers: HashMap<String, String>,
     pub title_hint: Option<String>,
+    #[serde(default)]
     pub is_hls: bool,
+    #[serde(default)]
     pub is_dash: bool,
 }

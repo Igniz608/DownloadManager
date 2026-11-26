@@ -1,6 +1,7 @@
 use crate::extractor::{
-    ProgressCallback, detect_default_extractors, extract_archive_with_progress,
-    is_extractable_archive, select_best_extractor,
+    ExtractionPasswordRequired, ProgressCallback, detect_default_extractors,
+    extract_archive_with_progress, is_extractable_archive, is_password_error_text,
+    select_best_extractor,
 };
 use crate::http_engine::{
     BandwidthLimiter, DownloadCancelHandle, HtmlPageDetected, ProgressSnapshot, build_http_client,
@@ -13,11 +14,11 @@ use crate::media_engine::{
 use crate::model::{
     AppSettings, DownloadId, DownloadItem, DownloadKind, DownloadPackage, DownloadStatus,
     FileCategory, GrabbedLink, MediaDownloadMeta, MediaProbeResult, NewDownloadRequest,
-    NewMediaRequest, PackageId,
+    NewMediaRequest, NoticeEntry, PackageId, PasswordPromptRequest,
 };
 use crate::package_grabber::{
     detect_multipart, extract_urls_from_text, fallback_filename_from_url, find_missing_parts,
-    probe_grabbed_links, sanitize_filename,
+    probe_grabbed_links, resolve_indirect_http_url, sanitize_filename,
 };
 use crate::state::{PersistedState, load_settings, load_state, save_settings, save_state};
 use crate::torrent_engine::TorrentEngine;
@@ -28,6 +29,7 @@ use reqwest::Client;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
@@ -42,12 +44,14 @@ pub struct ManagerSnapshot {
     pub downloads: Vec<DownloadItem>,
     pub packages: Vec<DownloadPackage>,
     pub grabbed_links: Vec<GrabbedLink>,
+    pub grabber_probing: bool,
     pub total_download_bps: u64,
     pub total_upload_bps: u64,
     pub speed_history: Vec<SpeedSample>,
     pub active_count: usize,
     pub media_tools: MediaToolsStatus,
-    pub notifications: Vec<String>,
+    pub notifications: Vec<NoticeEntry>,
+    pub pending_password_prompts: Vec<PasswordPromptRequest>,
 }
 
 pub struct DownloadManager {
@@ -55,8 +59,10 @@ pub struct DownloadManager {
     pub downloads: Arc<RwLock<Vec<DownloadItem>>>,
     pub packages: Arc<RwLock<Vec<DownloadPackage>>>,
     pub grabbed_links: Arc<RwLock<Vec<GrabbedLink>>>,
+    grabber_probe_count: Arc<AtomicUsize>,
     pub speed_history: Arc<RwLock<VecDeque<SpeedSample>>>,
-    pub notifications: Arc<RwLock<VecDeque<String>>>,
+    pub notifications: Arc<RwLock<VecDeque<NoticeEntry>>>,
+    pub pending_password_prompts: Arc<RwLock<Vec<PasswordPromptRequest>>>,
     client: Client,
     limiter: BandwidthLimiter,
     cancel_handles: Arc<RwLock<HashMap<DownloadId, Arc<DownloadCancelHandle>>>>,
@@ -70,7 +76,22 @@ impl DownloadManager {
         settings.extractors = detect_default_extractors(&settings.extractors);
         let _ = save_settings(&settings);
 
-        let persisted = load_state();
+        let mut persisted = load_state();
+        for d in &mut persisted.downloads {
+            if let Some(ref st) = d.extraction_status {
+                if is_password_error_text(st) {
+                    d.extraction_status = Some("Senha necessária para extração".to_string());
+                }
+            }
+        }
+        for p in &mut persisted.packages {
+            if let Some(ref st) = p.extraction_status {
+                if is_password_error_text(st) {
+                    p.extraction_status = Some("Senha necessária para extração".to_string());
+                }
+            }
+        }
+
         let client = build_http_client().expect("Failed to initialize HTTP client");
         let limiter = BandwidthLimiter::new(settings.speed_limit_kbps);
 
@@ -87,8 +108,10 @@ impl DownloadManager {
             downloads: Arc::new(RwLock::new(persisted.downloads)),
             packages: Arc::new(RwLock::new(persisted.packages)),
             grabbed_links: Arc::new(RwLock::new(Vec::new())),
+            grabber_probe_count: Arc::new(AtomicUsize::new(0)),
             speed_history: Arc::new(RwLock::new(hist)),
             notifications: Arc::new(RwLock::new(VecDeque::with_capacity(20))),
+            pending_password_prompts: Arc::new(RwLock::new(Vec::new())),
             client,
             limiter,
             cancel_handles: Arc::new(RwLock::new(HashMap::new())),
@@ -101,34 +124,67 @@ impl DownloadManager {
     }
 
     fn push_notice(&self, msg: impl Into<String>) {
+        self.push_notice_kind(msg, false);
+    }
+
+    fn push_error_notice(&self, msg: impl Into<String>) {
+        self.push_notice_kind(msg, true);
+    }
+
+    fn push_notice_kind(&self, msg: impl Into<String>, is_error: bool) {
         let mut g = self.notifications.write();
-        g.push_back(msg.into());
+        g.push_back(NoticeEntry {
+            id: Uuid::new_v4(),
+            message: msg.into(),
+            is_error,
+            created_at: Utc::now(),
+        });
         while g.len() > 20 {
             g.pop_front();
         }
+    }
+
+    pub fn dismiss_notice(&self, id: Uuid) {
+        self.notifications.write().retain(|n| n.id != id);
+    }
+
+    pub fn clear_notices(&self) {
+        self.notifications.write().clear();
     }
 
     pub fn snapshot(&self) -> ManagerSnapshot {
         let downloads = self.downloads.read().clone();
         let packages = self.packages.read().clone();
         let grabbed_links = self.grabbed_links.read().clone();
+        let grabber_probing = self.grabber_probe_count.load(Ordering::Relaxed) > 0;
         let total_download_bps: u64 = downloads.iter().map(|d| d.speed_bps).sum();
         let total_upload_bps: u64 = downloads.iter().map(|d| d.upload_speed_bps).sum();
         let active_count = downloads.iter().filter(|d| d.status.is_active()).count();
         let speed_history = self.speed_history.read().iter().cloned().collect();
         let media_tools = detect_media_tools(&self.settings.read());
-        let notifications = self.notifications.read().iter().cloned().collect();
+        let now = Utc::now();
+        let notifications = {
+            let mut g = self.notifications.write();
+            g.retain(|n| {
+                let max_age = if n.is_error { 15 } else { 8 };
+                (now - n.created_at).num_seconds() < max_age
+            });
+            g.iter().cloned().collect()
+        };
+        let pending_password_prompts = self.pending_password_prompts.read().clone();
 
         ManagerSnapshot {
             downloads,
             packages,
             grabbed_links,
+            grabber_probing,
             total_download_bps,
             total_upload_bps,
             speed_history,
             active_count,
             media_tools,
             notifications,
+            pending_password_prompts,
         }
     }
 
@@ -511,15 +567,19 @@ impl DownloadManager {
     ) {
         let mgr = self.clone();
         let client = self.client.clone();
+        self.grabber_probe_count.fetch_add(1, Ordering::Relaxed);
         self.runtime.spawn(async move {
             let links = probe_grabbed_links(&client, urls, headers).await;
             let count = links.len();
-            let mut g = mgr.grabbed_links.write();
-            for link in links {
-                if !g.iter().any(|existing| existing.url == link.url) {
-                    g.push(link);
+            {
+                let mut g = mgr.grabbed_links.write();
+                for link in links {
+                    if !g.iter().any(|existing| existing.url == link.url) {
+                        g.push(link);
+                    }
                 }
             }
+            mgr.grabber_probe_count.fetch_sub(1, Ordering::Relaxed);
             mgr.push_notice(format!("{count} link(s) analisados no LinkGrabber."));
         });
     }
@@ -696,6 +756,72 @@ impl DownloadManager {
                             }
                         }
                         Err(e) if e.downcast_ref::<HtmlPageDetected>().is_some() => {
+                            let indirect_res =
+                                resolve_indirect_http_url(&client, &item.url, &item.headers).await;
+
+                            match indirect_res {
+                                Ok(Some(resolved)) => {
+                                    let mut resolved_item = item.clone();
+                                    resolved_item.url = resolved.url;
+                                    resolved_item.headers = resolved.headers;
+                                    if let Some(name) = resolved.probe.filename {
+                                        let clean = sanitize_filename(&name);
+                                        if !clean.is_empty() {
+                                            resolved_item.category =
+                                                FileCategory::from_filename(&clean);
+                                            if cat_subfolders && resolved_item.package_id.is_none()
+                                            {
+                                                if let Some(parent) = resolved_item.save_dir.parent()
+                                                {
+                                                    if resolved_item
+                                                        .save_dir
+                                                        .ends_with(item.category.subfolder())
+                                                    {
+                                                        resolved_item.save_dir = parent.join(
+                                                            resolved_item.category.subfolder(),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            resolved_item.filename = clean;
+                                            resolved_item.file_path = resolved_item
+                                                .save_dir
+                                                .join(&resolved_item.filename);
+                                        }
+                                    }
+                                    mgr.replace_item(resolved_item.clone());
+                                    let direct_res = run_http_download(
+                                        client,
+                                        resolved_item,
+                                        cat_subfolders,
+                                        limiter,
+                                        cancel.clone(),
+                                        on_prog,
+                                    )
+                                    .await;
+                                    mgr.cancel_handles.write().remove(&id);
+                                    match direct_res {
+                                        Ok(finished_item) => {
+                                            let is_done =
+                                                finished_item.status == DownloadStatus::Completed;
+                                            mgr.replace_item(finished_item.clone());
+                                            if is_done {
+                                                mgr.handle_post_download_completion(finished_item)
+                                                    .await;
+                                            }
+                                        }
+                                        Err(err) => mgr.mark_failed(id, err.to_string()),
+                                    }
+                                    return;
+                                }
+                                Err(cf_err) => {
+                                    mgr.cancel_handles.write().remove(&id);
+                                    mgr.mark_failed(id, cf_err.to_string());
+                                    return;
+                                }
+                                Ok(None) => {}
+                            }
+
                             let tools = detect_media_tools(&mgr.settings.read());
                             let media_probe = if let Some(ref yt_dlp) = tools.yt_dlp_path {
                                 probe_single_media_url(yt_dlp, &item.url, &item.headers)
@@ -1010,22 +1136,208 @@ impl DownloadManager {
         self.persist_now();
     }
 
+    pub fn set_download_password(&self, id: DownloadId, password: Option<String>) {
+        let clean = password.and_then(|p| {
+            let t = p.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        });
+        let mut package_id = None;
+        {
+            let mut dls = self.downloads.write();
+            if let Some(d) = dls.iter_mut().find(|x| x.id == id) {
+                d.extract_password = clean.clone();
+                package_id = d.package_id;
+            }
+        }
+        if let Some(pid) = package_id {
+            self.set_package_password(pid, clean);
+        } else {
+            self.persist_now();
+        }
+    }
+
+    pub fn set_package_password(&self, pkg_id: PackageId, password: Option<String>) {
+        let clean = password.and_then(|p| {
+            let t = p.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        });
+        let item_ids: Vec<DownloadId> = {
+            let mut pkgs = self.packages.write();
+            if let Some(p) = pkgs.iter_mut().find(|x| x.id == pkg_id) {
+                p.extract_password = clean.clone();
+                p.item_ids.clone()
+            } else {
+                Vec::new()
+            }
+        };
+        if !item_ids.is_empty() {
+            let mut dls = self.downloads.write();
+            for d in dls.iter_mut() {
+                if item_ids.contains(&d.id) {
+                    d.extract_password = clean.clone();
+                }
+            }
+        }
+        self.persist_now();
+    }
+
+    pub fn dismiss_password_prompt(&self, prompt_id: Uuid) {
+        self.pending_password_prompts
+            .write()
+            .retain(|p| p.id != prompt_id);
+    }
+
+    pub fn submit_extraction_password(
+        self: &Arc<Self>,
+        prompt_id: Uuid,
+        password: String,
+        save_to_list: bool,
+    ) {
+        let prompt_opt = {
+            let mut prompts = self.pending_password_prompts.write();
+            let pos = prompts.iter().position(|p| p.id == prompt_id);
+            pos.map(|idx| prompts.remove(idx))
+        };
+        let Some(prompt) = prompt_opt else {
+            return;
+        };
+
+        let trimmed = password.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        if save_to_list {
+            let mut s = self.settings.write();
+            if !s.password_list.iter().any(|x| x == &trimmed) {
+                s.password_list.push(trimmed.clone());
+                let _ = save_settings(&s);
+            }
+        }
+
+        if let Some(pkg_id) = prompt.package_id {
+            self.set_package_password(pkg_id, Some(trimmed.clone()));
+            self.trigger_package_extract(pkg_id, Some(trimmed));
+        } else {
+            self.set_download_password(prompt.item_id, Some(trimmed.clone()));
+            let item_opt = self
+                .downloads
+                .read()
+                .iter()
+                .find(|d| d.id == prompt.item_id)
+                .cloned();
+            if let Some(item) = item_opt {
+                let mgr = self.clone();
+                let delete_after = self.settings.read().delete_archives_after_extract;
+                self.runtime.spawn(async move {
+                    let _ = mgr
+                        .run_extraction_for_target(
+                            None,
+                            item.id,
+                            item.file_path.clone(),
+                            item.save_dir.clone(),
+                            item.extractor_override,
+                            Some(trimmed),
+                            delete_after,
+                            vec![item.file_path],
+                        )
+                        .await;
+                });
+            }
+        }
+    }
+
+    pub fn trigger_package_extract(
+        self: &Arc<Self>,
+        pkg_id: PackageId,
+        password_override: Option<String>,
+    ) {
+        let pkg_info = {
+            let pkgs = self.packages.read();
+            let dls = self.downloads.read();
+            pkgs.iter().find(|p| p.id == pkg_id).map(|p| {
+                let parts: Vec<DownloadItem> = p
+                    .item_ids
+                    .iter()
+                    .filter_map(|iid| dls.iter().find(|d| d.id == *iid).cloned())
+                    .collect();
+                (p.clone(), parts)
+            })
+        };
+        let Some((pkg, mut parts)) = pkg_info else {
+            return;
+        };
+        if parts.is_empty() {
+            return;
+        }
+        if !parts
+            .iter()
+            .all(|d| d.status == DownloadStatus::Completed)
+        {
+            self.push_error_notice(format!(
+                "Aguarde todas as partes de \"{}\" terminarem antes de extrair.",
+                pkg.name
+            ));
+            return;
+        }
+        parts.sort_by_key(|p| p.part_index.unwrap_or(9999));
+        let first_part = parts
+            .iter()
+            .find(|p| {
+                detect_multipart(&p.filename)
+                    .map(|m| m.is_first_part)
+                    .unwrap_or(false)
+            })
+            .or_else(|| parts.first())
+            .cloned();
+        let Some(first) = first_part else {
+            return;
+        };
+
+        let password = password_override
+            .or(pkg.extract_password.clone())
+            .or(first.extract_password.clone());
+        let mgr = self.clone();
+        self.runtime.spawn(async move {
+            let _ = mgr
+                .run_extraction_for_target(
+                    Some(pkg.id),
+                    first.id,
+                    first.file_path.clone(),
+                    pkg.save_dir.clone(),
+                    pkg.extractor_id.clone(),
+                    password,
+                    pkg.delete_archives_after_extract,
+                    parts.into_iter().map(|p| p.file_path).collect(),
+                )
+                .await;
+        });
+    }
+
     pub fn trigger_manual_extract(self: &Arc<Self>, id: DownloadId, extractor_id: Option<String>) {
         let item_opt = self.downloads.read().iter().find(|d| d.id == id).cloned();
         let Some(item) = item_opt else {
             return;
         };
+        if let Some(pkg_id) = item.package_id {
+            if let Some(ext_id) = extractor_id {
+                self.set_extractor_override(id, Some(ext_id), item.auto_extract);
+            }
+            self.trigger_package_extract(pkg_id, None);
+            return;
+        }
         let mgr = self.clone();
+        let delete_after = self.settings.read().delete_archives_after_extract;
         self.runtime.spawn(async move {
             let _ = mgr
                 .run_extraction_for_target(
-                    item.package_id,
+                    None,
                     item.id,
                     item.file_path.clone(),
                     item.save_dir.clone(),
                     extractor_id.or(item.extractor_override),
                     item.extract_password,
-                    false,
+                    delete_after,
                     vec![item.file_path],
                 )
                 .await;
@@ -1105,7 +1417,7 @@ impl DownloadManager {
         match res {
             Ok(out_dir) => {
                 if delete_archives {
-                    for f in files_to_delete {
+                    for f in &files_to_delete {
                         let _ = tokio::fs::remove_file(f).await;
                     }
                 }
@@ -1135,6 +1447,70 @@ impl DownloadManager {
                 Ok(())
             }
             Err(e) => {
+                if let Some(pw_err) = e.downcast_ref::<ExtractionPasswordRequired>() {
+                    let display_name = package_id
+                        .and_then(|pid| {
+                            self.packages
+                                .read()
+                                .iter()
+                                .find(|p| p.id == pid)
+                                .map(|p| p.name.clone())
+                        })
+                        .unwrap_or_else(|| {
+                            archive_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "Arquivo".to_string())
+                        });
+                    let status_msg = if pw_err.wrong_password {
+                        "Senha incorreta — informe a senha para extrair".to_string()
+                    } else {
+                        "Senha necessária para extração".to_string()
+                    };
+                    {
+                        let mut dls = self.downloads.write();
+                        if let Some(d) = dls.iter_mut().find(|x| x.id == item_id) {
+                            d.status = DownloadStatus::Completed;
+                            d.extraction_status = Some(status_msg.clone());
+                            d.extraction_progress = None;
+                        }
+                    }
+                    if let Some(pid) = package_id {
+                        let mut pkgs = self.packages.write();
+                        if let Some(p) = pkgs.iter_mut().find(|x| x.id == pid) {
+                            p.extraction_status = Some(status_msg.clone());
+                            p.extraction_progress = None;
+                        }
+                    }
+                    {
+                        let mut prompts = self.pending_password_prompts.write();
+                        let already_queued = prompts.iter().any(|p| {
+                            p.item_id == item_id
+                                || (package_id.is_some() && p.package_id == package_id)
+                        });
+                        if !already_queued {
+                            prompts.push(PasswordPromptRequest {
+                                id: Uuid::new_v4(),
+                                item_id,
+                                package_id,
+                                display_name: display_name.clone(),
+                                archive_path: archive_path.clone(),
+                                dest_dir: dest_dir.clone(),
+                                extractor_override: extractor_override.clone(),
+                                delete_archives,
+                                files_to_delete: files_to_delete.clone(),
+                                wrong_password: pw_err.wrong_password,
+                            });
+                        }
+                    }
+                    self.push_error_notice(format!(
+                        "{}: {}",
+                        status_msg, display_name
+                    ));
+                    self.persist_now();
+                    return Err(e);
+                }
+
                 let msg = format!("Erro na extração ({}): {e}", profile.name);
                 {
                     let mut dls = self.downloads.write();
@@ -1151,7 +1527,7 @@ impl DownloadManager {
                         p.extraction_progress = None;
                     }
                 }
-                self.push_notice(msg);
+                self.push_error_notice(msg);
                 self.persist_now();
                 Err(e)
             }

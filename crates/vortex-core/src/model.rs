@@ -278,6 +278,28 @@ pub struct GrabbedLink {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PasswordPromptRequest {
+    pub id: Uuid,
+    pub package_id: Option<PackageId>,
+    pub item_id: DownloadId,
+    pub display_name: String,
+    pub archive_path: PathBuf,
+    pub dest_dir: PathBuf,
+    pub extractor_override: Option<String>,
+    pub delete_archives: bool,
+    pub files_to_delete: Vec<PathBuf>,
+    pub wrong_password: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct NoticeEntry {
+    pub id: Uuid,
+    pub message: String,
+    pub is_error: bool,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExtractorKind {
     NanaZip,

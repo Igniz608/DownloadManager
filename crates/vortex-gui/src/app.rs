@@ -14,8 +14,8 @@ use uuid::Uuid;
 use vortex_core::ipc_server::register_browser_native_host;
 use vortex_core::manager::{DownloadManager, ManagerSnapshot};
 use vortex_core::model::{
-    DownloadItem, DownloadKind, DownloadStatus, ExtractorKind, ExtractorProfile, FileCategory,
-    MediaProbeResult, NewDownloadRequest, NewMediaRequest, ThemeConfig,
+    DownloadId, DownloadItem, DownloadKind, DownloadStatus, ExtractorKind, ExtractorProfile,
+    FileCategory, MediaProbeResult, NewDownloadRequest, NewMediaRequest, PackageId, ThemeConfig,
 };
 use vortex_core::package_grabber::extract_urls_from_text;
 
@@ -40,6 +40,20 @@ pub struct TrayControls {
     pub pause_all_id: MenuId,
     pub resume_all_id: MenuId,
     pub quit_id: MenuId,
+}
+
+#[derive(Debug, Clone)]
+enum PasswordEditTarget {
+    Download {
+        id: DownloadId,
+        name: String,
+        is_finished: bool,
+    },
+    Package {
+        id: PackageId,
+        name: String,
+        all_finished: bool,
+    },
 }
 
 pub struct VortexApp {
@@ -106,6 +120,17 @@ pub struct VortexApp {
     // Custom Theme save
     custom_theme_name: String,
 
+    // Extraction password prompt & quick password setter
+    pw_modal_id: Option<Uuid>,
+    pw_modal_input: String,
+    pw_modal_save_to_list: bool,
+    pw_modal_focus: bool,
+    pw_modal_show_chars: bool,
+    pw_edit_target: Option<PasswordEditTarget>,
+    pw_edit_input: String,
+    pw_edit_focus: bool,
+    pw_edit_show_chars: bool,
+
     last_applied_theme_hash: u64,
 }
 
@@ -170,6 +195,15 @@ impl VortexApp {
             chrome_ext_id_input: String::new(),
             ext_reg_status: None,
             custom_theme_name: "Meu Tema".into(),
+            pw_modal_id: None,
+            pw_modal_input: String::new(),
+            pw_modal_save_to_list: false,
+            pw_modal_focus: false,
+            pw_modal_show_chars: false,
+            pw_edit_target: None,
+            pw_edit_input: String::new(),
+            pw_edit_focus: false,
+            pw_edit_show_chars: false,
             last_applied_theme_hash: 0,
         }
     }
@@ -297,6 +331,8 @@ impl eframe::App for VortexApp {
 
         self.render_new_http_modal(&ctx, &theme);
         self.render_new_torrent_modal(&ctx, &theme);
+        self.render_password_prompt_modal(&ctx, &snap, &theme);
+        self.render_set_password_modal(&ctx, &theme);
     }
 }
 
@@ -660,9 +696,31 @@ impl VortexApp {
 
     fn render_notices_bar(&mut self, ui: &mut Ui, snap: &ManagerSnapshot, theme: &ThemeConfig) {
         if let Some(latest) = snap.notifications.last() {
+            let dot_color = if latest.is_error {
+                to_c32(theme.error)
+            } else {
+                to_c32(theme.accent)
+            };
+            let text_color = if latest.is_error {
+                to_c32(theme.error)
+            } else {
+                to_c32(theme.text_muted)
+            };
             ui.horizontal(|ui| {
-                ui.label(RichText::new("•").color(to_c32(theme.accent)));
-                ui.label(RichText::new(latest).small().color(to_c32(theme.text_muted)));
+                ui.label(RichText::new("•").color(dot_color));
+                ui.label(RichText::new(&latest.message).small().color(text_color));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if snap.notifications.len() > 1 && ui.small_button("Limpar").clicked() {
+                        self.manager.clear_notices();
+                    }
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("Fechar aviso")
+                        .clicked()
+                    {
+                        self.manager.dismiss_notice(latest.id);
+                    }
+                });
             });
             ui.add_space(4.0);
         }
@@ -809,6 +867,24 @@ impl VortexApp {
                             || vortex_core::extractor::is_extractable_archive(&item.file_path))
                             && (!item.status.is_finished() || item.file_path.exists());
                         if is_archive {
+                            let has_pw = item.extract_password.is_some();
+                            let pw_btn_label = if has_pw { "Senha ✓" } else { "Senha" };
+                            if ui
+                                .button(pw_btn_label)
+                                .on_hover_text("Definir ou alterar senha de extração")
+                                .clicked()
+                            {
+                                self.pw_edit_input =
+                                    item.extract_password.clone().unwrap_or_default();
+                                self.pw_edit_focus = true;
+                                self.pw_edit_show_chars = false;
+                                self.pw_edit_target = Some(PasswordEditTarget::Download {
+                                    id: item.id,
+                                    name: item.filename.clone(),
+                                    is_finished: item.status.is_finished(),
+                                });
+                            }
+
                             let combo_label = if !item.status.is_finished() {
                                 if !item.auto_extract {
                                     "Não extrair".to_string()
@@ -968,12 +1044,29 @@ impl VortexApp {
                         );
                     }
                     if let Some(ref ex_status) = item.extraction_status {
+                        let ex_is_err = ex_status.starts_with("Erro")
+                            || ex_status.starts_with("Senha");
                         ui.label(RichText::new("•").small().color(to_c32(theme.text_muted)));
                         ui.label(
-                            RichText::new(ex_status)
-                                .small()
-                                .color(to_c32(theme.success)),
+                            RichText::new(ex_status).small().color(if ex_is_err {
+                                to_c32(theme.error)
+                            } else {
+                                to_c32(theme.success)
+                            }),
                         );
+                        if ex_status.starts_with("Senha") {
+                            if ui.small_button("Informar Senha").clicked() {
+                                self.pw_edit_input =
+                                    item.extract_password.clone().unwrap_or_default();
+                                self.pw_edit_focus = true;
+                                self.pw_edit_show_chars = false;
+                                self.pw_edit_target = Some(PasswordEditTarget::Download {
+                                    id: item.id,
+                                    name: item.filename.clone(),
+                                    is_finished: item.status.is_finished(),
+                                });
+                            }
+                        }
                         if item.status == DownloadStatus::Extracting {
                             ui.add_space(4.0);
                             if let Some(ex_frac) = item.extraction_progress {
@@ -1138,6 +1231,33 @@ impl VortexApp {
                                 if ui.button("Pasta").clicked() {
                                     let _ = open::that(&pkg.save_dir);
                                 }
+                                let pkg_all_done = !parts.is_empty()
+                                    && parts.iter().all(|p| p.status == DownloadStatus::Completed);
+                                if pkg_all_done {
+                                    if ui.button("Extrair").clicked() {
+                                        self.manager.trigger_package_extract(pkg.id, None);
+                                    }
+                                }
+                                let pw_label = if pkg.extract_password.is_some() {
+                                    "Senha ✓"
+                                } else {
+                                    "Senha"
+                                };
+                                if ui
+                                    .button(pw_label)
+                                    .on_hover_text("Definir senha para extração deste pacote")
+                                    .clicked()
+                                {
+                                    self.pw_edit_input =
+                                        pkg.extract_password.clone().unwrap_or_default();
+                                    self.pw_edit_focus = true;
+                                    self.pw_edit_show_chars = false;
+                                    self.pw_edit_target = Some(PasswordEditTarget::Package {
+                                        id: pkg.id,
+                                        name: pkg.name.clone(),
+                                        all_finished: pkg_all_done,
+                                    });
+                                }
                                 if ui.button("Pausar Pacote").clicked() {
                                     for p in &parts {
                                         self.manager.pause_download(p.id);
@@ -1170,7 +1290,31 @@ impl VortexApp {
                                 .color(to_c32(theme.text_muted)),
                             );
                             if let Some(ref st) = pkg.extraction_status {
-                                ui.label(RichText::new(format!("• {st}")).small().color(to_c32(theme.success)));
+                                let pkg_ex_err = st.starts_with("Erro") || st.starts_with("Senha");
+                                ui.label(
+                                    RichText::new(format!("• {st}")).small().color(if pkg_ex_err {
+                                        to_c32(theme.error)
+                                    } else {
+                                        to_c32(theme.success)
+                                    }),
+                                );
+                                if st.starts_with("Senha") {
+                                    let pkg_all_done = !parts.is_empty()
+                                        && parts
+                                            .iter()
+                                            .all(|p| p.status == DownloadStatus::Completed);
+                                    if ui.small_button("Informar Senha").clicked() {
+                                        self.pw_edit_input =
+                                            pkg.extract_password.clone().unwrap_or_default();
+                                        self.pw_edit_focus = true;
+                                        self.pw_edit_show_chars = false;
+                                        self.pw_edit_target = Some(PasswordEditTarget::Package {
+                                            id: pkg.id,
+                                            name: pkg.name.clone(),
+                                            all_finished: pkg_all_done,
+                                        });
+                                    }
+                                }
                                 if let Some(ex_frac) = pkg.extraction_progress {
                                     let frac = ex_frac.clamp(0.0, 1.0);
                                     ui.add_space(4.0);
@@ -1226,7 +1370,7 @@ impl VortexApp {
         ui.heading("LinkGrabber — Captura em Lote & Multi-Parte");
         ui.label(
             RichText::new(
-                "Cole texto de páginas, listas de links (.part1.rar, .part2.rar, .7z.001...) ou links individuais. O VortexDL verifica disponibilidade, soma tamanhos e agrupa pacotes automaticamente.",
+                "Cole texto de páginas, listas de links (.part1.rar, .part2.rar, .7z.001...), páginas de hosters (FileDitch, Pixeldrain, Gofile, Buzzheavier) ou páginas com vários botões DOWNLOAD. O VortexDL resolve links intermediários, verifica disponibilidade e agrupa pacotes automaticamente.",
             )
             .small()
             .color(to_c32(theme.text_muted)),
@@ -1329,6 +1473,15 @@ impl VortexApp {
                 ))
                 .strong(),
             );
+            if snap.grabber_probing {
+                ui.add_space(8.0);
+                ui.spinner();
+                ui.label(
+                    RichText::new("Analisando e resolvendo páginas intermediárias...")
+                        .small()
+                        .color(to_c32(theme.accent)),
+                );
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if selected_count > 0
                     && accent_button(ui, format!("Iniciar Download ({selected_count})"), theme).clicked()
@@ -2092,6 +2245,19 @@ impl VortexApp {
 
                 ui.add(egui::Slider::new(&mut self.new_http_connections, 1..=32).text("Conexões (Work-Stealing)"));
 
+                if detected_media.is_none() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.new_http_auto_extract, "Auto-extrair");
+                        ui.label("Senha (opcional):");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.new_http_password)
+                                .hint_text("Senha do .rar / .zip / .7z")
+                                .desired_width(210.0),
+                        );
+                    });
+                }
+
                 ui.collapsing("Avançado (Headers, Checksum, Extrator)", |ui| {
                     ui.label("Referer (opcional):");
                     ui.add(egui::TextEdit::singleline(&mut self.new_http_referer).desired_width(f32::INFINITY));
@@ -2099,7 +2265,6 @@ impl VortexApp {
                     ui.add(egui::TextEdit::singleline(&mut self.new_http_cookie).desired_width(f32::INFINITY));
                     ui.label("Checksum esperado (sha256:... ou md5:...):");
                     ui.add(egui::TextEdit::singleline(&mut self.new_http_checksum).desired_width(f32::INFINITY));
-                    ui.checkbox(&mut self.new_http_auto_extract, "Extrair automaticamente ao concluir");
                     egui::ComboBox::from_id_salt("modal_ext_combo")
                         .selected_text(extractor_display_name(&self.new_http_extractor_id, &extractors))
                         .show_ui(ui, |ui| {
@@ -2108,8 +2273,6 @@ impl VortexApp {
                                 ui.selectable_value(&mut self.new_http_extractor_id, prof.id.clone(), &prof.name);
                             }
                         });
-                    ui.label("Senha do arquivo (opcional):");
-                    ui.add(egui::TextEdit::singleline(&mut self.new_http_password).desired_width(f32::INFINITY));
                 });
 
                 ui.add_space(10.0);
@@ -2180,10 +2343,236 @@ impl VortexApp {
                             });
                             self.new_http_url.clear();
                             self.new_http_filename.clear();
+                            self.new_http_password.clear();
                             self.show_new_http_modal = false;
                         }
                     });
                 });
+            });
+    }
+
+    fn render_password_prompt_modal(
+        &mut self,
+        ctx: &egui::Context,
+        snap: &ManagerSnapshot,
+        theme: &ThemeConfig,
+    ) {
+        let Some(prompt) = snap.pending_password_prompts.first().cloned() else {
+            self.pw_modal_id = None;
+            return;
+        };
+        if self.pw_modal_id != Some(prompt.id) {
+            self.pw_modal_id = Some(prompt.id);
+            self.pw_modal_input.clear();
+            self.pw_modal_focus = true;
+            self.pw_modal_show_chars = false;
+        }
+
+        egui::Window::new("Senha de Extração Necessária")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(430.0);
+                if prompt.wrong_password {
+                    ui.label(
+                        RichText::new("A senha informada está incorreta. Tente novamente:")
+                            .color(to_c32(theme.error))
+                            .strong(),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("Este arquivo compactado está protegido por senha:")
+                            .color(to_c32(theme.text_muted)),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(&prompt.display_name)
+                        .strong()
+                        .color(to_c32(theme.text_primary)),
+                );
+                ui.add_space(8.0);
+
+                let mut submit_now = false;
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.pw_modal_input)
+                            .password(!self.pw_modal_show_chars)
+                            .hint_text("Digite a senha do arquivo...")
+                            .desired_width(270.0),
+                    );
+                    if self.pw_modal_focus {
+                        resp.request_focus();
+                        self.pw_modal_focus = false;
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit_now = true;
+                    }
+                    if ui
+                        .button(if self.pw_modal_show_chars {
+                            "Ocultar"
+                        } else {
+                            "Mostrar"
+                        })
+                        .clicked()
+                    {
+                        self.pw_modal_show_chars = !self.pw_modal_show_chars;
+                    }
+                    if ui.button("Colar").clicked() {
+                        if let Some(txt) = read_clipboard_text() {
+                            self.pw_modal_input = txt.trim().to_string();
+                        }
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.checkbox(
+                    &mut self.pw_modal_save_to_list,
+                    "Salvar esta senha na lista automática (Configurações / Extratores)",
+                );
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Cancelar").clicked() {
+                        self.manager.dismiss_password_prompt(prompt.id);
+                        self.pw_modal_id = None;
+                        self.pw_modal_input.clear();
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let can_submit = !self.pw_modal_input.trim().is_empty();
+                        if ui
+                            .add_enabled_ui(can_submit, |ui| accent_button(ui, "Extrair Agora", theme))
+                            .inner
+                            .clicked()
+                        {
+                            submit_now = true;
+                        }
+                    });
+                });
+
+                if submit_now && !self.pw_modal_input.trim().is_empty() {
+                    let pw = self.pw_modal_input.trim().to_string();
+                    self.manager
+                        .submit_extraction_password(prompt.id, pw, self.pw_modal_save_to_list);
+                    self.pw_modal_id = None;
+                    self.pw_modal_input.clear();
+                }
+            });
+    }
+
+    fn render_set_password_modal(&mut self, ctx: &egui::Context, theme: &ThemeConfig) {
+        let Some(target) = self.pw_edit_target.clone() else {
+            return;
+        };
+
+        let (title_name, is_finished) = match &target {
+            PasswordEditTarget::Download {
+                name, is_finished, ..
+            } => (name.as_str(), *is_finished),
+            PasswordEditTarget::Package {
+                name, all_finished, ..
+            } => (name.as_str(), *all_finished),
+        };
+
+        egui::Window::new("Senha de Extração")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(410.0);
+                ui.label(RichText::new(title_name).strong());
+                ui.label(
+                    RichText::new(if is_finished {
+                        "Informe a senha para salvar e iniciar a extração:"
+                    } else {
+                        "Defina a senha agora — ela será usada automaticamente assim que o download concluir:"
+                    })
+                    .small()
+                    .color(to_c32(theme.text_muted)),
+                );
+                ui.add_space(6.0);
+
+                let mut save_only = false;
+                let mut save_and_extract = false;
+
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.pw_edit_input)
+                            .password(!self.pw_edit_show_chars)
+                            .hint_text("Digite a senha (ou deixe vazio para limpar)...")
+                            .desired_width(250.0),
+                    );
+                    if self.pw_edit_focus {
+                        resp.request_focus();
+                        self.pw_edit_focus = false;
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if is_finished && !self.pw_edit_input.trim().is_empty() {
+                            save_and_extract = true;
+                        } else {
+                            save_only = true;
+                        }
+                    }
+                    if ui
+                        .button(if self.pw_edit_show_chars {
+                            "Ocultar"
+                        } else {
+                            "Mostrar"
+                        })
+                        .clicked()
+                    {
+                        self.pw_edit_show_chars = !self.pw_edit_show_chars;
+                    }
+                    if ui.button("Colar").clicked() {
+                        if let Some(txt) = read_clipboard_text() {
+                            self.pw_edit_input = txt.trim().to_string();
+                        }
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancelar").clicked() {
+                        self.pw_edit_target = None;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if is_finished && !self.pw_edit_input.trim().is_empty() {
+                            if accent_button(ui, "Salvar e Extrair", theme).clicked() {
+                                save_and_extract = true;
+                            }
+                            if ui.button("Apenas Salvar").clicked() {
+                                save_only = true;
+                            }
+                        } else if accent_button(ui, "Salvar Senha", theme).clicked() {
+                            save_only = true;
+                        }
+                    });
+                });
+
+                if save_only || save_and_extract {
+                    let pw_opt = if self.pw_edit_input.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.pw_edit_input.trim().to_string())
+                    };
+                    match target {
+                        PasswordEditTarget::Download { id, .. } => {
+                            self.manager.set_download_password(id, pw_opt);
+                            if save_and_extract {
+                                self.manager.trigger_manual_extract(id, None);
+                            }
+                        }
+                        PasswordEditTarget::Package { id, .. } => {
+                            self.manager.set_package_password(id, pw_opt.clone());
+                            if save_and_extract {
+                                self.manager.trigger_package_extract(id, pw_opt);
+                            }
+                        }
+                    }
+                    self.pw_edit_target = None;
+                    self.pw_edit_input.clear();
+                }
             });
     }
 

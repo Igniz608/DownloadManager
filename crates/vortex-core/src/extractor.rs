@@ -1,10 +1,96 @@
 use crate::model::{AppSettings, ExtractorKind, ExtractorProfile};
 use anyhow::{Context, Result, anyhow};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+
+#[derive(Debug, Clone)]
+pub struct ExtractionPasswordRequired {
+    pub extractor_name: String,
+    pub wrong_password: bool,
+}
+
+impl fmt::Display for ExtractionPasswordRequired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.wrong_password {
+            write!(
+                f,
+                "Senha incorreta para extração ({})",
+                self.extractor_name
+            )
+        } else {
+            write!(
+                f,
+                "Arquivo protegido por senha ({})",
+                self.extractor_name
+            )
+        }
+    }
+}
+
+impl std::error::Error for ExtractionPasswordRequired {}
+
+pub fn is_password_error_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("enter password")
+        || lower.contains("wrong password")
+        || lower.contains("password is incorrect")
+        || lower.contains("incorrect password")
+        || lower.contains("can not open encrypted archive")
+        || lower.contains("cannot open encrypted archive")
+        || lower.contains("data error in encrypted file")
+        || lower.contains("crc failed in encrypted")
+        || lower.contains("checksum error in the encrypted file")
+        || lower.contains("headers error")
+        || lower.contains("encrypted file")
+        || lower.contains("corrupt file or wrong password")
+        || lower.contains("missing or wrong password")
+}
+
+fn summarize_extractor_output(stderr: &str, stdout: &str) -> String {
+    let combined = format!("{}\n{}", stderr.trim(), stdout.trim());
+    let interesting: Vec<&str> = combined
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            !l.is_empty()
+                && !l.starts_with("Scanning the drive")
+                && !l.starts_with("0M Scan")
+                && !l.starts_with("Extracting archive:")
+                && !l.starts_with("7-Zip")
+                && !l.starts_with("NanaZip")
+                && !l.contains("Copyright (c)")
+                && !l.starts_with("--")
+                && !l.starts_with("Path =")
+                && !l.starts_with("Type =")
+                && !l.starts_with("Physical Size =")
+        })
+        .collect();
+    if let Some(err_line) = interesting
+        .iter()
+        .rev()
+        .find(|l| {
+            let low = l.to_ascii_lowercase();
+            low.contains("error")
+                || low.contains("erro")
+                || low.contains("fail")
+                || low.contains("cannot")
+                || low.contains("can not")
+                || low.contains("break")
+                || low.contains("password")
+        })
+    {
+        return (*err_line).to_string();
+    }
+    interesting
+        .last()
+        .copied()
+        .unwrap_or("Falha ao extrair arquivo")
+        .to_string()
+}
 
 #[cfg(windows)]
 use winreg::{RegKey, enums::*};
@@ -249,7 +335,12 @@ pub async fn extract_archive_with_progress(
     }
 
     let mut last_err = None;
+    let mut had_password_err = false;
+    let mut tried_non_empty_pw = false;
     for pw in passwords_to_try {
+        if pw.as_deref().is_some_and(|p| !p.is_empty()) {
+            tried_non_empty_pw = true;
+        }
         match run_extractor_once(
             archive_path,
             &final_dest,
@@ -261,12 +352,24 @@ pub async fn extract_archive_with_progress(
         {
             Ok(()) => return Ok(final_dest),
             Err(err) => {
+                if err.downcast_ref::<ExtractionPasswordRequired>().is_some()
+                    || is_password_error_text(&err.to_string())
+                {
+                    had_password_err = true;
+                }
                 last_err = Some(err);
                 if pw.is_none() && password_list.is_empty() && explicit_password.is_none() {
                     break;
                 }
             }
         }
+    }
+
+    if had_password_err {
+        return Err(anyhow::Error::new(ExtractionPasswordRequired {
+            extractor_name: profile.name.clone(),
+            wrong_password: tried_non_empty_pw,
+        }));
     }
 
     Err(last_err.unwrap_or_else(|| anyhow!("Falha desconhecida ao extrair arquivo")))
@@ -331,14 +434,26 @@ async fn run_extractor_once(
                 cmd.arg("x").arg("-y").arg("-bsp1");
                 if let Some(pw) = password {
                     cmd.arg(format!("-p{pw}"));
+                } else {
+                    cmd.arg("-p");
                 }
                 cmd.arg(format!("-o{dest_str}")).arg(&archive_str);
-                let (status, _stdout, stderr) =
+                let (status, stdout, stderr) =
                     run_command_with_progress(cmd, on_progress).await?;
                 if status.success() {
                     return Ok(());
                 }
-                return Err(anyhow!("PeaZip/7z falhou: {}", stderr.trim()));
+                let combined = format!("{stderr}\n{stdout}");
+                if is_password_error_text(&combined) {
+                    return Err(anyhow::Error::new(ExtractionPasswordRequired {
+                        extractor_name: profile.name.clone(),
+                        wrong_password: password.is_some(),
+                    }));
+                }
+                return Err(anyhow!(
+                    "PeaZip/7z falhou: {}",
+                    summarize_extractor_output(&stderr, &stdout)
+                ));
             }
         }
     }
@@ -353,6 +468,14 @@ async fn run_extractor_once(
             let pw_arg = pw_tpl.replace("{password}", pw);
             rendered = format!("{pw_arg} {rendered}");
         }
+    } else if matches!(
+        profile.kind,
+        ExtractorKind::NanaZip | ExtractorKind::SevenZip
+    ) {
+        // Passing `-p` disables interactive stdin password prompts so encrypted archives fail fast.
+        rendered = format!("-p {rendered}");
+    } else if profile.kind == ExtractorKind::WinRar {
+        rendered = format!("-p- {rendered}");
     }
 
     let mut args = split_command_args(&rendered);
@@ -373,12 +496,18 @@ async fn run_extractor_once(
     if status.success() {
         Ok(())
     } else {
+        let combined = format!("{stderr}\n{stdout}");
+        if is_password_error_text(&combined) {
+            return Err(anyhow::Error::new(ExtractionPasswordRequired {
+                extractor_name: profile.name.clone(),
+                wrong_password: password.is_some(),
+            }));
+        }
         Err(anyhow!(
-            "{} retornou erro ({}): {} {}",
+            "{} ({}): {}",
             profile.name,
             status,
-            stderr.trim(),
-            stdout.trim()
+            summarize_extractor_output(&stderr, &stdout)
         ))
     }
 }
@@ -671,5 +800,15 @@ mod tests {
         assert_eq!(parse_progress_percent("100%"), Some(100));
         assert_eq!(parse_progress_percent("file%20name.zip"), None);
         assert_eq!(parse_progress_percent("Everything is Ok"), None);
+    }
+
+    #[test]
+    fn detects_password_errors_and_summarizes_output() {
+        let nanazip_err = "Break signaled\n\nNanaZip 7.0 (x64)\nEnter password (will not be echoed):";
+        assert!(is_password_error_text(nanazip_err));
+        assert!(is_password_error_text("ERROR: Data Error in encrypted file. Wrong password?"));
+        assert!(!is_password_error_text("Everything is Ok"));
+        let summary = summarize_extractor_output("line1\nline2\nERROR: CRC Failed", "");
+        assert_eq!(summary, "ERROR: CRC Failed");
     }
 }

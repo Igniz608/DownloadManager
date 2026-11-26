@@ -156,20 +156,100 @@ fn walkdir_shallow(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+fn is_youtube_url(raw_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw_url.trim()) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let h = host.to_ascii_lowercase();
+    h == "youtube.com"
+        || h.ends_with(".youtube.com")
+        || h == "youtu.be"
+        || h.ends_with(".youtu.be")
+        || h == "youtube-nocookie.com"
+        || h.ends_with(".youtube-nocookie.com")
+}
+
+fn has_cookie_header(headers: &HashMap<String, String>) -> bool {
+    headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("cookie") && !v.trim().is_empty())
+}
+
+fn append_yt_dlp_headers(
+    cmd: &mut Command,
+    headers: &HashMap<String, String>,
+    include_cookies: bool,
+) {
+    for (k, v) in headers {
+        if v.trim().is_empty() {
+            continue;
+        }
+        if !include_cookies && k.eq_ignore_ascii_case("cookie") {
+            continue;
+        }
+        cmd.arg("--add-header").arg(format!("{k}:{v}"));
+    }
+}
+
+fn detect_js_runtime() -> Option<&'static str> {
+    let path_var = std::env::var_os("PATH")?;
+    let candidates: &[(&str, &[&str])] = if cfg!(windows) {
+        &[
+            ("deno", &["deno.exe", "deno.cmd"]),
+            ("node", &["node.exe"]),
+            ("bun", &["bun.exe"]),
+            ("qjs", &["qjs.exe"]),
+        ]
+    } else {
+        &[
+            ("deno", &["deno"]),
+            ("node", &["node"]),
+            ("bun", &["bun"]),
+            ("qjs", &["qjs"]),
+        ]
+    };
+    for (runtime, names) in candidates {
+        for dir in std::env::split_paths(&path_var) {
+            for bin in *names {
+                if dir.join(bin).is_file() {
+                    return Some(*runtime);
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn run_yt_dlp_probe(
+    yt_dlp_path: &str,
+    url: &str,
+    headers: &HashMap<String, String>,
+    include_cookies: bool,
+) -> Result<std::process::Output> {
+    let mut cmd = Command::new(yt_dlp_path);
+    crate::extractor::configure_silent_command(&mut cmd);
+    cmd.args(["-J", "--no-warnings", "--flat-playlist", "--playlist-end", "100"]);
+    if let Some(rt) = detect_js_runtime() {
+        cmd.args(["--js-runtimes", rt]);
+    }
+    append_yt_dlp_headers(&mut cmd, headers, include_cookies);
+    cmd.arg(url);
+    cmd.output().await.context("Falha ao executar yt-dlp")
+}
+
 pub async fn probe_media_url(
     yt_dlp_path: &str,
     url: &str,
     headers: &HashMap<String, String>,
 ) -> Result<MediaProbeResult> {
-    let mut cmd = Command::new(yt_dlp_path);
-    crate::extractor::configure_silent_command(&mut cmd);
-    cmd.args(["-J", "--no-warnings", "--flat-playlist", "--playlist-end", "100"]);
-    for (k, v) in headers {
-        cmd.arg("--add-header").arg(format!("{k}:{v}"));
+    let include_cookies = !is_youtube_url(url);
+    let mut output = run_yt_dlp_probe(yt_dlp_path, url, headers, include_cookies).await?;
+    if !output.status.success() && include_cookies && has_cookie_header(headers) {
+        output = run_yt_dlp_probe(yt_dlp_path, url, headers, false).await?;
     }
-    cmd.arg(url);
-
-    let output = cmd.output().await.context("Falha ao executar yt-dlp")?;
     if !output.status.success() {
         return Err(anyhow!(
             "yt-dlp erro: {}",
@@ -345,6 +425,43 @@ where
         + Send
         + Sync,
 {
+    let include_cookies = !is_youtube_url(&item.url);
+    let res = run_yt_dlp_download_attempt(
+        yt_dlp_path,
+        ffmpeg_path,
+        item,
+        cancel,
+        on_progress,
+        include_cookies,
+    )
+    .await;
+    if res.is_err() && !cancel.is_stopped() && include_cookies && has_cookie_header(&item.headers) {
+        return run_yt_dlp_download_attempt(
+            yt_dlp_path,
+            ffmpeg_path,
+            item,
+            cancel,
+            on_progress,
+            false,
+        )
+        .await;
+    }
+    res
+}
+
+async fn run_yt_dlp_download_attempt<F>(
+    yt_dlp_path: &str,
+    ffmpeg_path: Option<&str>,
+    item: &mut DownloadItem,
+    cancel: &Arc<DownloadCancelHandle>,
+    on_progress: &F,
+    include_cookies: bool,
+) -> Result<()>
+where
+    F: Fn(Option<DownloadStatus>, Option<String>, Option<PathBuf>, u64, Option<u64>, u64, Option<u64>)
+        + Send
+        + Sync,
+{
     on_progress(
         Some(DownloadStatus::Probing),
         None,
@@ -376,6 +493,10 @@ where
         .arg("--print")
         .arg("after_move:VORTEX_FINAL_PATH:%(filepath)s");
 
+    if let Some(rt) = detect_js_runtime() {
+        cmd.args(["--js-runtimes", rt]);
+    }
+
     if let Some(ffmpeg) = ffmpeg_path {
         if let Some(dir) = Path::new(ffmpeg).parent() {
             cmd.arg("--ffmpeg-location").arg(dir);
@@ -402,9 +523,7 @@ where
         cmd.args(["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]);
     }
 
-    for (k, v) in &item.headers {
-        cmd.arg("--add-header").arg(format!("{k}:{v}"));
-    }
+    append_yt_dlp_headers(&mut cmd, &item.headers, include_cookies);
 
     cmd.arg(&item.url)
         .stdout(Stdio::piped())
@@ -933,5 +1052,20 @@ mod tests {
         let segs = parse_hls_segments(&best, media);
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].as_str(), "https://cdn.example.com/hls/high/seg001.ts");
+    }
+
+    #[test]
+    fn detects_youtube_urls_and_cookie_headers() {
+        assert!(is_youtube_url("https://www.youtube.com/watch?v=jcPpVsCwvJo&list=RDjcPpVsCwvJo"));
+        assert!(is_youtube_url("https://youtu.be/jcPpVsCwvJo"));
+        assert!(is_youtube_url("https://music.youtube.com/watch?v=abc"));
+        assert!(!is_youtube_url("https://vimeo.com/123456"));
+        assert!(!is_youtube_url("https://notyoutube.com/watch?v=123"));
+
+        let mut hdrs = HashMap::new();
+        hdrs.insert("Referer".to_string(), "https://www.youtube.com/".to_string());
+        assert!(!has_cookie_header(&hdrs));
+        hdrs.insert("Cookie".to_string(), "SID=abc".to_string());
+        assert!(has_cookie_header(&hdrs));
     }
 }

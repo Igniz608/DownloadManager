@@ -1456,7 +1456,13 @@ impl VortexApp {
             });
 
         ui.add_space(8.0);
+        let total_count = snap.grabbed_links.len();
         let selected_count = snap.grabbed_links.iter().filter(|l| l.selected).count();
+        let offline_selected_count = snap
+            .grabbed_links
+            .iter()
+            .filter(|l| l.selected && l.online == Some(false))
+            .count();
         let total_size: u64 = snap
             .grabbed_links
             .iter()
@@ -1467,12 +1473,44 @@ impl VortexApp {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!(
-                    "{} link(s) capturados ({selected_count} selecionados • {})",
-                    snap.grabbed_links.len(),
+                    "{total_count} link(s) capturados ({selected_count} selecionados • {})",
                     format_bytes(total_size)
                 ))
                 .strong(),
             );
+            if total_count > 0 {
+                ui.add_space(8.0);
+                if ui
+                    .add_enabled(selected_count < total_count, egui::Button::new("Marcar Tudo"))
+                    .clicked()
+                {
+                    let mut g = self.manager.grabbed_links.write();
+                    for item in g.iter_mut() {
+                        item.selected = true;
+                    }
+                }
+                if ui
+                    .add_enabled(selected_count > 0, egui::Button::new("Desmarcar Tudo"))
+                    .clicked()
+                {
+                    let mut g = self.manager.grabbed_links.write();
+                    for item in g.iter_mut() {
+                        item.selected = false;
+                    }
+                }
+                if offline_selected_count > 0
+                    && ui
+                        .button(format!("Desmarcar Offline ({offline_selected_count})"))
+                        .clicked()
+                {
+                    let mut g = self.manager.grabbed_links.write();
+                    for item in g.iter_mut() {
+                        if item.online == Some(false) {
+                            item.selected = false;
+                        }
+                    }
+                }
+            }
             if snap.grabber_probing {
                 ui.add_space(8.0);
                 ui.spinner();

@@ -233,9 +233,10 @@ impl DownloadManager {
                         for (id, upd) in updates {
                             if let Some(item) = dls.iter_mut().find(|d| d.id == id) {
                                 if let Some(name) = upd.name {
-                                    item.filename = name.clone();
-                                    item.file_path = item.save_dir.join(name);
+                                    item.filename = name;
                                 }
+                                item.save_dir = upd.output_folder;
+                                item.file_path = upd.file_path;
                                 item.status = upd.status.clone();
                                 item.total_bytes = upd.total_bytes.or(item.total_bytes);
                                 item.downloaded_bytes = upd.downloaded_bytes;

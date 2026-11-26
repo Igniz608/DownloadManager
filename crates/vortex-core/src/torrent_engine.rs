@@ -4,10 +4,13 @@ use crate::model::{
 };
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use librqbit::{AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, SessionOptions};
+use librqbit::{
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, ManagedTorrent, Session,
+    SessionOptions,
+};
 use parking_lot::Mutex;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -37,47 +40,64 @@ impl TorrentEngine {
         paused: bool,
     ) -> Result<DownloadItem> {
         tokio::fs::create_dir_all(&output_folder).await?;
-        let add = if source.starts_with("magnet:")
-            || source.starts_with("http://")
-            || source.starts_with("https://")
-        {
-            AddTorrent::from_url(source)
-        } else {
-            AddTorrent::from_local_filename(source)?
+        let list_add = make_add_torrent(source)?;
+        let list_opts = AddTorrentOptions {
+            list_only: true,
+            ..Default::default()
         };
+
+        let list = match self.session.add_torrent(list_add, Some(list_opts)).await? {
+            AddTorrentResponse::ListOnly(resp) => resp,
+            AddTorrentResponse::Added(_, h) | AddTorrentResponse::AlreadyManaged(_, h) => {
+                return self.build_item_from_handle(source, h, paused);
+            }
+        };
+
+        let final_output_folder = resolve_output_folder_for_list(&output_folder, source, &list);
+        tokio::fs::create_dir_all(&final_output_folder).await?;
 
         let opts = AddTorrentOptions {
             paused,
             overwrite: true,
-            output_folder: Some(output_folder.to_string_lossy().to_string()),
+            output_folder: Some(final_output_folder.to_string_lossy().to_string()),
+            only_files: list.only_files,
+            initial_peers: if list.seen_peers.is_empty() {
+                None
+            } else {
+                Some(list.seen_peers)
+            },
             ..Default::default()
         };
 
-        let resp = self.session.add_torrent(add, Some(opts)).await?;
+        let resp = self
+            .session
+            .add_torrent(AddTorrent::TorrentFileBytes(list.torrent_bytes), Some(opts))
+            .await?;
         let handle = match resp {
             AddTorrentResponse::Added(_, h) | AddTorrentResponse::AlreadyManaged(_, h) => h,
             AddTorrentResponse::ListOnly(_) => return Err(anyhow!("Resposta list-only inesperada")),
         };
 
+        self.build_item_from_handle(source, handle, paused)
+    }
+
+    fn build_item_from_handle(
+        &self,
+        source: &str,
+        handle: Arc<ManagedTorrent>,
+        paused: bool,
+    ) -> Result<DownloadItem> {
         let id = Uuid::new_v4();
         let name = handle
             .name()
-            .unwrap_or_else(|| {
-                if source.starts_with("magnet:") {
-                    "Torrent (carregando metadados...)".to_string()
-                } else {
-                    std::path::Path::new(source)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("Torrent")
-                        .to_string()
-                }
-            });
+            .unwrap_or_else(|| fallback_torrent_name(source));
 
         let info_hash = format!("{:?}", handle.info_hash());
         let stats = handle.stats();
 
         let files = extract_torrent_files(&handle, &stats.file_progress);
+        let save_dir = handle.output_folder().to_path_buf();
+        let file_path = resolve_display_file_path(&handle, &save_dir, &files, &name);
         let total = if stats.total_bytes > 0 {
             Some(stats.total_bytes)
         } else {
@@ -98,9 +118,9 @@ impl TorrentEngine {
                 DownloadStatus::Downloading
             },
             url: source.to_string(),
-            filename: name.clone(),
-            save_dir: output_folder.clone(),
-            file_path: output_folder.join(&name),
+            filename: name,
+            save_dir,
+            file_path,
             category: FileCategory::Torrent,
             total_bytes: total,
             downloaded_bytes: stats.progress_bytes,
@@ -229,10 +249,15 @@ impl TorrentEngine {
             };
 
             let files = extract_torrent_files(&handle, &stats.file_progress);
+            let output_folder = handle.output_folder().to_path_buf();
+            let display_name = name.clone().unwrap_or_default();
+            let file_path = resolve_display_file_path(&handle, &output_folder, &files, &display_name);
             updates.push((
                 id,
                 TorrentPollUpdate {
                     name,
+                    output_folder,
+                    file_path,
                     status,
                     total_bytes: if stats.total_bytes > 0 {
                         Some(stats.total_bytes)
@@ -257,6 +282,8 @@ impl TorrentEngine {
 
 pub struct TorrentPollUpdate {
     pub name: Option<String>,
+    pub output_folder: PathBuf,
+    pub file_path: PathBuf,
     pub status: DownloadStatus,
     pub total_bytes: Option<u64>,
     pub downloaded_bytes: u64,
@@ -268,6 +295,172 @@ pub struct TorrentPollUpdate {
     pub ratio: f64,
     pub files: Vec<TorrentFileEntry>,
     pub finished: bool,
+}
+
+fn make_add_torrent(source: &str) -> Result<AddTorrent<'_>> {
+    if source.starts_with("magnet:")
+        || source.starts_with("http://")
+        || source.starts_with("https://")
+    {
+        Ok(AddTorrent::from_url(source))
+    } else {
+        AddTorrent::from_local_filename(source)
+    }
+}
+
+fn magnet_display_name(source: &str) -> Option<String> {
+    if !source.starts_with("magnet:") {
+        return None;
+    }
+    let parsed = url::Url::parse(source).ok()?;
+    parsed
+        .query_pairs()
+        .find(|(k, _)| k == "dn")
+        .map(|(_, v)| v.into_owned())
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn fallback_torrent_name(source: &str) -> String {
+    if source.starts_with("magnet:") {
+        magnet_display_name(source)
+            .unwrap_or_else(|| "Torrent (carregando metadados...)".to_string())
+    } else {
+        Path::new(source)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Torrent")
+            .to_string()
+    }
+}
+
+fn sanitize_torrent_folder_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches(['.', ' ']).to_string();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn resolve_torrent_output_dir(
+    base_output_folder: &Path,
+    is_multi_file: bool,
+    preferred_name: Option<&str>,
+    fallback_stem: Option<&str>,
+    info_hash_hex: &str,
+) -> PathBuf {
+    if !is_multi_file {
+        return base_output_folder.to_path_buf();
+    }
+
+    let folder_name = preferred_name
+        .and_then(sanitize_torrent_folder_name)
+        .or_else(|| fallback_stem.and_then(sanitize_torrent_folder_name))
+        .unwrap_or_else(|| {
+            let prefix: String = info_hash_hex.chars().take(8).collect();
+            format!("torrent-{prefix}")
+        });
+
+    let already_in_folder = base_output_folder
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|last| last.eq_ignore_ascii_case(&folder_name))
+        .unwrap_or(false);
+
+    if already_in_folder {
+        base_output_folder.to_path_buf()
+    } else {
+        base_output_folder.join(folder_name)
+    }
+}
+
+fn resolve_output_folder_for_list(
+    base_output_folder: &Path,
+    source: &str,
+    list: &ListOnlyResponse,
+) -> PathBuf {
+    let real_files: Vec<(PathBuf, u64)> = list
+        .info
+        .iter_file_details()
+        .filter(|fd| !fd.attrs().padding)
+        .map(|fd| (fd.filename.to_pathbuf(), fd.len))
+        .collect();
+
+    let info_name = list.info.name().map(|s| s.into_owned());
+    let has_files_list = list.info.info().files.is_some();
+    let is_multi_file = real_files.len() >= 2
+        || (has_files_list
+            && info_name.as_deref() != real_files.first().and_then(|(p, _)| p.to_str()));
+
+    let magnet_or_file_name = magnet_display_name(source).or_else(|| {
+        if !source.starts_with("magnet:")
+            && !source.starts_with("http://")
+            && !source.starts_with("https://")
+        {
+            Path::new(source)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        } else {
+            None
+        }
+    });
+
+    let longest_stem = real_files
+        .iter()
+        .max_by_key(|(_, len)| *len)
+        .and_then(|(p, _)| p.file_stem().and_then(|s| s.to_str()))
+        .map(str::to_string);
+
+    let preferred = info_name.or(magnet_or_file_name);
+    let hash_hex = format!("{:?}", list.info_hash);
+    resolve_torrent_output_dir(
+        base_output_folder,
+        is_multi_file,
+        preferred.as_deref(),
+        longest_stem.as_deref(),
+        &hash_hex,
+    )
+}
+
+fn resolve_display_file_path(
+    handle: &ManagedTorrent,
+    output_folder: &Path,
+    files: &[TorrentFileEntry],
+    name: &str,
+) -> PathBuf {
+    let is_multi_file = handle
+        .with_metadata(|meta| {
+            let real_files: Vec<&str> = meta
+                .file_infos
+                .iter()
+                .filter(|fi| !fi.attrs.padding)
+                .filter_map(|fi| fi.relative_filename.to_str())
+                .collect();
+            real_files.len() >= 2
+                || (meta.info.info().files.is_some()
+                    && meta.info.name().as_deref() != real_files.first().copied())
+        })
+        .unwrap_or(files.len() >= 2);
+
+    if is_multi_file {
+        output_folder.to_path_buf()
+    } else if let Some(first) = files.first() {
+        output_folder.join(&first.path)
+    } else if !name.is_empty() {
+        output_folder.join(name)
+    } else {
+        output_folder.to_path_buf()
+    }
 }
 
 fn extract_torrent_files(handle: &ManagedTorrent, file_progress: &[u64]) -> Vec<TorrentFileEntry> {
@@ -289,4 +482,44 @@ fn extract_torrent_files(handle: &ManagedTorrent, file_progress: &[u64]) -> Vec<
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitizes_windows_illegal_chars_and_trailing_dots() {
+        assert_eq!(
+            sanitize_torrent_folder_name("Game: Ultimate / Pack* v1.0.. "),
+            Some("Game_ Ultimate _ Pack_ v1.0".to_string())
+        );
+        assert_eq!(sanitize_torrent_folder_name(".."), None);
+        assert_eq!(sanitize_torrent_folder_name("   "), None);
+    }
+
+    #[test]
+    fn resolves_subfolder_only_for_multifile_and_avoids_double_nesting() {
+        let base = Path::new("D:/Downloads");
+        assert_eq!(
+            resolve_torrent_output_dir(base, false, Some("ubuntu.iso"), None, "abcdef12"),
+            PathBuf::from("D:/Downloads")
+        );
+        assert_eq!(
+            resolve_torrent_output_dir(base, true, Some("Xbox Game"), None, "abcdef12"),
+            PathBuf::from("D:/Downloads/Xbox Game")
+        );
+
+        let already_nested = Path::new("D:/Downloads/Xbox Game");
+        assert_eq!(
+            resolve_torrent_output_dir(already_nested, true, Some("xbox game"), None, "abcdef12"),
+            PathBuf::from("D:/Downloads/Xbox Game")
+        );
+    }
+
+    #[test]
+    fn extracts_magnet_display_name() {
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=My%20Cool%20Game";
+        assert_eq!(magnet_display_name(magnet).as_deref(), Some("My Cool Game"));
+    }
 }

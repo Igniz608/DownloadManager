@@ -29,7 +29,7 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use reqwest::Client;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Mutex as AsyncMutex;
@@ -723,7 +723,8 @@ impl DownloadManager {
             match res {
                 Ok((te, attached)) => {
                     if !still_present || cancel.cancelled.load(Ordering::SeqCst) {
-                        let _ = te.remove(id, false).await;
+                        let delete_files = cancel.delete_on_cancel.load(Ordering::SeqCst);
+                        let _ = te.remove(id, delete_files).await;
                         return;
                     }
                     if was_paused {
@@ -1936,9 +1937,18 @@ impl DownloadManager {
     }
 
     pub fn remove_download(&self, id: DownloadId, delete_disk_file: bool) {
-        if let Some(cancel) = self.cancel_handles.read().get(&id) {
-            cancel.cancel();
-        }
+        let was_active = {
+            let handles = self.cancel_handles.read();
+            if let Some(cancel) = handles.get(&id) {
+                if delete_disk_file {
+                    cancel.delete_on_cancel.store(true, Ordering::SeqCst);
+                }
+                cancel.cancel();
+                true
+            } else {
+                false
+            }
+        };
         let removed = {
             let mut dls = self.downloads.write();
             if let Some(pos) = dls.iter().position(|d| d.id == id) {
@@ -1951,22 +1961,82 @@ impl DownloadManager {
         if let Some(item) = removed {
             if item.kind == DownloadKind::Torrent {
                 let mgr_te = self.torrent_engine.clone();
-                self.runtime.spawn(async move {
-                    if let Some(te) = mgr_te.lock().await.as_ref() {
-                        let _ = te.remove(id, delete_disk_file).await;
+                let item_clone = item.clone();
+                let handled_sync = if delete_disk_file {
+                    if let Ok(guard) = mgr_te.try_lock() {
+                        if guard.is_none() {
+                            delete_torrent_files_from_disk(&item_clone);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
                     }
-                });
+                } else {
+                    false
+                };
+                if !handled_sync {
+                    self.runtime.spawn(async move {
+                        let deleted_by_engine = if let Some(te) = mgr_te.lock().await.as_ref() {
+                            te.remove(id, delete_disk_file).await.unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        if delete_disk_file && !deleted_by_engine {
+                            delete_torrent_files_from_disk(&item_clone);
+                        }
+                    });
+                }
             } else if delete_disk_file {
-                let _ = std::fs::remove_file(&item.file_path);
-                let part = PathBuf::from(format!("{}.vortexpart", item.file_path.display()));
-                let _ = std::fs::remove_file(part);
+                if !was_active && delete_non_torrent_files_from_disk(&item) {
+                    // Deleted immediately without waiting for active workers.
+                } else {
+                    let cancel_handles = self.cancel_handles.clone();
+                    let item_clone = item.clone();
+                    self.runtime.spawn(async move {
+                        for _ in 0..100 {
+                            if !cancel_handles.read().contains_key(&id) {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
+                        for attempt in 0..6 {
+                            if delete_non_torrent_files_from_disk(&item_clone) || attempt == 5 {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                        }
+                    });
+                }
             }
+            self.pending_password_prompts
+                .write()
+                .retain(|p| p.id != id);
             let mut pkgs = self.packages.write();
             for p in pkgs.iter_mut() {
                 p.item_ids.retain(|x| *x != id);
             }
             pkgs.retain(|p| !p.item_ids.is_empty());
         }
+        self.persist_now();
+    }
+
+    pub fn remove_package(&self, pkg_id: PackageId, delete_disk_files: bool) {
+        let item_ids: Vec<DownloadId> = {
+            let pkgs = self.packages.read();
+            pkgs.iter()
+                .find(|p| p.id == pkg_id)
+                .map(|p| p.item_ids.clone())
+                .unwrap_or_default()
+        };
+        for item_id in item_ids {
+            self.remove_download(item_id, delete_disk_files);
+        }
+        self.pending_password_prompts
+            .write()
+            .retain(|p| p.id != pkg_id);
+        self.packages.write().retain(|p| p.id != pkg_id);
         self.persist_now();
     }
 
@@ -2082,6 +2152,85 @@ fn grabbed_link_sort_tier(link: &GrabbedLink) -> u8 {
 
 fn sort_grabbed_links(links: &mut [GrabbedLink]) {
     links.sort_by_key(grabbed_link_sort_tier);
+}
+
+fn safe_relative_path(raw: &str) -> Option<PathBuf> {
+    let p = Path::new(raw);
+    let mut clean = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
+fn try_remove_file_if_present(path: &Path) -> bool {
+    if std::fs::symlink_metadata(path).is_err() {
+        return true;
+    }
+    std::fs::remove_file(path).is_ok()
+}
+
+fn delete_non_torrent_files_from_disk(item: &DownloadItem) -> bool {
+    let mut all_ok = true;
+    all_ok &= try_remove_file_if_present(&item.file_path);
+    let vortex_part = PathBuf::from(format!("{}.vortexpart", item.file_path.display()));
+    all_ok &= try_remove_file_if_present(&vortex_part);
+    if item.kind == DownloadKind::Media {
+        let yt_part = PathBuf::from(format!("{}.part", item.file_path.display()));
+        let ytdl = PathBuf::from(format!("{}.ytdl", item.file_path.display()));
+        all_ok &= try_remove_file_if_present(&yt_part);
+        all_ok &= try_remove_file_if_present(&ytdl);
+    }
+    all_ok
+}
+
+fn prune_empty_parents(start_dir: Option<&Path>, stop_at: &Path) {
+    let mut cur = start_dir;
+    while let Some(dir) = cur {
+        if dir == stop_at || !dir.starts_with(stop_at) {
+            break;
+        }
+        if std::fs::remove_dir(dir).is_err() {
+            break;
+        }
+        cur = dir.parent();
+    }
+}
+
+fn delete_torrent_files_from_disk(item: &DownloadItem) {
+    if let Some(ref ti) = item.torrent_info {
+        if !ti.files.is_empty() {
+            for f in &ti.files {
+                if let Some(rel) = safe_relative_path(&f.path) {
+                    let target = item.save_dir.join(&rel);
+                    let _ = try_remove_file_if_present(&target);
+                    prune_empty_parents(target.parent(), &item.save_dir);
+                }
+            }
+            if item.file_path == item.save_dir && item.save_dir.is_dir() {
+                let _ = std::fs::remove_dir(&item.save_dir);
+            }
+            return;
+        }
+    }
+
+    if item.file_path != item.save_dir {
+        if item.file_path.is_file() {
+            let _ = std::fs::remove_file(&item.file_path);
+        } else if item.file_path.is_dir() {
+            let _ = std::fs::remove_dir_all(&item.file_path);
+        }
+        let vortex_part = PathBuf::from(format!("{}.vortexpart", item.file_path.display()));
+        let _ = try_remove_file_if_present(&vortex_part);
+    }
 }
 
 #[cfg(test)]
@@ -2239,5 +2388,148 @@ mod tests {
         assert_eq!(default_torrent_dir_from_settings(&s), PathBuf::from("D:/Downloads/Torrents"));
         s.categorize_into_subfolders = false;
         assert_eq!(default_torrent_dir_from_settings(&s), PathBuf::from("D:/Downloads"));
+    }
+
+    #[test]
+    fn delete_non_torrent_files_removes_main_and_part_files() {
+        let dir = std::env::temp_dir().join(format!("vortex_del_http_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("archive.zip");
+        let part_path = PathBuf::from(format!("{}.vortexpart", file_path.display()));
+        let unrelated = dir.join("keep_me.txt");
+        std::fs::write(&file_path, b"data").unwrap();
+        std::fs::write(&part_path, b"part").unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        let item = DownloadItem {
+            id: Uuid::new_v4(),
+            package_id: None,
+            part_index: None,
+            part_total: None,
+            kind: DownloadKind::Http,
+            status: DownloadStatus::Completed,
+            url: "https://example.com/archive.zip".into(),
+            filename: "archive.zip".into(),
+            save_dir: dir.clone(),
+            file_path: file_path.clone(),
+            category: FileCategory::Archive,
+            total_bytes: Some(4),
+            downloaded_bytes: 4,
+            uploaded_bytes: 0,
+            speed_bps: 0,
+            upload_speed_bps: 0,
+            eta_seconds: None,
+            connections: 1,
+            supports_ranges: true,
+            segments: Vec::new(),
+            etag: None,
+            last_modified: None,
+            headers: HashMap::new(),
+            checksum_expected: None,
+            checksum_verified: None,
+            media_info: None,
+            torrent_info: None,
+            auto_extract: false,
+            extractor_override: None,
+            extract_password: None,
+            extracted_to: None,
+            extraction_status: None,
+            extraction_progress: None,
+            created_at: Utc::now(),
+            completed_at: None,
+            error: None,
+        };
+
+        assert!(delete_non_torrent_files_from_disk(&item));
+        assert!(!file_path.exists());
+        assert!(!part_path.exists());
+        assert!(unrelated.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_torrent_files_handles_multifile_and_rejects_traversal() {
+        let root = std::env::temp_dir().join(format!("vortex_del_tor_{}", Uuid::new_v4()));
+        let save_dir = root.join("GamePack");
+        let nested_dir = save_dir.join("bin");
+        let outside = root.join("outside_secret.txt");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(save_dir.join("setup.exe"), b"exe").unwrap();
+        std::fs::write(nested_dir.join("data.bin"), b"bin").unwrap();
+        std::fs::write(&outside, b"safe").unwrap();
+
+        let item = DownloadItem {
+            id: Uuid::new_v4(),
+            package_id: None,
+            part_index: None,
+            part_total: None,
+            kind: DownloadKind::Torrent,
+            status: DownloadStatus::Completed,
+            url: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
+            filename: "GamePack".into(),
+            save_dir: save_dir.clone(),
+            file_path: save_dir.clone(),
+            category: FileCategory::Torrent,
+            total_bytes: Some(6),
+            downloaded_bytes: 6,
+            uploaded_bytes: 0,
+            speed_bps: 0,
+            upload_speed_bps: 0,
+            eta_seconds: None,
+            connections: 1,
+            supports_ranges: false,
+            segments: Vec::new(),
+            etag: None,
+            last_modified: None,
+            headers: HashMap::new(),
+            checksum_expected: None,
+            checksum_verified: None,
+            media_info: None,
+            torrent_info: Some(TorrentDownloadMeta {
+                info_hash: "0123456789abcdef0123456789abcdef01234567".into(),
+                magnet_or_path: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
+                rqbit_id: None,
+                peers_connected: 0,
+                peers_seen: 0,
+                ratio: 0.0,
+                files: vec![
+                    crate::model::TorrentFileEntry {
+                        index: 0,
+                        path: "setup.exe".into(),
+                        size_bytes: 3,
+                        downloaded_bytes: 3,
+                        included: true,
+                    },
+                    crate::model::TorrentFileEntry {
+                        index: 1,
+                        path: "bin/data.bin".into(),
+                        size_bytes: 3,
+                        downloaded_bytes: 3,
+                        included: true,
+                    },
+                    crate::model::TorrentFileEntry {
+                        index: 2,
+                        path: "../outside_secret.txt".into(),
+                        size_bytes: 4,
+                        downloaded_bytes: 4,
+                        included: true,
+                    },
+                ],
+            }),
+            auto_extract: false,
+            extractor_override: None,
+            extract_password: None,
+            extracted_to: None,
+            extraction_status: None,
+            extraction_progress: None,
+            created_at: Utc::now(),
+            completed_at: None,
+            error: None,
+        };
+
+        delete_torrent_files_from_disk(&item);
+        assert!(!save_dir.exists());
+        assert!(outside.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

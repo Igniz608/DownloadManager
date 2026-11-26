@@ -58,6 +58,25 @@ enum PasswordEditTarget {
     },
 }
 
+#[derive(Debug, Clone)]
+enum DeleteConfirmTarget {
+    Download {
+        id: DownloadId,
+        filename: String,
+        file_path: PathBuf,
+        save_dir: PathBuf,
+        is_torrent_dir: bool,
+        torrent_file_count: usize,
+        is_active: bool,
+    },
+    Package {
+        id: PackageId,
+        name: String,
+        save_dir: PathBuf,
+        part_count: usize,
+    },
+}
+
 pub struct VortexApp {
     manager: Arc<DownloadManager>,
     runtime: tokio::runtime::Handle,
@@ -132,6 +151,7 @@ pub struct VortexApp {
     pw_edit_input: String,
     pw_edit_focus: bool,
     pw_edit_show_chars: bool,
+    delete_confirm_target: Option<DeleteConfirmTarget>,
 
     last_applied_theme_hash: u64,
     last_api_card_height: f32,
@@ -206,6 +226,7 @@ impl VortexApp {
             pw_edit_input: String::new(),
             pw_edit_focus: false,
             pw_edit_show_chars: false,
+            delete_confirm_target: None,
             last_applied_theme_hash: 0,
             last_api_card_height: 96.0,
             last_min_window_height: 0.0,
@@ -350,6 +371,7 @@ impl eframe::App for VortexApp {
         self.render_new_torrent_modal(&ctx, &theme);
         self.render_password_prompt_modal(&ctx, &snap, &theme);
         self.render_set_password_modal(&ctx, &theme);
+        self.render_delete_confirm_modal(&ctx, &theme);
     }
 }
 
@@ -983,7 +1005,7 @@ impl VortexApp {
             .show(ui, |ui| {
                 let avail_w = ui.available_width();
                 let scale = theme.font_scale.clamp(0.8, 1.4);
-                let single_row_needed = if is_archive { 760.0 } else { 560.0 } * scale;
+                let single_row_needed = if is_archive { 830.0 } else { 630.0 } * scale;
 
                 let render_action = |app: &mut Self, ui: &mut Ui, action: u8| match action {
                     0 => {
@@ -1099,8 +1121,49 @@ impl VortexApp {
                         }
                     }
                     5 => {
-                        if ui.button("Remover").clicked() {
+                        if ui
+                            .button("Remover")
+                            .on_hover_text("Remover da lista (mantém o arquivo no disco)")
+                            .clicked()
+                        {
                             app.manager.remove_download(item.id, false);
+                            if app.selected_id == Some(item.id) {
+                                app.selected_id = None;
+                            }
+                        }
+                    }
+                    6 => {
+                        let err_c = to_c32(theme.error);
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Excluir").color(err_c))
+                                    .stroke(Stroke::new(
+                                        1.0,
+                                        Color32::from_rgba_unmultiplied(
+                                            err_c.r(),
+                                            err_c.g(),
+                                            err_c.b(),
+                                            110,
+                                        ),
+                                    )),
+                            )
+                            .on_hover_text("Remover da lista e excluir arquivo(s) do disco")
+                            .clicked()
+                        {
+                            let torrent_file_count = item
+                                .torrent_info
+                                .as_ref()
+                                .map_or(0, |ti| ti.files.len());
+                            app.delete_confirm_target = Some(DeleteConfirmTarget::Download {
+                                id: item.id,
+                                filename: item.filename.clone(),
+                                file_path: item.file_path.clone(),
+                                save_dir: item.save_dir.clone(),
+                                is_torrent_dir: item.kind == DownloadKind::Torrent
+                                    && item.file_path == item.save_dir,
+                                torrent_file_count,
+                                is_active: item.status.is_active(),
+                            });
                         }
                     }
                     _ => {}
@@ -1138,7 +1201,7 @@ impl VortexApp {
                             }
                         },
                         |ui| {
-                            for action in [5, 4, 3, 2, 1, 0] {
+                            for action in [6, 5, 4, 3, 2, 1, 0] {
                                 render_action(self, ui, action);
                             }
                         },
@@ -1175,7 +1238,7 @@ impl VortexApp {
                         });
                         ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
-                            for action in [0, 1, 2, 3, 4, 5] {
+                            for action in [0, 1, 2, 3, 4, 5, 6] {
                                 render_action(self, ui, action);
                             }
                         });
@@ -1415,7 +1478,7 @@ impl VortexApp {
                     .show(ui, |ui| {
                         let avail_w = ui.available_width();
                         let scale = theme.font_scale.clamp(0.8, 1.4);
-                        let single_row_needed = 780.0 * scale;
+                        let single_row_needed = 920.0 * scale;
                         let pkg_all_done = !parts.is_empty()
                             && parts.iter().all(|p| p.status == DownloadStatus::Completed);
                         let pkg_extracting = pkg
@@ -1545,6 +1608,41 @@ impl VortexApp {
                                     let _ = open::that(&pkg.save_dir);
                                 }
                             }
+                            6 => {
+                                if ui
+                                    .button("Remover")
+                                    .on_hover_text("Remover pacote da lista (mantém arquivos no disco)")
+                                    .clicked()
+                                {
+                                    app.manager.remove_package(pkg.id, false);
+                                }
+                            }
+                            7 => {
+                                let err_c = to_c32(theme.error);
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new("Excluir").color(err_c))
+                                            .stroke(Stroke::new(
+                                                1.0,
+                                                Color32::from_rgba_unmultiplied(
+                                                    err_c.r(),
+                                                    err_c.g(),
+                                                    err_c.b(),
+                                                    110,
+                                                ),
+                                            )),
+                                    )
+                                    .on_hover_text("Remover pacote da lista e excluir arquivos do disco")
+                                    .clicked()
+                                {
+                                    app.delete_confirm_target = Some(DeleteConfirmTarget::Package {
+                                        id: pkg.id,
+                                        name: pkg.name.clone(),
+                                        save_dir: pkg.save_dir.clone(),
+                                        part_count: parts.len(),
+                                    });
+                                }
+                            }
                             _ => {}
                         };
 
@@ -1582,7 +1680,7 @@ impl VortexApp {
                                     .on_hover_text(&pkg.name);
                                 },
                                 |ui| {
-                                    for action in [5, 4, 3, 2, 1, 0] {
+                                    for action in [7, 6, 5, 4, 3, 2, 1, 0] {
                                         render_pkg_action(self, ui, action);
                                     }
                                 },
@@ -1625,7 +1723,7 @@ impl VortexApp {
                                 });
                                 ui.add_space(4.0);
                                 ui.horizontal_wrapped(|ui| {
-                                    for action in [0, 1, 2, 3, 4, 5] {
+                                    for action in [0, 1, 2, 3, 4, 5, 6, 7] {
                                         render_pkg_action(self, ui, action);
                                     }
                                 });
@@ -3206,12 +3304,140 @@ impl VortexApp {
                 });
             });
     }
+
+    fn render_delete_confirm_modal(&mut self, ctx: &egui::Context, theme: &ThemeConfig) {
+        let Some(target) = self.delete_confirm_target.clone() else {
+            return;
+        };
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.delete_confirm_target = None;
+            return;
+        }
+
+        egui::Window::new("Excluir do Disco")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(450.0);
+                match &target {
+                    DeleteConfirmTarget::Download {
+                        id,
+                        filename,
+                        file_path,
+                        save_dir,
+                        is_torrent_dir,
+                        torrent_file_count,
+                        is_active,
+                    } => {
+                        ui.label(
+                            RichText::new("Deseja remover este download e apagar o(s) arquivo(s) do disco?")
+                                .color(to_c32(theme.text_primary)),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(filename)
+                                .strong()
+                                .color(to_c32(theme.text_primary)),
+                        );
+                        let path_note = if *is_torrent_dir && *torrent_file_count > 1 {
+                            format!("{} ({} arquivos do torrent)", save_dir.display(), torrent_file_count)
+                        } else {
+                            file_path.display().to_string()
+                        };
+                        ui.label(
+                            RichText::new(path_note)
+                                .small()
+                                .color(to_c32(theme.text_muted)),
+                        );
+                        if *is_active {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("O download está ativo no momento e será cancelado antes da exclusão.")
+                                    .small()
+                                    .color(to_c32(theme.warning)),
+                            );
+                        }
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancelar").clicked() {
+                                self.delete_confirm_target = None;
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if danger_button(ui, "Excluir do disco", theme).clicked() {
+                                    self.manager.remove_download(*id, true);
+                                    if self.selected_id == Some(*id) {
+                                        self.selected_id = None;
+                                    }
+                                    self.delete_confirm_target = None;
+                                }
+                                if ui.button("Remover só da lista").clicked() {
+                                    self.manager.remove_download(*id, false);
+                                    if self.selected_id == Some(*id) {
+                                        self.selected_id = None;
+                                    }
+                                    self.delete_confirm_target = None;
+                                }
+                            });
+                        });
+                    }
+                    DeleteConfirmTarget::Package {
+                        id,
+                        name,
+                        save_dir,
+                        part_count,
+                    } => {
+                        ui.label(
+                            RichText::new(format!(
+                                "Deseja remover este pacote ({part_count} parte(s)) e apagar seus arquivos do disco?"
+                            ))
+                            .color(to_c32(theme.text_primary)),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(name)
+                                .strong()
+                                .color(to_c32(theme.text_primary)),
+                        );
+                        ui.label(
+                            RichText::new(save_dir.display().to_string())
+                                .small()
+                                .color(to_c32(theme.text_muted)),
+                        );
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancelar").clicked() {
+                                self.delete_confirm_target = None;
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if danger_button(ui, "Excluir do disco", theme).clicked() {
+                                    self.manager.remove_package(*id, true);
+                                    self.delete_confirm_target = None;
+                                }
+                                if ui.button("Remover só da lista").clicked() {
+                                    self.manager.remove_package(*id, false);
+                                    self.delete_confirm_target = None;
+                                }
+                            });
+                        });
+                    }
+                }
+            });
+    }
 }
 
 fn accent_button(ui: &mut Ui, text: impl Into<String>, theme: &ThemeConfig) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text.into()).strong().color(Color32::WHITE))
             .fill(to_c32(theme.accent)),
+    )
+}
+
+fn danger_button(ui: &mut Ui, text: impl Into<String>, theme: &ThemeConfig) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(text.into()).strong().color(Color32::WHITE))
+            .fill(to_c32(theme.error)),
     )
 }
 

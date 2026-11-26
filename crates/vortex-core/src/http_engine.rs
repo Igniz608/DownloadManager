@@ -314,6 +314,7 @@ impl BandwidthLimiter {
 pub struct DownloadCancelHandle {
     pub paused: AtomicBool,
     pub cancelled: AtomicBool,
+    pub delete_on_cancel: AtomicBool,
     pub notify: Notify,
 }
 
@@ -322,6 +323,7 @@ impl DownloadCancelHandle {
         Self {
             paused: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            delete_on_cancel: AtomicBool::new(false),
             notify: Notify::new(),
         }
     }

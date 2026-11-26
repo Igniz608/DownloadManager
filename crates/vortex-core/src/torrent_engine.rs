@@ -251,7 +251,7 @@ impl TorrentEngine {
         Ok(())
     }
 
-    pub async fn remove(&self, id: Uuid, delete_files: bool) -> Result<()> {
+    pub async fn remove(&self, id: Uuid, delete_files: bool) -> Result<bool> {
         let handle = {
             let mut g = self.handles.lock();
             if let Some(pos) = g.iter().position(|(i, _)| *i == id) {
@@ -262,8 +262,9 @@ impl TorrentEngine {
         };
         if let Some(h) = handle {
             self.session.delete(h.id().into(), delete_files).await?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub fn poll_snapshots(&self, seed_after_complete: bool, max_ratio: f32) -> Vec<(Uuid, TorrentPollUpdate)> {

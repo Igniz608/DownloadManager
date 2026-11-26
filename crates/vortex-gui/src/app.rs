@@ -723,7 +723,7 @@ impl VortexApp {
                         self.manager.clear_notices();
                     }
                     if ui
-                        .small_button("✕")
+                        .small_button("X")
                         .on_hover_text("Fechar aviso")
                         .clicked()
                     {
@@ -816,7 +816,21 @@ impl VortexApp {
             Stroke::new(1.0, to_c32(theme.border))
         };
 
-        let extractors = self.manager.settings.read().extractors.clone();
+        let (default_ext_id, extractors) = {
+            let s = self.manager.settings.read();
+            (s.default_extractor_id.clone(), s.extractors.clone())
+        };
+        let (eff_auto_extract, eff_extractor) = if let Some(pkg_id) = item.package_id {
+            self.manager
+                .packages
+                .read()
+                .iter()
+                .find(|p| p.id == pkg_id)
+                .map(|p| (p.auto_extract, p.extractor_id.clone()))
+                .unwrap_or((item.auto_extract, item.extractor_override.clone()))
+        } else {
+            (item.auto_extract, item.extractor_override.clone())
+        };
         let margin_y = if theme.compact_mode { 7 } else { 11 };
 
         Frame::new()
@@ -877,7 +891,7 @@ impl VortexApp {
                             && (!item.status.is_finished() || item.file_path.exists());
                         if is_archive {
                             let has_pw = item.extract_password.is_some();
-                            let pw_btn_label = if has_pw { "Senha ✓" } else { "Senha" };
+                            let pw_btn_label = if has_pw { "Senha (OK)" } else { "Senha" };
                             if ui
                                 .button(pw_btn_label)
                                 .on_hover_text("Definir ou alterar senha de extração")
@@ -895,23 +909,14 @@ impl VortexApp {
                             }
 
                             let combo_label = if !item.status.is_finished() {
-                                if !item.auto_extract {
+                                if !eff_auto_extract {
                                     "Não extrair".to_string()
-                                } else if let Some(ref ov_id) = item.extractor_override {
-                                    extractors
-                                        .iter()
-                                        .find(|p| &p.id == ov_id)
-                                        .map(|p| {
-                                            let short = if p.id == "windows_native" {
-                                                "Win. Nativo"
-                                            } else {
-                                                p.name.as_str()
-                                            };
-                                            format!("Extrair: {short}")
-                                        })
-                                        .unwrap_or_else(|| "Extrair com...".to_string())
                                 } else {
-                                    "Extrair com...".to_string()
+                                    extractor_combo_label(
+                                        eff_extractor.as_deref(),
+                                        &default_ext_id,
+                                        &extractors,
+                                    )
                                 }
                             } else {
                                 "Extrair com...".to_string()
@@ -921,10 +926,10 @@ impl VortexApp {
                             ui.add_enabled_ui(can_interact, |ui| {
                                 egui::ComboBox::from_id_salt(("ext_now", item.id))
                                     .selected_text(combo_label)
-                                    .width(122.0)
+                                    .width(128.0)
                                     .show_ui(ui, |ui| {
                                         let auto_selected =
-                                            item.auto_extract && item.extractor_override.is_none();
+                                            eff_auto_extract && eff_extractor.is_none();
                                         if ui.selectable_label(auto_selected, "Padrão (Auto)").clicked()
                                         {
                                             self.manager.set_extractor_override(item.id, None, true);
@@ -934,8 +939,8 @@ impl VortexApp {
                                         }
                                         for prof in &extractors {
                                             if prof.detected && prof.enabled {
-                                                let prof_selected = item.auto_extract
-                                                    && item.extractor_override.as_deref()
+                                                let prof_selected = eff_auto_extract
+                                                    && eff_extractor.as_deref()
                                                         == Some(prof.id.as_str());
                                                 if ui
                                                     .selectable_label(prof_selected, &prof.name)
@@ -959,7 +964,7 @@ impl VortexApp {
                                         }
                                         if !item.status.is_finished() {
                                             if ui
-                                                .selectable_label(!item.auto_extract, "Não extrair")
+                                                .selectable_label(!eff_auto_extract, "Não extrair")
                                                 .clicked()
                                             {
                                                 self.manager
@@ -1184,6 +1189,11 @@ impl VortexApp {
             return;
         }
 
+        let (default_ext_id, extractors) = {
+            let s = self.manager.settings.read();
+            (s.default_extractor_id.clone(), s.extractors.clone())
+        };
+
         ScrollArea::vertical().show(ui, |ui| {
             for pkg in &snap.packages {
                 let parts: Vec<&DownloadItem> = pkg
@@ -1242,13 +1252,87 @@ impl VortexApp {
                                 }
                                 let pkg_all_done = !parts.is_empty()
                                     && parts.iter().all(|p| p.status == DownloadStatus::Completed);
+                                let pkg_extracting = pkg
+                                    .extraction_status
+                                    .as_deref()
+                                    .is_some_and(|s| s.starts_with("Extraindo"))
+                                    || parts
+                                        .iter()
+                                        .any(|p| p.status == DownloadStatus::Extracting);
                                 if pkg_all_done {
                                     if ui.button("Extrair").clicked() {
                                         self.manager.trigger_package_extract(pkg.id, None);
                                     }
                                 }
+                                let pkg_combo_label = if !pkg_all_done {
+                                    if !pkg.auto_extract {
+                                        "Não extrair".to_string()
+                                    } else {
+                                        extractor_combo_label(
+                                            pkg.extractor_id.as_deref(),
+                                            &default_ext_id,
+                                            &extractors,
+                                        )
+                                    }
+                                } else {
+                                    "Extrair com...".to_string()
+                                };
+                                ui.add_enabled_ui(!pkg_extracting, |ui| {
+                                    egui::ComboBox::from_id_salt(("pkg_ext_now", pkg.id))
+                                        .selected_text(pkg_combo_label)
+                                        .width(128.0)
+                                        .show_ui(ui, |ui| {
+                                            let auto_selected =
+                                                pkg.auto_extract && pkg.extractor_id.is_none();
+                                            if ui
+                                                .selectable_label(auto_selected, "Padrão (Auto)")
+                                                .clicked()
+                                            {
+                                                self.manager
+                                                    .set_package_extractor(pkg.id, None, true);
+                                                if pkg_all_done {
+                                                    self.manager
+                                                        .trigger_package_extract(pkg.id, None);
+                                                }
+                                            }
+                                            for prof in &extractors {
+                                                if prof.detected && prof.enabled {
+                                                    let prof_selected = pkg.auto_extract
+                                                        && pkg.extractor_id.as_deref()
+                                                            == Some(prof.id.as_str());
+                                                    if ui
+                                                        .selectable_label(prof_selected, &prof.name)
+                                                        .clicked()
+                                                    {
+                                                        self.manager.set_package_extractor(
+                                                            pkg.id,
+                                                            Some(prof.id.clone()),
+                                                            true,
+                                                        );
+                                                        if pkg_all_done {
+                                                            self.manager.trigger_package_extract(
+                                                                pkg.id, None,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if !pkg_all_done {
+                                                if ui
+                                                    .selectable_label(
+                                                        !pkg.auto_extract,
+                                                        "Não extrair",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.manager
+                                                        .set_package_extractor(pkg.id, None, false);
+                                                }
+                                            }
+                                        });
+                                });
                                 let pw_label = if pkg.extract_password.is_some() {
-                                    "Senha ✓"
+                                    "Senha (OK)"
                                 } else {
                                     "Senha"
                                 };
@@ -1340,13 +1424,15 @@ impl VortexApp {
                                     );
                                 }
                             } else if pkg.auto_extract {
+                                let ext_id = pkg
+                                    .extractor_id
+                                    .as_deref()
+                                    .unwrap_or(default_ext_id.as_str());
+                                let ext_name = extractor_display_name(ext_id, &extractors);
                                 ui.label(
-                                    RichText::new(format!(
-                                        "• Extração automática ({})",
-                                        pkg.extractor_id.as_deref().unwrap_or("Auto")
-                                    ))
-                                    .small()
-                                    .color(to_c32(theme.accent)),
+                                    RichText::new(format!("• Extração automática ({ext_name})"))
+                                        .small()
+                                        .color(to_c32(theme.accent)),
                                 );
                             }
                         });
@@ -1909,7 +1995,7 @@ impl VortexApp {
                             .selected_text(cur_label)
                             .show_ui(ui, |ui| {
                                 changed |= ui
-                                    .selectable_value(&mut settings.default_extractor_id, "auto".into(), "Automático (Prioridade: NanaZip → 7-Zip → WinRAR → PeaZip → Windows)")
+                                    .selectable_value(&mut settings.default_extractor_id, "auto".into(), "Automático (Prioridade: NanaZip > 7-Zip > WinRAR > PeaZip > Windows)")
                                     .changed();
                                 for (id, name) in names {
                                     changed |= ui
@@ -2973,4 +3059,27 @@ fn extractor_display_name(id: &str, list: &[ExtractorProfile]) -> String {
         .find(|e| e.id == id)
         .map(|e| e.name.clone())
         .unwrap_or_else(|| id.to_string())
+}
+
+fn extractor_combo_label(
+    override_id: Option<&str>,
+    default_id: &str,
+    list: &[ExtractorProfile],
+) -> String {
+    let eff = override_id.unwrap_or(default_id);
+    if eff == "auto" {
+        return "Extrair: Auto".to_string();
+    }
+    let short = list
+        .iter()
+        .find(|p| p.id == eff)
+        .map(|p| {
+            if p.id == "windows_native" {
+                "Win. Nativo"
+            } else {
+                p.name.as_str()
+            }
+        })
+        .unwrap_or(eff);
+    format!("Extrair: {short}")
 }

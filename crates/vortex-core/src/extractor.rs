@@ -210,8 +210,13 @@ pub fn detect_default_extractors(existing: &[ExtractorProfile]) -> Vec<Extractor
             profiles.push(updated);
         } else if let Some(prof) = profiles.iter_mut().find(|p| p.id == old.id) {
             if !old.executable.is_empty() && old.executable != prof.executable {
+                let ignore_git_tar = prof.kind == ExtractorKind::WindowsNative
+                    && old.executable.to_lowercase().contains("\\git\\usr\\bin\\tar.exe");
                 // Keep user custom override if path exists
-                if Path::new(&old.executable).exists() || find_in_path(&old.executable).is_some() {
+                if !ignore_git_tar
+                    && (Path::new(&old.executable).exists()
+                        || find_in_path(&old.executable).is_some())
+                {
                     prof.executable = old.executable.clone();
                     prof.detected = true;
                 }
@@ -810,5 +815,42 @@ mod tests {
         assert!(!is_password_error_text("Everything is Ok"));
         let summary = summarize_extractor_output("line1\nline2\nERROR: CRC Failed", "");
         assert_eq!(summary, "ERROR: CRC Failed");
+    }
+
+    #[test]
+    fn select_best_extractor_respects_explicit_windows_native_override() {
+        let mut settings = AppSettings::default();
+        settings.default_extractor_id = "nanazip".into();
+        settings.extractors = vec![
+            ExtractorProfile {
+                id: "nanazip".into(),
+                name: "NanaZip".into(),
+                kind: ExtractorKind::NanaZip,
+                executable: "NanaZipC.exe".into(),
+                args_template: "x".into(),
+                password_arg_template: None,
+                silent: true,
+                detected: true,
+                detected_path: Some("NanaZipC.exe".into()),
+                supported_extensions: vec!["zip".into()],
+                enabled: true,
+            },
+            ExtractorProfile {
+                id: "windows_native".into(),
+                name: "Windows Nativo (tar.exe / PowerShell)".into(),
+                kind: ExtractorKind::WindowsNative,
+                executable: "tar.exe".into(),
+                args_template: "-xf".into(),
+                password_arg_template: None,
+                silent: true,
+                detected: true,
+                detected_path: Some("tar.exe".into()),
+                supported_extensions: vec!["zip".into()],
+                enabled: true,
+            },
+        ];
+
+        let selected = select_best_extractor(&settings, Some("windows_native")).unwrap();
+        assert_eq!(selected.id, "windows_native");
     }
 }

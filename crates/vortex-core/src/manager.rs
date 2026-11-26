@@ -786,9 +786,9 @@ impl DownloadManager {
                         Ok(finished_item) => {
                             mgr.cancel_handles.write().remove(&id);
                             let is_done = finished_item.status == DownloadStatus::Completed;
-                            mgr.replace_item(finished_item.clone());
+                            let merged_item = mgr.replace_item(finished_item);
                             if is_done {
-                                mgr.handle_post_download_completion(finished_item).await;
+                                mgr.handle_post_download_completion(merged_item).await;
                             }
                         }
                         Err(e) if e.downcast_ref::<HtmlPageDetected>().is_some() => {
@@ -840,9 +840,9 @@ impl DownloadManager {
                                         Ok(finished_item) => {
                                             let is_done =
                                                 finished_item.status == DownloadStatus::Completed;
-                                            mgr.replace_item(finished_item.clone());
+                                            let merged_item = mgr.replace_item(finished_item);
                                             if is_done {
-                                                mgr.handle_post_download_completion(finished_item)
+                                                mgr.handle_post_download_completion(merged_item)
                                                     .await;
                                             }
                                         }
@@ -937,7 +937,9 @@ impl DownloadManager {
 
                                 mgr.cancel_handles.write().remove(&id);
                                 match media_res {
-                                    Ok(finished_item) => mgr.replace_item(finished_item),
+                                    Ok(finished_item) => {
+                                        mgr.replace_item(finished_item);
+                                    }
                                     Err(err) => mgr.mark_failed(id, err.to_string()),
                                 }
                             } else {
@@ -955,9 +957,9 @@ impl DownloadManager {
                                 match fallback_res {
                                     Ok(finished_item) => {
                                         let is_done = finished_item.status == DownloadStatus::Completed;
-                                        mgr.replace_item(finished_item.clone());
+                                        let merged_item = mgr.replace_item(finished_item);
                                         if is_done {
-                                            mgr.handle_post_download_completion(finished_item).await;
+                                            mgr.handle_post_download_completion(merged_item).await;
                                         }
                                     }
                                     Err(err) => mgr.mark_failed(id, err.to_string()),
@@ -1060,11 +1062,14 @@ impl DownloadManager {
         }
     }
 
-    fn replace_item(&self, updated: DownloadItem) {
+    fn replace_item(&self, updated: DownloadItem) -> DownloadItem {
         let mut dls = self.downloads.write();
         if let Some(slot) = dls.iter_mut().find(|d| d.id == updated.id) {
-            *slot = updated;
+            let merged = merge_completed_download_item(slot, updated);
+            *slot = merged.clone();
+            return merged;
         }
+        updated
     }
 
     fn mark_failed(&self, id: DownloadId, err: String) {
@@ -1078,6 +1083,13 @@ impl DownloadManager {
     }
 
     async fn handle_post_download_completion(self: &Arc<Self>, item: DownloadItem) {
+        let item = self
+            .downloads
+            .read()
+            .iter()
+            .find(|d| d.id == item.id)
+            .cloned()
+            .unwrap_or(item);
         // Case 1: Part of a multi-part Package -> check if ALL parts of that package are now Completed!
         if let Some(pkg_id) = item.package_id {
             let pkg_info = {
@@ -1153,20 +1165,50 @@ impl DownloadManager {
         extractor_id: Option<String>,
         auto_extract: bool,
     ) {
-        let mut package_id = None;
+        let package_id = self
+            .downloads
+            .read()
+            .iter()
+            .find(|x| x.id == id)
+            .and_then(|x| x.package_id);
+
+        if let Some(pid) = package_id {
+            self.set_package_extractor(pid, extractor_id, auto_extract);
+            return;
+        }
+
         {
             let mut dls = self.downloads.write();
             if let Some(d) = dls.iter_mut().find(|x| x.id == id) {
-                d.extractor_override = extractor_id.clone();
+                d.extractor_override = extractor_id;
                 d.auto_extract = auto_extract;
-                package_id = d.package_id;
             }
         }
-        if let Some(pid) = package_id {
+        self.persist_now();
+    }
+
+    pub fn set_package_extractor(
+        &self,
+        pkg_id: PackageId,
+        extractor_id: Option<String>,
+        auto_extract: bool,
+    ) {
+        let item_ids: Vec<DownloadId> = {
             let mut pkgs = self.packages.write();
-            if let Some(p) = pkgs.iter_mut().find(|x| x.id == pid) {
-                p.extractor_id = extractor_id;
+            if let Some(p) = pkgs.iter_mut().find(|x| x.id == pkg_id) {
+                p.extractor_id = extractor_id.clone();
                 p.auto_extract = auto_extract;
+                p.item_ids.clone()
+            } else {
+                Vec::new()
+            }
+        };
+        if !item_ids.is_empty() {
+            let mut dls = self.downloads.write();
+            for d in dls.iter_mut() {
+                if item_ids.contains(&d.id) {
+                    d.extractor_override = extractor_id.clone();
+                }
             }
         }
         self.persist_now();
@@ -1739,6 +1781,19 @@ impl DownloadManager {
     }
 }
 
+fn merge_completed_download_item(live_slot: &DownloadItem, mut updated: DownloadItem) -> DownloadItem {
+    updated.auto_extract = live_slot.auto_extract;
+    updated.extractor_override = live_slot.extractor_override.clone();
+    updated.extract_password = live_slot.extract_password.clone();
+    updated.package_id = live_slot.package_id;
+    updated.part_index = live_slot.part_index;
+    updated.part_total = live_slot.part_total;
+    updated.extracted_to = live_slot.extracted_to.clone();
+    updated.extraction_status = live_slot.extraction_status.clone();
+    updated.extraction_progress = live_slot.extraction_progress;
+    updated
+}
+
 pub fn is_valid_grabbed_link(link: &GrabbedLink) -> bool {
     link.part_number.is_some()
         && link.online == Some(true)
@@ -1831,5 +1886,64 @@ mod tests {
         let mut zero_size = valid.clone();
         zero_size.size_bytes = Some(0);
         assert!(!is_valid_grabbed_link(&zero_size));
+    }
+
+    #[test]
+    fn merge_completed_download_item_preserves_mid_download_extractor_and_password_edits() {
+        let now = Utc::now();
+        let initial = DownloadItem {
+            id: Uuid::new_v4(),
+            package_id: None,
+            part_index: None,
+            part_total: None,
+            kind: DownloadKind::Http,
+            status: DownloadStatus::Downloading,
+            url: "https://example.com/archive.zip".into(),
+            filename: "archive.zip".into(),
+            save_dir: PathBuf::from("C:/dl"),
+            file_path: PathBuf::from("C:/dl/archive.zip"),
+            category: FileCategory::Archive,
+            total_bytes: Some(1000),
+            downloaded_bytes: 0,
+            uploaded_bytes: 0,
+            speed_bps: 0,
+            upload_speed_bps: 0,
+            eta_seconds: None,
+            connections: 4,
+            supports_ranges: true,
+            segments: Vec::new(),
+            etag: None,
+            last_modified: None,
+            headers: HashMap::new(),
+            checksum_expected: None,
+            checksum_verified: None,
+            media_info: None,
+            torrent_info: None,
+            auto_extract: true,
+            extractor_override: Some("nanazip".into()),
+            extract_password: None,
+            extracted_to: None,
+            extraction_status: None,
+            extraction_progress: None,
+            created_at: now,
+            completed_at: None,
+            error: None,
+        };
+
+        let mut live_slot = initial.clone();
+        live_slot.extractor_override = Some("windows_native".into());
+        live_slot.extract_password = Some("secret123".into());
+
+        let mut worker_finished = initial;
+        worker_finished.status = DownloadStatus::Completed;
+        worker_finished.downloaded_bytes = 1000;
+        worker_finished.completed_at = Some(now);
+
+        let merged = merge_completed_download_item(&live_slot, worker_finished);
+        assert_eq!(merged.status, DownloadStatus::Completed);
+        assert_eq!(merged.downloaded_bytes, 1000);
+        assert_eq!(merged.extractor_override.as_deref(), Some("windows_native"));
+        assert_eq!(merged.extract_password.as_deref(), Some("secret123"));
+        assert!(merged.auto_extract);
     }
 }

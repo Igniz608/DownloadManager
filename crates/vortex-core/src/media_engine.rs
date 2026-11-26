@@ -228,10 +228,16 @@ async fn run_yt_dlp_probe(
     url: &str,
     headers: &HashMap<String, String>,
     include_cookies: bool,
+    single_video: bool,
 ) -> Result<std::process::Output> {
     let mut cmd = Command::new(yt_dlp_path);
     crate::extractor::configure_silent_command(&mut cmd);
-    cmd.args(["-J", "--no-warnings", "--flat-playlist", "--playlist-end", "100"]);
+    cmd.args(["-J", "--no-warnings"]);
+    if single_video {
+        cmd.arg("--no-playlist");
+    } else {
+        cmd.args(["--flat-playlist", "--playlist-end", "100"]);
+    }
     if let Some(rt) = detect_js_runtime() {
         cmd.args(["--js-runtimes", rt]);
     }
@@ -245,10 +251,27 @@ pub async fn probe_media_url(
     url: &str,
     headers: &HashMap<String, String>,
 ) -> Result<MediaProbeResult> {
+    probe_media_url_impl(yt_dlp_path, url, headers, false).await
+}
+
+pub async fn probe_single_media_url(
+    yt_dlp_path: &str,
+    url: &str,
+    headers: &HashMap<String, String>,
+) -> Result<MediaProbeResult> {
+    probe_media_url_impl(yt_dlp_path, url, headers, true).await
+}
+
+async fn probe_media_url_impl(
+    yt_dlp_path: &str,
+    url: &str,
+    headers: &HashMap<String, String>,
+    single_video: bool,
+) -> Result<MediaProbeResult> {
     let include_cookies = !is_youtube_url(url);
-    let mut output = run_yt_dlp_probe(yt_dlp_path, url, headers, include_cookies).await?;
+    let mut output = run_yt_dlp_probe(yt_dlp_path, url, headers, include_cookies, single_video).await?;
     if !output.status.success() && include_cookies && has_cookie_header(headers) {
-        output = run_yt_dlp_probe(yt_dlp_path, url, headers, false).await?;
+        output = run_yt_dlp_probe(yt_dlp_path, url, headers, false, single_video).await?;
     }
     if !output.status.success() {
         return Err(anyhow!(

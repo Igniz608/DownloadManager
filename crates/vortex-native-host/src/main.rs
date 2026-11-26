@@ -213,6 +213,7 @@ fn main() {
             "download" => forward_http(req.port, "POST", "/api/downloads", Some(&body_str)),
             "grab" => forward_http(req.port, "POST", "/api/grab", Some(&body_str)),
             "media" => forward_http(req.port, "POST", "/api/media", Some(&body_str)),
+            "media_probe" => forward_http(req.port, "POST", "/api/media/probe", Some(&body_str)),
             "torrent" => forward_http(req.port, "POST", "/api/torrent", Some(&body_str)),
             "pause_all" => forward_http(req.port, "POST", "/api/pause-all", Some("{}")),
             "resume_all" => forward_http(req.port, "POST", "/api/resume-all", Some("{}")),

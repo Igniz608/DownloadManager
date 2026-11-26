@@ -1,5 +1,6 @@
 use crate::manager::DownloadManager;
-use crate::model::{NewDownloadRequest, NewMediaRequest};
+use crate::media_engine::{detect_media_tools, probe_media_url, probe_single_media_url};
+use crate::model::{MediaProbeResult, NewDownloadRequest, NewMediaRequest};
 use crate::state::app_data_dir;
 use anyhow::Result;
 use axum::extract::State;
@@ -43,6 +44,22 @@ pub struct ApiActionResponse {
     pub id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MediaProbePayload {
+    pub url: String,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub single_video: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MediaProbeApiResponse {
+    pub ok: bool,
+    pub message: Option<String>,
+    pub result: Option<MediaProbeResult>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct StatusItemSummary {
     pub id: String,
@@ -70,6 +87,7 @@ pub fn spawn_ipc_server(manager: Arc<DownloadManager>, port: u16) {
             .route("/api/downloads", post(handle_add_download))
             .route("/api/grab", post(handle_grab))
             .route("/api/media", post(handle_add_media))
+            .route("/api/media/probe", post(handle_probe_media))
             .route("/api/torrent", post(handle_add_torrent))
             .route("/api/pause-all", post(handle_pause_all))
             .route("/api/resume-all", post(handle_resume_all))
@@ -176,6 +194,48 @@ async fn handle_add_media(
                 ok: false,
                 message: e.to_string(),
                 id: None,
+            }),
+        ),
+    }
+}
+
+async fn handle_probe_media(
+    State(mgr): State<Arc<DownloadManager>>,
+    Json(req): Json<MediaProbePayload>,
+) -> (StatusCode, Json<MediaProbeApiResponse>) {
+    let tools = detect_media_tools(&mgr.settings.read());
+    let Some(yt_dlp) = tools.yt_dlp_path else {
+        return (
+            StatusCode::OK,
+            Json(MediaProbeApiResponse {
+                ok: false,
+                message: Some("yt-dlp não instalado".into()),
+                result: None,
+            }),
+        );
+    };
+
+    let res = if req.single_video {
+        probe_single_media_url(&yt_dlp, &req.url, &req.headers).await
+    } else {
+        probe_media_url(&yt_dlp, &req.url, &req.headers).await
+    };
+
+    match res {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(MediaProbeApiResponse {
+                ok: true,
+                message: None,
+                result: Some(result),
+            }),
+        ),
+        Err(e) => (
+            StatusCode::OK,
+            Json(MediaProbeApiResponse {
+                ok: false,
+                message: Some(e.to_string()),
+                result: None,
             }),
         ),
     }

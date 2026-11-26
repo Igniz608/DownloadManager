@@ -143,6 +143,8 @@ async function sendToVortex(endpoint, payload) {
           ? "download"
           : endpoint === "/api/media"
           ? "media"
+          : endpoint === "/api/media/probe"
+          ? "media_probe"
           : endpoint === "/api/grab"
           ? "grab"
           : "ping";
@@ -728,6 +730,101 @@ function isKnownVideoPlatformUrl(rawUrl) {
   }
 }
 
+const probeCache = new Map();
+
+async function resolveOverlayMediaTarget(msg, sender) {
+  const tabUrl = sender?.tab?.url || msg.pageUrl || "";
+  const frameUrl = msg.frameUrl || tabUrl;
+  const title = sender?.tab?.title || msg.title || null;
+  const tabId = sender?.tab?.id;
+  const videoSrc = (msg.videoSrc || "").trim();
+
+  let targetUrl = tabUrl || frameUrl;
+  let targetHeaders = { Referer: tabUrl || frameUrl };
+  let isHls = false;
+  let isDash = false;
+
+  const usePageExtractor = isKnownVideoPlatformUrl(tabUrl) || isKnownVideoPlatformUrl(frameUrl);
+  if (usePageExtractor) {
+    targetUrl = isKnownVideoPlatformUrl(tabUrl) ? tabUrl : frameUrl;
+  } else if (videoSrc.startsWith("http://") || videoSrc.startsWith("https://")) {
+    targetUrl = videoSrc;
+    targetHeaders = { ...(recentHeaders.get(videoSrc) || {}), Referer: tabUrl || frameUrl };
+    isHls = videoSrc.toLowerCase().includes(".m3u8");
+    isDash = videoSrc.toLowerCase().includes(".mpd");
+  } else if (tabId != null && tabMedia.has(tabId)) {
+    const items = Array.from(tabMedia.get(tabId).values());
+    const preferred =
+      items.slice().reverse().find((i) => i.isHls || i.isDash) ||
+      items[items.length - 1];
+    if (preferred) {
+      targetUrl = preferred.url;
+      targetHeaders = { ...(preferred.headers || {}), Referer: tabUrl || frameUrl };
+      isHls = Boolean(preferred.isHls);
+      isDash = Boolean(preferred.isDash);
+    }
+  }
+
+  const cookie = await collectCookiesHeader(targetUrl);
+  if (cookie && !targetHeaders.Cookie) targetHeaders.Cookie = cookie;
+
+  return {
+    targetUrl,
+    targetHeaders,
+    title,
+    isHls: isHls || targetUrl.toLowerCase().includes(".m3u8"),
+    isDash: isDash || targetUrl.toLowerCase().includes(".mpd"),
+  };
+}
+
+function summarizeProbeFormats(probeResult) {
+  const formats = Array.isArray(probeResult?.formats) ? probeResult.formats : [];
+  const byHeight = new Map();
+  let bestAudio = null;
+
+  for (const f of formats) {
+    if (f.is_audio_only) {
+      if (!bestAudio || (f.filesize || 0) > (bestAudio.filesize || 0)) {
+        bestAudio = f;
+      }
+      continue;
+    }
+    const res = String(f.resolution || "");
+    const m = res.match(/(\d+)x(\d+)|(\d+)p/);
+    const height = m ? parseInt(m[2] || m[3] || "0", 10) : 0;
+    if (height <= 0) continue;
+
+    const ext = String(f.ext || "mp4").toLowerCase();
+    const vcodec = String(f.vcodec || "").toLowerCase();
+    const score =
+      (ext === "mp4" ? 100 : 0) +
+      (vcodec.startsWith("avc1") ? 40 : vcodec.startsWith("vp") ? 20 : 10) +
+      (f.filesize ? 5 : 0);
+
+    const prev = byHeight.get(height);
+    if (!prev || score > prev._score || (score === prev._score && (f.filesize || 0) > (prev.filesize || 0))) {
+      byHeight.set(height, {
+        format_id: f.format_id,
+        height,
+        label: `${height}p`,
+        ext,
+        filesize: f.filesize || null,
+        _score: score,
+      });
+    }
+  }
+
+  const qualities = Array.from(byHeight.values())
+    .sort((a, b) => b.height - a.height)
+    .map(({ _score, ...rest }) => rest);
+
+  return {
+    title: probeResult?.title || null,
+    qualities,
+    audioSize: bestAudio?.filesize || null,
+  };
+}
+
 // Messages from popup.js and content.js
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
@@ -756,48 +853,42 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         is_dash: Boolean(msg.isDash) || msg.url.toLowerCase().includes(".mpd"),
       });
       sendResponse(res);
-    } else if (msg.type === "SEND_VIDEO_OVERLAY") {
-      const tabUrl = sender?.tab?.url || msg.pageUrl || "";
-      const frameUrl = msg.frameUrl || tabUrl;
-      const title = sender?.tab?.title || msg.title || null;
-      const tabId = sender?.tab?.id;
-      const videoSrc = (msg.videoSrc || "").trim();
-
-      let targetUrl = tabUrl || frameUrl;
-      let targetHeaders = { Referer: tabUrl || frameUrl };
-      let isHls = false;
-      let isDash = false;
-
-      const usePageExtractor = isKnownVideoPlatformUrl(tabUrl) || isKnownVideoPlatformUrl(frameUrl);
-      if (usePageExtractor) {
-        targetUrl = isKnownVideoPlatformUrl(tabUrl) ? tabUrl : frameUrl;
-      } else if (videoSrc.startsWith("http://") || videoSrc.startsWith("https://")) {
-        targetUrl = videoSrc;
-        targetHeaders = { ...(recentHeaders.get(videoSrc) || {}), Referer: tabUrl || frameUrl };
-        isHls = videoSrc.toLowerCase().includes(".m3u8");
-        isDash = videoSrc.toLowerCase().includes(".mpd");
-      } else if (tabId != null && tabMedia.has(tabId)) {
-        const items = Array.from(tabMedia.get(tabId).values());
-        const preferred =
-          items.slice().reverse().find((i) => i.isHls || i.isDash) ||
-          items[items.length - 1];
-        if (preferred) {
-          targetUrl = preferred.url;
-          targetHeaders = { ...(preferred.headers || {}), Referer: tabUrl || frameUrl };
-          isHls = Boolean(preferred.isHls);
-          isDash = Boolean(preferred.isDash);
-        }
+    } else if (msg.type === "PROBE_VIDEO_OVERLAY") {
+      const target = await resolveOverlayMediaTarget(msg, sender);
+      const cached = probeCache.get(target.targetUrl);
+      if (cached && Date.now() - cached.ts < 60000) {
+        sendResponse({ ok: true, ...cached.summary });
+        return;
       }
 
-      const cookie = await collectCookiesHeader(targetUrl);
-      if (cookie && !targetHeaders.Cookie) targetHeaders.Cookie = cookie;
-
+      const raw = await sendToVortex("/api/media/probe", {
+        url: target.targetUrl,
+        headers: target.targetHeaders,
+        single_video: true,
+      });
+      const probeResult = raw?.data?.result || raw?.result;
+      const ok = Boolean((raw?.data?.ok ?? raw?.ok) && probeResult);
+      if (!ok) {
+        sendResponse({ ok: false, error: raw?.data?.message || raw?.message || raw?.error || "Falha ao consultar formatos" });
+        return;
+      }
+      const summary = summarizeProbeFormats(probeResult);
+      probeCache.set(target.targetUrl, { ts: Date.now(), summary });
+      if (probeCache.size > 40) {
+        probeCache.delete(probeCache.keys().next().value);
+      }
+      sendResponse({ ok: true, ...summary });
+    } else if (msg.type === "SEND_VIDEO_OVERLAY") {
+      const target = await resolveOverlayMediaTarget(msg, sender);
       const res = await sendToVortex("/api/media", {
-        url: targetUrl,
-        title_hint: title,
-        headers: targetHeaders,
-        is_hls: isHls || targetUrl.toLowerCase().includes(".m3u8"),
-        is_dash: isDash || targetUrl.toLowerCase().includes(".mpd"),
+        url: target.targetUrl,
+        title_hint: target.title,
+        format_id: msg.formatId || null,
+        quality_label: msg.qualityLabel || null,
+        audio_only: Boolean(msg.audioOnly),
+        headers: target.targetHeaders,
+        is_hls: target.isHls,
+        is_dash: target.isDash,
       });
       sendResponse(res);
     } else if (msg.type === "SEND_BATCH_LINKS") {

@@ -6,8 +6,21 @@
   let tabHasDetectedMedia = false;
   let rescanScheduled = false;
   let positionScheduled = false;
+  let activeMenuEntry = null;
 
   const trackedVideos = new Map();
+
+  function formatBytes(bytes) {
+    if (!bytes || bytes <= 0) return "";
+    const units = ["B", "KB", "MB", "GB"];
+    let v = bytes;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i++;
+    }
+    return `${v.toFixed(1)} ${units[i]}`;
+  }
 
   chrome.storage.local.get("vortexSettings", (data) => {
     const s = data?.vortexSettings;
@@ -114,6 +127,13 @@
     return hasPlayableSource(video);
   }
 
+  function closeActiveMenu() {
+    if (!activeMenuEntry) return;
+    activeMenuEntry.menu.classList.remove("open");
+    activeMenuEntry.btn.classList.remove("menu-open");
+    activeMenuEntry = null;
+  }
+
   function createOverlayForVideo(video) {
     const host = document.createElement("div");
     host.setAttribute("data-vortexdl-overlay", "1");
@@ -124,6 +144,13 @@
     const style = document.createElement("style");
     style.textContent = `
       :host { all: initial; }
+      .wrap {
+        position: relative;
+        display: inline-flex;
+        flex-direction: column;
+        align-items: flex-end;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      }
       .vortex-btn {
         pointer-events: auto;
         display: inline-flex;
@@ -137,7 +164,7 @@
         backdrop-filter: blur(8px);
         -webkit-backdrop-filter: blur(8px);
         color: rgba(238, 241, 247, 0.92);
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-family: inherit;
         font-size: 11.5px;
         font-weight: 600;
         letter-spacing: 0.15px;
@@ -148,11 +175,14 @@
         transition: opacity 0.18s ease, background 0.16s ease, border-color 0.16s ease, transform 0.14s ease, box-shadow 0.16s ease;
         user-select: none;
       }
-      .vortex-btn:hover {
+      .vortex-btn:hover,
+      .vortex-btn.menu-open {
         opacity: 0.98;
-        background: rgba(19, 23, 34, 0.9);
+        background: rgba(19, 23, 34, 0.92);
         border-color: rgba(124, 92, 255, 0.95);
         box-shadow: 0 4px 14px rgba(0, 0, 0, 0.38);
+      }
+      .vortex-btn:hover {
         transform: translateY(-1px);
       }
       .vortex-btn:active {
@@ -184,12 +214,114 @@
         stroke-linecap: round;
         stroke-linejoin: round;
       }
+      .vortex-caret {
+        width: 10px !important;
+        height: 10px !important;
+        opacity: 0.78;
+        margin-left: 1px;
+      }
+      .vortex-menu {
+        pointer-events: auto;
+        display: none;
+        margin-top: 6px;
+        width: 232px;
+        max-height: 320px;
+        overflow-y: auto;
+        background: rgba(15, 17, 23, 0.94);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        border: 1px solid rgba(124, 92, 255, 0.45);
+        border-radius: 10px;
+        padding: 6px;
+        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.48);
+        color: #eef1f7;
+      }
+      .vortex-menu.open {
+        display: block;
+      }
+      .vortex-menu.flip-up {
+        position: absolute;
+        bottom: 33px;
+        right: 0;
+        margin-top: 0;
+      }
+      .menu-header {
+        font-size: 11px;
+        font-weight: 600;
+        color: #9aa3b8;
+        padding: 4px 7px 6px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        margin-bottom: 4px;
+      }
+      .menu-section {
+        font-size: 10px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: #7c87a2;
+        padding: 5px 7px 3px;
+      }
+      .menu-item {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        background: transparent;
+        border: none;
+        border-radius: 7px;
+        padding: 6px 8px;
+        color: #eef1f7;
+        font-family: inherit;
+        font-size: 12px;
+        font-weight: 500;
+        text-align: left;
+        cursor: pointer;
+        transition: background 0.12s ease;
+      }
+      .menu-item:hover {
+        background: rgba(124, 92, 255, 0.22);
+      }
+      .menu-item-main {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
+      }
+      .menu-item-meta {
+        font-size: 10.5px;
+        color: #9aa3b8;
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+      .menu-item.audio-item {
+        color: #7df0a6;
+      }
+      .menu-item.audio-item:hover {
+        background: rgba(60, 208, 112, 0.16);
+      }
+      .menu-divider {
+        height: 1px;
+        background: rgba(255, 255, 255, 0.08);
+        margin: 5px 4px;
+      }
+      .menu-status {
+        font-size: 10.5px;
+        color: #9aa3b8;
+        padding: 4px 7px 2px;
+      }
     `;
+
+    const wrap = document.createElement("div");
+    wrap.className = "wrap";
 
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "vortex-btn";
-    btn.title = "Baixar vídeo com VortexDL";
+    btn.title = "Escolher qualidade ou áudio para baixar no VortexDL";
     btn.innerHTML = `
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path d="M12 3v12"></path>
@@ -201,20 +333,33 @@
     labelEl.textContent = "Baixar";
     btn.appendChild(labelEl);
 
+    const caret = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    caret.setAttribute("viewBox", "0 0 24 24");
+    caret.setAttribute("aria-hidden", "true");
+    caret.setAttribute("class", "vortex-caret");
+    caret.innerHTML = `<path d="m6 9 6 6 6-6"></path>`;
+    btn.appendChild(caret);
+
+    const menu = document.createElement("div");
+    menu.className = "vortex-menu";
+
     const stopBubble = (e) => {
       e.stopPropagation();
     };
-    btn.addEventListener("mousedown", stopBubble, true);
-    btn.addEventListener("pointerdown", stopBubble, true);
-    btn.addEventListener("dblclick", (e) => {
+    wrap.addEventListener("mousedown", stopBubble, true);
+    wrap.addEventListener("pointerdown", stopBubble, true);
+    wrap.addEventListener("dblclick", (e) => {
       e.preventDefault();
       e.stopPropagation();
     });
 
     let resetTimer = null;
-    btn.addEventListener("click", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
+    let probeInFlight = false;
+    let lastProbeData = null;
+    let lastProbeSrc = "";
+
+    function triggerDownload({ formatId = null, qualityLabel = null, audioOnly = false }) {
+      closeActiveMenu();
       if (btn.classList.contains("busy")) return;
 
       if (resetTimer) {
@@ -232,6 +377,9 @@
           pageUrl: window.location.href,
           frameUrl: window.location.href,
           title: document.title,
+          formatId,
+          qualityLabel,
+          audioOnly,
         },
         (res) => {
           btn.classList.remove("busy");
@@ -249,10 +397,171 @@
           }, 2200);
         }
       );
+    }
+
+    function addMenuOption(container, { label, meta = "", isAudio = false, onSelect }) {
+      const itemBtn = document.createElement("button");
+      itemBtn.type = "button";
+      itemBtn.className = isAudio ? "menu-item audio-item" : "menu-item";
+
+      const main = document.createElement("span");
+      main.className = "menu-item-main";
+      main.textContent = label;
+      itemBtn.appendChild(main);
+
+      if (meta) {
+        const metaEl = document.createElement("span");
+        metaEl.className = "menu-item-meta";
+        metaEl.textContent = meta;
+        itemBtn.appendChild(metaEl);
+      }
+
+      itemBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onSelect();
+      });
+      container.appendChild(itemBtn);
+    }
+
+    function renderMenu() {
+      menu.innerHTML = "";
+
+      const header = document.createElement("div");
+      header.className = "menu-header";
+      header.textContent = lastProbeData?.title || document.title || "Baixar mídia";
+      menu.appendChild(header);
+
+      const videoSec = document.createElement("div");
+      videoSec.className = "menu-section";
+      videoSec.textContent = "Vídeo + Áudio";
+      menu.appendChild(videoSec);
+
+      addMenuOption(menu, {
+        label: "Melhor qualidade",
+        meta: "Auto",
+        onSelect: () => triggerDownload({ qualityLabel: "Melhor qualidade" }),
+      });
+
+      const qualities = lastProbeData?.qualities;
+      if (Array.isArray(qualities) && qualities.length > 0) {
+        for (const q of qualities.slice(0, 7)) {
+          const sizeTxt = formatBytes(q.filesize);
+          const meta = [q.ext || "mp4", sizeTxt].filter(Boolean).join(" • ");
+          addMenuOption(menu, {
+            label: q.label,
+            meta,
+            onSelect: () =>
+              triggerDownload({
+                formatId: q.format_id,
+                qualityLabel: q.label,
+                audioOnly: false,
+              }),
+          });
+        }
+      } else {
+        for (const h of [1080, 720, 480, 360]) {
+          addMenuOption(menu, {
+            label: `${h}p`,
+            meta: "mp4",
+            onSelect: () =>
+              triggerDownload({
+                formatId: `bv*[height<=${h}]+ba/b[height<=${h}]/best`,
+                qualityLabel: `${h}p`,
+                audioOnly: false,
+              }),
+          });
+        }
+      }
+
+      const divider = document.createElement("div");
+      divider.className = "menu-divider";
+      menu.appendChild(divider);
+
+      const audioSec = document.createElement("div");
+      audioSec.className = "menu-section";
+      audioSec.textContent = "Somente Áudio";
+      menu.appendChild(audioSec);
+
+      addMenuOption(menu, {
+        label: "Áudio MP3 (alta qualidade)",
+        meta: formatBytes(lastProbeData?.audioSize) || "MP3",
+        isAudio: true,
+        onSelect: () =>
+          triggerDownload({
+            qualityLabel: "Áudio MP3",
+            audioOnly: true,
+          }),
+      });
+
+      if (probeInFlight) {
+        const statusEl = document.createElement("div");
+        statusEl.className = "menu-status";
+        statusEl.textContent = "Consultando qualidades disponíveis...";
+        menu.appendChild(statusEl);
+      }
+    }
+
+    function openMenu() {
+      if (activeMenuEntry && activeMenuEntry.menu !== menu) {
+        closeActiveMenu();
+      }
+
+      const rect = video.getBoundingClientRect();
+      const spaceBelow = window.innerHeight - (rect.top + 40);
+      menu.classList.toggle("flip-up", spaceBelow < 240 && rect.top > 240);
+
+      const key = `${window.location.href}|${resolveVideoSrc(video)}`;
+      if (key !== lastProbeSrc) {
+        lastProbeSrc = key;
+        lastProbeData = null;
+      }
+
+      menu.classList.add("open");
+      btn.classList.add("menu-open");
+      activeMenuEntry = { host, btn, menu };
+
+      if (!lastProbeData && !probeInFlight) {
+        probeInFlight = true;
+        renderMenu();
+        chrome.runtime.sendMessage(
+          {
+            type: "PROBE_VIDEO_OVERLAY",
+            videoSrc: resolveVideoSrc(video),
+            pageUrl: window.location.href,
+            frameUrl: window.location.href,
+            title: document.title,
+          },
+          (res) => {
+            probeInFlight = false;
+            if (!chrome.runtime.lastError && res?.ok) {
+              lastProbeData = res;
+            }
+            if (menu.classList.contains("open")) {
+              renderMenu();
+            }
+          }
+        );
+      } else {
+        renderMenu();
+      }
+    }
+
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (btn.classList.contains("busy")) return;
+      if (menu.classList.contains("open")) {
+        closeActiveMenu();
+      } else {
+        openMenu();
+      }
     });
 
+    wrap.appendChild(btn);
+    wrap.appendChild(menu);
     shadow.appendChild(style);
-    shadow.appendChild(btn);
+    shadow.appendChild(wrap);
 
     const mountTarget = document.fullscreenElement || document.documentElement;
     if (mountTarget) {
@@ -267,13 +576,16 @@
     const ro = new ResizeObserver(() => schedulePositionUpdate());
     ro.observe(video);
 
-    trackedVideos.set(video, { host, btn, labelEl, ro, onMediaEvent });
+    trackedVideos.set(video, { host, btn, labelEl, menu, ro, onMediaEvent });
     return trackedVideos.get(video);
   }
 
   function removeOverlay(video) {
     const entry = trackedVideos.get(video);
     if (!entry) return;
+    if (activeMenuEntry && activeMenuEntry.menu === entry.menu) {
+      activeMenuEntry = null;
+    }
     entry.ro.disconnect();
     video.removeEventListener("loadedmetadata", entry.onMediaEvent);
     video.removeEventListener("play", entry.onMediaEvent);
@@ -283,6 +595,7 @@
   }
 
   function removeAllOverlays() {
+    closeActiveMenu();
     for (const video of Array.from(trackedVideos.keys())) {
       removeOverlay(video);
     }
@@ -307,13 +620,16 @@
       }
 
       if (!isEligibleVideo(video)) {
+        if (activeMenuEntry && activeMenuEntry.menu === entry.menu) {
+          closeActiveMenu();
+        }
         entry.host.style.display = "none";
         continue;
       }
 
       const rect = video.getBoundingClientRect();
       entry.host.style.display = "block";
-      const btnWidth = entry.btn.offsetWidth || 76;
+      const btnWidth = entry.btn.offsetWidth || 86;
       const top = Math.max(8, Math.min(window.innerHeight - 36, rect.top + 10));
       const left = Math.max(8, Math.min(window.innerWidth - btnWidth - 8, rect.right - btnWidth - 10));
       entry.host.style.top = `${Math.round(top)}px`;
@@ -370,6 +686,22 @@
       attributeFilter: ["src", "style", "class"],
     });
   }
+
+  document.addEventListener(
+    "pointerdown",
+    (e) => {
+      if (!activeMenuEntry) return;
+      if (e.target === activeMenuEntry.host) return;
+      closeActiveMenu();
+    },
+    true
+  );
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && activeMenuEntry) {
+      closeActiveMenu();
+    }
+  });
 
   window.addEventListener("scroll", schedulePositionUpdate, { passive: true, capture: true });
   window.addEventListener("resize", schedulePositionUpdate, { passive: true });

@@ -424,8 +424,8 @@
     const stopBubble = (e) => {
       e.stopPropagation();
     };
-    wrap.addEventListener("mousedown", stopBubble, true);
-    wrap.addEventListener("pointerdown", stopBubble, true);
+    wrap.addEventListener("mousedown", stopBubble);
+    wrap.addEventListener("pointerdown", stopBubble);
     wrap.addEventListener("dblclick", (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -647,20 +647,27 @@
       schedulePositionUpdate();
     });
 
+    btn.draggable = false;
     btn.title = "Clique para escolher qualidade ou arraste para mover";
 
     btn.addEventListener("pointerdown", (e) => {
       if (e.button !== 0 || btn.classList.contains("busy")) return;
+      e.preventDefault();
       e.stopPropagation();
 
       const startX = e.clientX;
       const startY = e.clientY;
-      const startLeft = parseFloat(host.style.left) || btn.getBoundingClientRect().left;
-      const startTop = parseFloat(host.style.top) || btn.getBoundingClientRect().top;
+      const currentRect = btn.getBoundingClientRect();
+      const startLeftRaw = parseFloat(host.style.left);
+      const startTopRaw = parseFloat(host.style.top);
+      const startLeft = Number.isFinite(startLeftRaw) ? startLeftRaw : currentRect.left;
+      const startTop = Number.isFinite(startTopRaw) ? startTopRaw : currentRect.top;
       const pointerId = e.pointerId;
       let dragging = false;
+      let finished = false;
 
       const onPointerMove = (moveEvent) => {
+        if (moveEvent.pointerId !== undefined && moveEvent.pointerId !== pointerId) return;
         const dx = moveEvent.clientX - startX;
         const dy = moveEvent.clientY - startY;
         if (!dragging) {
@@ -695,7 +702,13 @@
         sitePosition = { rx, ry };
       };
 
-      const finishDrag = () => {
+      const finishDrag = (upEvent) => {
+        if (finished) return;
+        if (upEvent?.pointerId !== undefined && upEvent.pointerId !== pointerId) return;
+        finished = true;
+        btn.removeEventListener("pointermove", onPointerMove);
+        btn.removeEventListener("pointerup", finishDrag);
+        btn.removeEventListener("pointercancel", finishDrag);
         window.removeEventListener("pointermove", onPointerMove, true);
         window.removeEventListener("pointerup", finishDrag, true);
         window.removeEventListener("pointercancel", finishDrag, true);
@@ -709,7 +722,7 @@
           suppressNextClick = true;
           setTimeout(() => {
             suppressNextClick = false;
-          }, 80);
+          }, 100);
           isDragging = false;
           const entry = trackedVideos.get(video);
           if (entry) entry.isDragging = false;
@@ -719,6 +732,9 @@
         }
       };
 
+      btn.addEventListener("pointermove", onPointerMove);
+      btn.addEventListener("pointerup", finishDrag);
+      btn.addEventListener("pointercancel", finishDrag);
       window.addEventListener("pointermove", onPointerMove, true);
       window.addEventListener("pointerup", finishDrag, true);
       window.addEventListener("pointercancel", finishDrag, true);

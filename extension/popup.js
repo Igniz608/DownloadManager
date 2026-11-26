@@ -20,13 +20,20 @@ async function init() {
   const statusBadge = document.getElementById("statusBadge");
   const interceptToggle = document.getElementById("interceptToggle");
   const videoOverlayToggle = document.getElementById("videoOverlayToggle");
+  const overlayHoverToggle = document.getElementById("overlayHoverToggle");
   const mediaList = document.getElementById("mediaList");
   const mediaCount = document.getElementById("mediaCount");
 
   const stored = await chrome.storage.local.get("vortexSettings");
-  const currentSettings = stored.vortexSettings || { interceptDownloads: true, showVideoOverlay: true };
+  const currentSettings = stored.vortexSettings || {
+    interceptDownloads: true,
+    showVideoOverlay: true,
+    overlayOnlyOnHover: false,
+  };
   interceptToggle.checked = currentSettings.interceptDownloads !== false;
   videoOverlayToggle.checked = currentSettings.showVideoOverlay !== false;
+  overlayHoverToggle.checked = Boolean(currentSettings.overlayOnlyOnHover);
+  overlayHoverToggle.disabled = !videoOverlayToggle.checked;
 
   interceptToggle.addEventListener("change", async () => {
     currentSettings.interceptDownloads = interceptToggle.checked;
@@ -36,11 +43,22 @@ async function init() {
 
   videoOverlayToggle.addEventListener("change", async () => {
     currentSettings.showVideoOverlay = videoOverlayToggle.checked;
+    overlayHoverToggle.disabled = !videoOverlayToggle.checked;
     await chrome.storage.local.set({ vortexSettings: currentSettings });
     setFeedback(
       videoOverlayToggle.checked
         ? "Botão sobre vídeos ativado."
         : "Botão sobre vídeos ocultado."
+    );
+  });
+
+  overlayHoverToggle.addEventListener("change", async () => {
+    currentSettings.overlayOnlyOnHover = overlayHoverToggle.checked;
+    await chrome.storage.local.set({ vortexSettings: currentSettings });
+    setFeedback(
+      overlayHoverToggle.checked
+        ? "Botão exibido somente ao passar o mouse no vídeo."
+        : "Botão sempre visível sobre vídeos."
     );
   });
 

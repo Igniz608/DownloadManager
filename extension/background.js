@@ -15,6 +15,7 @@ const cancellingIds = new Set();
 const DEFAULT_SETTINGS = {
   interceptDownloads: true,
   showVideoOverlay: true,
+  overlayOnlyOnHover: false,
   minSizeBytes: 512 * 1024, // 512 KB minimum for auto-interception (skip tiny icons/html)
   interceptExtensions: [
     "zip", "rar", "7z", "tar", "gz", "xz", "bz2", "z01", "r00", "001",

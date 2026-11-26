@@ -95,23 +95,33 @@ async function init() {
   });
 
   document.getElementById("btnGrabAllLinks").addEventListener("click", () => {
-    chrome.tabs.sendMessage(tab.id, { type: "COLLECT_LINKS", selectionOnly: false }, (res) => {
-      const urls = res?.urls || [];
-      if (urls.length === 0) {
-        setFeedback("Nenhum link encontrado na página.", true);
-        return;
-      }
-      chrome.runtime.sendMessage(
-        { type: "SEND_BATCH_LINKS", urls, pageUrl: tab.url },
-        (apiRes) => {
-          if (apiRes?.ok !== false) {
-            setFeedback(`${urls.length} links enviados para o LinkGrabber!`);
+    setFeedback("Coletando links da página...");
+    chrome.runtime.sendMessage(
+      { type: "COLLECT_TAB_LINKS", tabId: tab.id, selectionOnly: false },
+      (collected) => {
+        const urls = collected?.urls || [];
+        if (urls.length === 0) {
+          if (collected?.error && tab.url?.startsWith("file://")) {
+            setFeedback("Ative 'Permitir acesso a URLs de arquivo' nos detalhes da extensão.", true);
+          } else if (collected?.hasDownloadButtons) {
+            setFeedback("Botões dinâmicos (JS) — clique em DOWNLOAD na página para interceptar.", true);
           } else {
-            setFeedback(`Erro: ${apiRes?.error || "Falha ao enviar"}`, true);
+            setFeedback("Nenhum link encontrado na página.", true);
           }
+          return;
         }
-      );
-    });
+        chrome.runtime.sendMessage(
+          { type: "SEND_BATCH_LINKS", urls, pageUrl: tab.url },
+          (apiRes) => {
+            if (apiRes?.ok !== false) {
+              setFeedback(`${urls.length} link(s) enviados para o LinkGrabber!`);
+            } else {
+              setFeedback(`Erro: ${apiRes?.error || "Falha ao enviar"}`, true);
+            }
+          }
+        );
+      }
+    );
   });
 
   chrome.runtime.sendMessage({ type: "GET_TAB_MEDIA", tabId: tab.id }, (res) => {

@@ -685,17 +685,282 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       is_dash: targetUrl.toLowerCase().includes(".mpd"),
     });
   } else if (info.menuItemId === "vortex-grab-page-links" && tab?.id) {
-    chrome.tabs.sendMessage(tab.id, { type: "COLLECT_LINKS", selectionOnly: Boolean(info.selectionText) }, async (res) => {
-      if (res?.urls?.length) {
-        const cookie = tab.url ? await collectCookiesHeader(tab.url) : "";
-        const headers = {};
-        if (tab.url) headers.Referer = tab.url;
-        if (cookie) headers.Cookie = cookie;
-        await sendToVortex("/api/grab", { urls: res.urls, headers });
+    const collected = await collectAllTabLinks(tab.id, Boolean(info.selectionText));
+    if (collected.urls?.length) {
+      const cookie = tab.url ? await collectCookiesHeader(tab.url) : "";
+      const headers = {};
+      if (tab.url) headers.Referer = tab.url;
+      if (cookie) headers.Cookie = cookie;
+      await sendToVortex("/api/grab", { urls: collected.urls, headers });
+    }
+  }
+});
+
+function collectLinksFromFrame(selectionOnly) {
+  const allUrls = new Set();
+  const priorityUrls = new Set();
+  let hasDownloadButtons = false;
+
+  const HOSTER_RE =
+    /(?:^|\.)(?:fileditch|fileditchfiles|filekeeper|pixeldrain|gofile|vikingfile|mediafire|buzzheavier|1fichier|mega\.nz|mega\.co\.nz|qiwi\.gg|krakenfiles|akirabox|datanodes|uploadhaven|send\.cm|rapidgator|ddownload|katfile|nitroflare|turbobit|workupload|bowfile|ranoz|anonfiles|bayfiles|dropbox\.com|drive\.google\.com|1drv\.ms|onedrive\.live\.com|huggingface\.co|archive\.org)(?:\/|$|\.)/i;
+  const FILE_EXT_RE =
+    /\.(?:rar|zip|7z|tar|gz|bz2|xz|part\d+|r\d{2}|z\d{2}|\d{3}|iso|img|exe|msi|apk|dmg|pkg|deb|rpm|torrent|mp4|mkv|avi|mov|webm|m3u8|mpd|mp3|flac|wav|m4a|pdf|epub)(?:[?#]|$)/i;
+  const STATIC_ASSET_RE =
+    /\.(?:css|js|mjs|cjs|map|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|otf)(?:[?#]|$)/i;
+  const DOWNLOAD_TEXT_RE = /\b(?:download|baixar|mirror|part\s*\d+)\b/i;
+
+  const pageSelfBase = `${window.location.origin}${window.location.pathname}${window.location.search}`;
+
+  function resolveCandidate(raw) {
+    if (!raw || typeof raw !== "string") return null;
+    let cleaned = raw
+      .trim()
+      .replace(/^["'`(<[]+/, "")
+      .replace(/["'`>\];,]+$/, "");
+    while (cleaned.endsWith(")")) {
+      const opens = (cleaned.match(/\(/g) || []).length;
+      const closes = (cleaned.match(/\)/g) || []).length;
+      if (closes > opens) {
+        cleaned = cleaned.slice(0, -1).replace(/["'`>\];,]+$/, "");
+      } else {
+        break;
+      }
+    }
+    if (!cleaned || cleaned.startsWith("#")) return null;
+    if (/^(?:javascript|mailto|tel|data|blob|about):/i.test(cleaned)) return null;
+    if (cleaned.startsWith("magnet:?")) return cleaned;
+    try {
+      const parsed = new URL(cleaned, window.location.href);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+      const base = `${parsed.origin}${parsed.pathname}${parsed.search}`;
+      if (base === pageSelfBase && parsed.hash) return null;
+      if (parsed.href === window.location.href) return null;
+      return parsed.href;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function isStaticAsset(url) {
+    try {
+      const pathname = new URL(url).pathname;
+      return STATIC_ASSET_RE.test(pathname);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function isDownloadIntent(url, label, forceMedia = false) {
+    if (!url) return false;
+    if (url.startsWith("magnet:?")) return true;
+    if (forceMedia) return true;
+    try {
+      const u = new URL(url);
+      if (HOSTER_RE.test(u.hostname)) return true;
+      if (FILE_EXT_RE.test(u.pathname + u.search)) return true;
+      if (
+        u.hostname === "github.com" &&
+        /\/releases\/(?:download|tag)\//i.test(u.pathname)
+      ) {
+        return true;
+      }
+      if (label && DOWNLOAD_TEXT_RE.test(label) && !isStaticAsset(url)) {
+        return true;
+      }
+      if (/\/(?:download|dl|getfile)\b/i.test(u.pathname) && !isStaticAsset(url)) {
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function addUrl(raw, label = "", forceMedia = false) {
+    const resolved = resolveCandidate(raw);
+    if (!resolved) return;
+    if (!forceMedia && isStaticAsset(resolved)) return;
+    allUrls.add(resolved);
+    if (isDownloadIntent(resolved, label, forceMedia)) {
+      priorityUrls.add(resolved);
+    }
+  }
+
+  function extractUrlsFromText(text, requireDownloadIntent) {
+    if (!text || typeof text !== "string") return;
+    const normalized = text
+      .replace(/\\\//g, "/")
+      .replace(/\\u002[fF]/g, "/");
+    const matches = normalized.match(/(?:https?:\/\/|magnet:\?)[^\s"'<>\\`\]}]+/gi) || [];
+    for (const m of matches) {
+      const resolved = resolveCandidate(m);
+      if (!resolved || isStaticAsset(resolved)) continue;
+      if (!requireDownloadIntent || isDownloadIntent(resolved, "")) {
+        allUrls.add(resolved);
+        if (isDownloadIntent(resolved, "")) {
+          priorityUrls.add(resolved);
+        }
+      }
+    }
+  }
+
+  function getElementLabel(el) {
+    return [
+      el.innerText,
+      el.textContent,
+      el.getAttribute?.("aria-label"),
+      el.getAttribute?.("title"),
+      el.getAttribute?.("download"),
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+  }
+
+  function collectFromRoot(root) {
+    if (!root || !root.querySelectorAll) return;
+
+    root.querySelectorAll("a[href], area[href]").forEach((el) => {
+      const label = getElementLabel(el);
+      if (DOWNLOAD_TEXT_RE.test(label)) hasDownloadButtons = true;
+      addUrl(el.getAttribute("href") || el.href, label, el.hasAttribute("download"));
+    });
+
+    root
+      .querySelectorAll("video[src], video source[src], audio[src], audio source[src]")
+      .forEach((el) => {
+        addUrl(el.getAttribute("src") || el.src, "media", true);
+      });
+
+    root.querySelectorAll("iframe[src]").forEach((el) => {
+      addUrl(el.getAttribute("src") || el.src, "iframe", false);
+    });
+
+    root
+      .querySelectorAll(
+        "button, [role='button'], [onclick], form[action], [formaction], input[type='button'], input[type='submit'], [data-url], [data-href], [data-link], [data-download], [data-file], [data-src], [data-clipboard-text]"
+      )
+      .forEach((el) => {
+        const label = getElementLabel(el);
+        if (DOWNLOAD_TEXT_RE.test(label) || DOWNLOAD_TEXT_RE.test(el.value || "")) {
+          hasDownloadButtons = true;
+        }
+        if (el.attributes) {
+          for (const attr of el.attributes) {
+            const name = attr.name.toLowerCase();
+            const val = attr.value || "";
+            if (!val) continue;
+            if (
+              name === "href" ||
+              name === "action" ||
+              name === "formaction" ||
+              name === "data-url" ||
+              name === "data-href" ||
+              name === "data-link" ||
+              name === "data-download" ||
+              name === "data-file" ||
+              name === "data-src" ||
+              name === "data-clipboard-text"
+            ) {
+              addUrl(val, label || "download", DOWNLOAD_TEXT_RE.test(label));
+            } else if (name === "onclick" || name.startsWith("data-")) {
+              extractUrlsFromText(val, false);
+              const relMatch = val.match(/['"]((?:\/|\.\.?\/)[^'"]+)['"]/g) || [];
+              for (const rm of relMatch) {
+                addUrl(rm.slice(1, -1), label || "download", DOWNLOAD_TEXT_RE.test(label));
+              }
+            }
+          }
+        }
+      });
+
+    root.querySelectorAll("*").forEach((el) => {
+      if (el.shadowRoot) {
+        collectFromRoot(el.shadowRoot);
       }
     });
   }
-});
+
+  if (selectionOnly) {
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0) {
+      const frag = sel.getRangeAt(0).cloneContents();
+      collectFromRoot(frag);
+      extractUrlsFromText(sel.toString(), false);
+      if (allUrls.size > 0) {
+        return {
+          urls: priorityUrls.size > 0 ? Array.from(priorityUrls) : Array.from(allUrls),
+          priorityUrls: Array.from(priorityUrls),
+          allUrls: Array.from(allUrls),
+          hasDownloadButtons,
+        };
+      }
+    }
+  }
+
+  collectFromRoot(document);
+
+  document.querySelectorAll("script").forEach((s) => {
+    if (!s.src && s.textContent && s.textContent.length <= 600000) {
+      extractUrlsFromText(s.textContent, true);
+    }
+  });
+
+  if (document.body?.innerText) {
+    extractUrlsFromText(document.body.innerText, true);
+  }
+
+  const urls = priorityUrls.size > 0 ? Array.from(priorityUrls) : Array.from(allUrls);
+  return {
+    urls,
+    priorityUrls: Array.from(priorityUrls),
+    allUrls: Array.from(allUrls),
+    hasDownloadButtons,
+  };
+}
+
+async function collectAllTabLinks(tabId, selectionOnly = false) {
+  const mergedPriority = new Set();
+  const mergedAll = new Set();
+  let hasDownloadButtons = false;
+
+  try {
+    const frames = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: collectLinksFromFrame,
+      args: [Boolean(selectionOnly)],
+    });
+    for (const frame of frames || []) {
+      const res = frame?.result;
+      if (!res) continue;
+      if (res.hasDownloadButtons) hasDownloadButtons = true;
+      (res.priorityUrls || []).forEach((u) => mergedPriority.add(u));
+      (res.allUrls || res.urls || []).forEach((u) => mergedAll.add(u));
+    }
+    const urls = mergedPriority.size > 0 ? Array.from(mergedPriority) : Array.from(mergedAll);
+    return { urls, hasDownloadButtons };
+  } catch (err) {
+    return await new Promise((resolve) => {
+      chrome.tabs.sendMessage(
+        tabId,
+        { type: "COLLECT_LINKS", selectionOnly: Boolean(selectionOnly) },
+        (res) => {
+          const sendErr = chrome.runtime.lastError;
+          if (sendErr || !res) {
+            resolve({
+              urls: [],
+              hasDownloadButtons: false,
+              error: err?.message || sendErr?.message || "Script execution failed",
+            });
+          } else {
+            resolve({
+              urls: res.urls || [],
+              hasDownloadButtons: Boolean(res.hasDownloadButtons),
+            });
+          }
+        }
+      );
+    });
+  }
+}
 
 function isKnownVideoPlatformUrl(rawUrl) {
   try {
@@ -891,6 +1156,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         is_hls: target.isHls,
         is_dash: target.isDash,
       });
+      sendResponse(res);
+    } else if (msg.type === "COLLECT_TAB_LINKS") {
+      const res = await collectAllTabLinks(msg.tabId, Boolean(msg.selectionOnly));
       sendResponse(res);
     } else if (msg.type === "SEND_BATCH_LINKS") {
       const cookie = msg.pageUrl ? await collectCookiesHeader(msg.pageUrl) : "";

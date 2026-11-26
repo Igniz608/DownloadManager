@@ -126,7 +126,12 @@ async function sendToVortex(endpoint, payload) {
     if (resp.ok) {
       return await resp.json();
     }
-  } catch (_) {
+    const errBody = await resp.json().catch(() => null);
+    extLog("sendToVortex.httpError", { endpoint, status: resp.status, errBody });
+    if (resp.status >= 400 && resp.status < 500) {
+      return errBody || { ok: false, error: `HTTP ${resp.status}` };
+    }
+  } catch (err) {
     // Fallback to Native Messaging, which launches vortex-gui.exe if closed
   }
 

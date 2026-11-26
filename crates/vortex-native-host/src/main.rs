@@ -2,8 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 #[derive(Debug, Deserialize)]
 struct NativeRequest {
@@ -63,9 +66,19 @@ fn ensure_gui_running(port: u16) -> bool {
         if let Some(dir) = cur_exe.parent() {
             let gui = dir.join("vortex-gui.exe");
             if gui.exists() {
-                let _ = Command::new(gui).spawn();
+                let mut cmd = Command::new(gui);
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                #[cfg(windows)]
+                {
+                    const DETACHED_PROCESS: u32 = 0x00000008;
+                    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+                    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+                }
+                let _ = cmd.spawn();
                 let start = Instant::now();
-                while start.elapsed() < Duration::from_secs(5) {
+                while start.elapsed() < Duration::from_secs(8) {
                     if TcpStream::connect_timeout(
                         &addr.parse().unwrap(),
                         Duration::from_millis(250),
@@ -74,7 +87,7 @@ fn ensure_gui_running(port: u16) -> bool {
                     {
                         return true;
                     }
-                    std::thread::sleep(Duration::from_millis(150));
+                    std::thread::sleep(Duration::from_millis(100));
                 }
             }
         }

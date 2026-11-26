@@ -73,6 +73,7 @@ pub fn spawn_ipc_server(manager: Arc<DownloadManager>, port: u16) {
             .route("/api/torrent", post(handle_add_torrent))
             .route("/api/pause-all", post(handle_pause_all))
             .route("/api/resume-all", post(handle_resume_all))
+            .route("/api/ext-log", post(handle_ext_log))
             .layer(CorsLayer::permissive())
             .with_state(manager);
 
@@ -221,6 +222,19 @@ async fn handle_resume_all(State(mgr): State<Arc<DownloadManager>>) -> Json<ApiA
         message: "Downloads retomados".into(),
         id: None,
     })
+}
+
+async fn handle_ext_log(Json(payload): Json<serde_json::Value>) -> StatusCode {
+    use std::io::Write;
+    let log_path = app_data_dir().join("extension-debug.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let _ = writeln!(file, "{payload}");
+    }
+    StatusCode::OK
 }
 
 /// Registers Chrome, Edge, Brave, and Firefox Native Messaging manifests in Windows HKCU Registry.

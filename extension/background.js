@@ -39,6 +39,36 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   }
 });
 
+function extLog(event, data = {}) {
+  const entry = { ts: new Date().toISOString(), event, ...data };
+  try {
+    fetch(`${API_BASE}/api/ext-log`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(entry),
+    }).catch(() => {});
+  } catch (_) {}
+}
+
+function summarizeItem(item) {
+  if (!item) return null;
+  return {
+    id: item.id,
+    url: item.url,
+    finalUrl: item.finalUrl,
+    filename: item.filename,
+    mime: item.mime,
+    state: item.state,
+    paused: item.paused,
+    incognito: item.incognito,
+    danger: item.danger,
+    bytesReceived: item.bytesReceived,
+    totalBytes: item.totalBytes,
+    fileSize: item.fileSize,
+    byExtensionId: item.byExtensionId,
+  };
+}
+
 function downloadsCall(fn) {
   return new Promise((resolve) => {
     try {
@@ -327,33 +357,40 @@ function callSuggestOnce(entry) {
 
 async function forceCancelDownload(id, entry) {
   cancellingIds.add(id);
-  await downloadsCall((cb) => chrome.downloads.cancel(id, cb));
-  await downloadsCall((cb) => chrome.downloads.erase({ id }, cb));
+  const c1 = await downloadsCall((cb) => chrome.downloads.cancel(id, cb));
+  const e1 = await downloadsCall((cb) => chrome.downloads.erase({ id }, cb));
+  extLog("forceCancel.initial", { id, c1, e1, hasSuggest: Boolean(entry?.suggest), suggested: Boolean(entry?.suggested) });
 
   // Verify the download actually left in_progress; some Chromium states require suggest() before cancel()
-  const verifyAndFinish = async () => {
+  const verifyAndFinish = async (tag) => {
     const res = await downloadsCall((cb) => chrome.downloads.search({ id }, cb));
     const found = Array.isArray(res.result) ? res.result[0] : null;
+    extLog(`forceCancel.verify.${tag}`, { id, searchOk: res.ok, searchErr: res.error, found: summarizeItem(found) });
     if (found && found.state === "in_progress") {
       callSuggestOnce(entry);
-      await downloadsCall((cb) => chrome.downloads.cancel(id, cb));
-      await downloadsCall((cb) => chrome.downloads.erase({ id }, cb));
+      const c2 = await downloadsCall((cb) => chrome.downloads.cancel(id, cb));
+      const e2 = await downloadsCall((cb) => chrome.downloads.erase({ id }, cb));
+      extLog(`forceCancel.afterSuggest.${tag}`, { id, c2, e2 });
     } else if (found) {
-      await downloadsCall((cb) => chrome.downloads.erase({ id }, cb));
+      const e3 = await downloadsCall((cb) => chrome.downloads.erase({ id }, cb));
+      extLog(`forceCancel.eraseNonActive.${tag}`, { id, e3 });
     }
   };
 
-  await verifyAndFinish();
+  await verifyAndFinish("t0");
   setTimeout(() => {
-    verifyAndFinish().catch(() => {});
+    verifyAndFinish("t150").catch(() => {});
   }, 150);
   setTimeout(() => {
-    verifyAndFinish().catch(() => {});
-    cancellingIds.delete(id);
+    verifyAndFinish("t1500").catch(() => {});
   }, 1500);
+  setTimeout(() => {
+    verifyAndFinish("t10000").catch(() => {});
+    cancellingIds.delete(id);
+  }, 10000);
 }
 
-async function releaseHeldDownload(entry) {
+async function releaseHeldDownload(entry, reason = "unmatched") {
   if (!entry || entry.decided) return;
   entry.decided = true;
   if (entry.decisionTimer) {
@@ -362,7 +399,8 @@ async function releaseHeldDownload(entry) {
   }
   heldDownloads.delete(entry.id);
   callSuggestOnce(entry);
-  await downloadsCall((cb) => chrome.downloads.resume(entry.id, cb));
+  const r = await downloadsCall((cb) => chrome.downloads.resume(entry.id, cb));
+  extLog("decide.release", { id: entry.id, reason, r, item: summarizeItem(entry.item) });
 }
 
 async function decideHeldDownload(entry, trigger) {
@@ -428,6 +466,7 @@ async function decideHeldDownload(entry, trigger) {
         headers,
         start_immediately: true,
       });
+      extLog("decide.sendToVortex", { id: entry.id, trigger, matched, filename, res });
 
       heldDownloads.delete(entry.id);
       if (res && res.ok !== false) {
@@ -436,7 +475,8 @@ async function decideHeldDownload(entry, trigger) {
         cancellingIds.delete(entry.id);
         await addBypassUrl(url);
         callSuggestOnce(entry);
-        await downloadsCall((cb) => chrome.downloads.resume(entry.id, cb));
+        const r = await downloadsCall((cb) => chrome.downloads.resume(entry.id, cb));
+        extLog("decide.fallbackResume", { id: entry.id, r });
       }
       return;
     }
@@ -452,7 +492,7 @@ async function decideHeldDownload(entry, trigger) {
     }
 
     if (trigger === "onDeterminingFilename" || trigger === "timeout") {
-      await releaseHeldDownload(entry);
+      await releaseHeldDownload(entry, trigger);
     }
   } finally {
     entry.processing = false;
@@ -466,6 +506,7 @@ async function decideHeldDownload(entry, trigger) {
 
 // Universal stage 1: pause synchronously in onCreated on every browser (Edge, Chrome, Brave, Firefox)
 chrome.downloads.onCreated.addListener((item) => {
+  extLog("downloads.onCreated", { item: summarizeItem(item), interceptDownloads: cachedSettings.interceptDownloads });
   if (!item || item.byExtensionId) return;
   if (item.state && item.state !== "in_progress") return;
   const url = item.finalUrl || item.url;
@@ -479,7 +520,8 @@ chrome.downloads.onCreated.addListener((item) => {
 
   // Pause immediately before any await so the browser stops pulling bytes right away
   chrome.downloads.pause(item.id, () => {
-    void chrome.runtime.lastError;
+    const err = chrome.runtime.lastError;
+    if (err) extLog("onCreated.pauseError", { id: item.id, error: err.message });
   });
 
   const entry = {
@@ -498,6 +540,7 @@ chrome.downloads.onCreated.addListener((item) => {
 // Stage 2 (Chromium/Edge/Brave/Vivaldi): stash suggest() to defer native Save As and capture Content-Disposition
 if (chrome.downloads.onDeterminingFilename) {
   chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+    extLog("downloads.onDeterminingFilename", { item: summarizeItem(item), hasHeld: heldDownloads.has(item?.id), isCancelling: cancellingIds.has(item?.id) });
     const url = item.finalUrl || item.url;
     if (!url || !url.startsWith("http") || item.byExtensionId) {
       suggest();
@@ -512,7 +555,8 @@ if (chrome.downloads.onDeterminingFilename) {
 
     if (cancellingIds.has(item.id)) {
       chrome.downloads.cancel(item.id, () => {
-        void chrome.runtime.lastError;
+        const err = chrome.runtime.lastError;
+        if (err) extLog("onDeterminingFilename.cancelError", { id: item.id, error: err.message });
       });
       chrome.downloads.erase({ id: item.id }, () => {
         void chrome.runtime.lastError;
@@ -556,6 +600,7 @@ if (chrome.downloads.onDeterminingFilename) {
 // Stage 3: enforce cancellation on any state/attribute change and update metadata on Firefox
 chrome.downloads.onChanged.addListener((delta) => {
   if (cancellingIds.has(delta.id)) {
+    extLog("downloads.onChanged.cancelling", { delta });
     if (delta.state && delta.state.current === "interrupted") {
       cancellingIds.delete(delta.id);
       chrome.downloads.erase({ id: delta.id }, () => {
@@ -564,13 +609,15 @@ chrome.downloads.onChanged.addListener((delta) => {
       return;
     }
     chrome.downloads.cancel(delta.id, () => {
-      void chrome.runtime.lastError;
+      const err = chrome.runtime.lastError;
+      if (err) extLog("onChanged.cancelError", { id: delta.id, error: err.message });
     });
     return;
   }
 
   const entry = heldDownloads.get(delta.id);
   if (!entry) return;
+  extLog("downloads.onChanged.held", { delta });
   if (delta.filename?.current) {
     entry.item.filename = delta.filename.current;
   }

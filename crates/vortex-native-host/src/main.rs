@@ -56,6 +56,28 @@ fn write_frame(val: &NativeResponse) -> io::Result<()> {
     out.flush()
 }
 
+#[cfg(windows)]
+fn clear_std_handle_inheritance() {
+    const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
+    const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+    const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+
+    unsafe extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> isize;
+        fn SetHandleInformation(hObject: isize, dwMask: u32, dwFlags: u32) -> i32;
+    }
+
+    unsafe {
+        for std_id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let h = GetStdHandle(std_id);
+            if h != 0 && h != -1 {
+                let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
 fn ensure_gui_running(port: u16) -> bool {
     let addr = format!("127.0.0.1:{port}");
     if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(250)).is_ok() {
@@ -66,17 +88,34 @@ fn ensure_gui_running(port: u16) -> bool {
         if let Some(dir) = cur_exe.parent() {
             let gui = dir.join("vortex-gui.exe");
             if gui.exists() {
-                let mut cmd = Command::new(gui);
-                cmd.stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
+                #[cfg(windows)]
+                clear_std_handle_inheritance();
+
+                let spawn_gui = |flags: u32| {
+                    let mut cmd = Command::new(&gui);
+                    cmd.stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null());
+                    #[cfg(windows)]
+                    cmd.creation_flags(flags);
+                    cmd.spawn()
+                };
+
                 #[cfg(windows)]
                 {
                     const DETACHED_PROCESS: u32 = 0x00000008;
                     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-                    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+                    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+                    let base_flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+                    if spawn_gui(base_flags | CREATE_BREAKAWAY_FROM_JOB).is_err() {
+                        let _ = spawn_gui(base_flags);
+                    }
                 }
-                let _ = cmd.spawn();
+                #[cfg(not(windows))]
+                {
+                    let _ = spawn_gui(0);
+                }
+
                 let start = Instant::now();
                 while start.elapsed() < Duration::from_secs(8) {
                     if TcpStream::connect_timeout(

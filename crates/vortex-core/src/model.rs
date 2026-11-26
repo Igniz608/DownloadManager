@@ -273,6 +273,8 @@ pub struct GrabbedLink {
     pub package_key: Option<String>,
     pub part_number: Option<u32>,
     pub part_total: Option<u32>,
+    #[serde(default)]
+    pub source_site: Option<String>,
     pub selected: bool,
     pub headers: HashMap<String, String>,
     pub error: Option<String>,

@@ -167,6 +167,7 @@ async fn handle_grab(
     Json(payload): Json<GrabPayload>,
 ) -> Json<ApiActionResponse> {
     let count = payload.urls.len();
+    mgr.request_focus_grabber();
     mgr.probe_urls_into_grabber(payload.urls, payload.headers);
     Json(ApiActionResponse {
         ok: true,

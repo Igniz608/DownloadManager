@@ -57,6 +57,17 @@ fn write_frame(val: &NativeResponse) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+fn allow_any_foreground_window() {
+    unsafe extern "system" {
+        fn AllowSetForegroundWindow(dwProcessId: u32) -> i32;
+    }
+    const ASFW_ANY: u32 = u32::MAX;
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+    }
+}
+
+#[cfg(windows)]
 fn clear_std_handle_inheritance() {
     const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
     const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
@@ -510,6 +521,8 @@ fn main() {
                 )
             }
             "grab" => {
+                #[cfg(windows)]
+                allow_any_foreground_window();
                 ensure_gui_running(req.port);
                 forward_http(
                     req.port,

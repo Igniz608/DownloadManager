@@ -29,7 +29,7 @@ use reqwest::Client;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
@@ -60,6 +60,7 @@ pub struct DownloadManager {
     pub packages: Arc<RwLock<Vec<DownloadPackage>>>,
     pub grabbed_links: Arc<RwLock<Vec<GrabbedLink>>>,
     grabber_probe_count: Arc<AtomicUsize>,
+    focus_grabber_requested: Arc<AtomicBool>,
     pub speed_history: Arc<RwLock<VecDeque<SpeedSample>>>,
     pub notifications: Arc<RwLock<VecDeque<NoticeEntry>>>,
     pub pending_password_prompts: Arc<RwLock<Vec<PasswordPromptRequest>>>,
@@ -109,6 +110,7 @@ impl DownloadManager {
             packages: Arc::new(RwLock::new(persisted.packages)),
             grabbed_links: Arc::new(RwLock::new(Vec::new())),
             grabber_probe_count: Arc::new(AtomicUsize::new(0)),
+            focus_grabber_requested: Arc::new(AtomicBool::new(false)),
             speed_history: Arc::new(RwLock::new(hist)),
             notifications: Arc::new(RwLock::new(VecDeque::with_capacity(20))),
             pending_password_prompts: Arc::new(RwLock::new(Vec::new())),
@@ -582,6 +584,14 @@ impl DownloadManager {
             return;
         }
         self.probe_urls_into_grabber(urls, headers);
+    }
+
+    pub fn request_focus_grabber(&self) {
+        self.focus_grabber_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn take_focus_grabber_request(&self) -> bool {
+        self.focus_grabber_requested.swap(false, Ordering::SeqCst)
     }
 
     pub fn probe_urls_into_grabber(
@@ -1767,6 +1777,7 @@ mod tests {
             package_key: None,
             part_number: None,
             part_total: None,
+            source_site: None,
             selected: true,
             headers: HashMap::new(),
             error: None,

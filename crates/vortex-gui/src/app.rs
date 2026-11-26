@@ -294,6 +294,15 @@ impl eframe::App for VortexApp {
         self.check_clipboard();
         self.handle_dropped_files(&ctx);
 
+        if self.manager.take_focus_grabber_request() {
+            self.active_tab = NavTab::LinkGrabber;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            #[cfg(windows)]
+            bring_main_window_to_front();
+        }
+
         let snap = self.manager.snapshot();
         let theme = self.manager.settings.read().theme.clone();
         let repaint_ms = if snap.active_count > 0 { 150 } else { 500 };
@@ -1581,7 +1590,19 @@ impl VortexApp {
                             if ui.checkbox(&mut sel, "").changed() {
                                 toggles.push((link.id, sel));
                             }
-                            ui.label(RichText::new(&link.filename).strong());
+                            let site_label = link
+                                .source_site
+                                .as_deref()
+                                .map(str::to_string)
+                                .or_else(|| {
+                                    vortex_core::package_grabber::classify_source_site(&link.url)
+                                });
+                            if let Some(ref site) = site_label {
+                                let (tag, color) = site_badge_style(site, theme);
+                                pill(ui, &format!("{tag} • {site}"), color, theme);
+                            }
+                            ui.label(RichText::new(&link.filename).strong())
+                                .on_hover_text(&link.url);
                             if let Some(ref pkg) = link.package_key {
                                 pill(ui, &format!("Pacote: {pkg}"), to_c32(theme.accent), theme);
                             }
@@ -1604,6 +1625,13 @@ impl VortexApp {
                                 );
                             });
                         });
+                        if let Some(ref err) = link.error {
+                            ui.label(
+                                RichText::new(err)
+                                    .small()
+                                    .color(to_c32(theme.error)),
+                            );
+                        }
                     });
                 ui.add_space(4.0);
             }
@@ -2882,6 +2910,59 @@ fn color_row(ui: &mut Ui, label: &str, rgba: &mut [u8; 4]) -> bool {
 
 fn read_clipboard_text() -> Option<String> {
     arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+fn site_badge_style(site: &str, theme: &ThemeConfig) -> (&'static str, Color32) {
+    match site {
+        "FileDitch" => ("FD", Color32::from_rgb(245, 158, 11)),
+        "FileKeeper" => ("FK", Color32::from_rgb(56, 189, 248)),
+        "Pixeldrain" => ("PD", Color32::from_rgb(16, 185, 129)),
+        "Gofile" => ("GF", Color32::from_rgb(139, 92, 246)),
+        "VikingFile" => ("VF", Color32::from_rgb(244, 63, 94)),
+        "Buzzheavier" => ("BH", Color32::from_rgb(251, 146, 60)),
+        "MediaFire" => ("MF", Color32::from_rgb(59, 130, 246)),
+        "1fichier" => ("1F", Color32::from_rgb(234, 88, 12)),
+        "MEGA" => ("MG", Color32::from_rgb(220, 38, 38)),
+        "Akirabox" => ("AK", Color32::from_rgb(168, 85, 247)),
+        "Datanodes" => ("DN", Color32::from_rgb(20, 184, 166)),
+        "GitHub" => ("GH", Color32::from_rgb(148, 163, 184)),
+        "Google Drive" => ("GD", Color32::from_rgb(34, 197, 94)),
+        "Dropbox" => ("DB", Color32::from_rgb(37, 99, 235)),
+        "OneDrive" => ("OD", Color32::from_rgb(14, 165, 233)),
+        "HuggingFace" => ("HF", Color32::from_rgb(250, 204, 21)),
+        "Archive.org" => ("AR", Color32::from_rgb(156, 163, 175)),
+        "Magnet" => ("MAG", Color32::from_rgb(236, 72, 153)),
+        _ => ("WEB", to_c32(theme.text_muted)),
+    }
+}
+
+#[cfg(windows)]
+fn bring_main_window_to_front() {
+    unsafe extern "system" {
+        fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> isize;
+        fn ShowWindow(hWnd: isize, nCmdShow: i32) -> i32;
+        fn IsIconic(hWnd: isize) -> i32;
+        fn SetForegroundWindow(hWnd: isize) -> i32;
+        fn BringWindowToTop(hWnd: isize) -> i32;
+    }
+    const SW_RESTORE: i32 = 9;
+    const SW_SHOW: i32 = 5;
+    let title: Vec<u16> = "VortexDL — Next-Gen Rust Download Manager"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd != 0 {
+            if IsIconic(hwnd) != 0 {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            } else {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+            }
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
 }
 
 fn extractor_display_name(id: &str, list: &[ExtractorProfile]) -> String {

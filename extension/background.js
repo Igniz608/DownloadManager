@@ -702,7 +702,11 @@ function collectLinksFromFrame(selectionOnly) {
   let hasDownloadButtons = false;
 
   const HOSTER_RE =
-    /(?:^|\.)(?:fileditch|fileditchfiles|filekeeper|pixeldrain|gofile|vikingfile|mediafire|buzzheavier|1fichier|mega\.nz|mega\.co\.nz|qiwi\.gg|krakenfiles|akirabox|datanodes|uploadhaven|send\.cm|rapidgator|ddownload|katfile|nitroflare|turbobit|workupload|bowfile|ranoz|anonfiles|bayfiles|dropbox\.com|drive\.google\.com|1drv\.ms|onedrive\.live\.com|huggingface\.co|archive\.org)(?:\/|$|\.)/i;
+    /(?:^|\.)(?:fileditch|fileditchfiles|fileditchvids|itsfileditchfiles|fileditchhot|theditch|embedditch|filekeeper|pixeldrain|gofile|vikingfile|vik1ngfile|mediafire|buzzheavier|bzzhr|1fichier|mega\.nz|mega\.co\.nz|qiwi\.gg|krakenfiles|akirabox|datanodes|uploadhaven|send\.cm|rapidgator|ddownload|katfile|nitroflare|turbobit|workupload|bowfile|ranoz|rootz|fuckingfast|anonfiles|bayfiles|dropbox\.com|drive\.google\.com|1drv\.ms|onedrive\.live\.com|huggingface\.co|archive\.org)(?:\/|$|\.)/i;
+  const BARE_HOSTER_RE =
+    /(?:^|[^a-zA-Z0-9._:/@])((?:fileditchfiles\.(?:me|st)|itsfileditchfiles\.st|fileditchvids\.st|fileditchhot\.st|theditch\.st|embedditch\.st|filekeeper\.net|pixeldrain\.com|gofile\.io|vikingfile\.com|vik1ngfile\.site|buzzheavier\.com|bzzhr\.co|mediafire\.com|1fichier\.com|mega\.nz|akirabox\.com|datanodes\.to)\/[A-Za-z0-9_/?=&.%#+-]+)/gi;
+  const HOST_ATTR_HINT_RE =
+    /https?:|magnet:|\\\/|\\u002f|aHR0c|fileditch|theditch|filekeeper|pixeldrain|gofile|vikingfile|vik1ngfile|buzzheavier|bzzhr|mediafire|1fichier|mega\.nz|akirabox|datanodes/i;
   const FILE_EXT_RE =
     /\.(?:rar|zip|7z|tar|gz|bz2|xz|part\d+|r\d{2}|z\d{2}|\d{3}|iso|img|exe|msi|apk|dmg|pkg|deb|rpm|torrent|mp4|mkv|avi|mov|webm|m3u8|mpd|mp3|flac|wav|m4a|pdf|epub)(?:[?#]|$)/i;
   const STATIC_ASSET_RE =
@@ -784,11 +788,16 @@ function collectLinksFromFrame(selectionOnly) {
     }
   }
 
-  function extractUrlsFromText(text, requireDownloadIntent) {
+  function extractUrlsFromText(text, requireDownloadIntent, depth = 0) {
     if (!text || typeof text !== "string") return;
     const normalized = text
       .replace(/\\\//g, "/")
-      .replace(/\\u002[fF]/g, "/");
+      .replace(/\\u002[fF]/g, "/")
+      .replace(/\\x2[fF]/g, "/")
+      .replace(/\\u003[aA]/g, ":")
+      .replace(/\\x3[aA]/g, ":")
+      .replace(/\\u0026/g, "&")
+      .replace(/&amp;/g, "&");
     const matches = normalized.match(/(?:https?:\/\/|magnet:\?)[^\s"'<>\\`\]}]+/gi) || [];
     for (const m of matches) {
       const resolved = resolveCandidate(m);
@@ -798,6 +807,27 @@ function collectLinksFromFrame(selectionOnly) {
         if (isDownloadIntent(resolved, "")) {
           priorityUrls.add(resolved);
         }
+      }
+    }
+    BARE_HOSTER_RE.lastIndex = 0;
+    let bareMatch;
+    while ((bareMatch = BARE_HOSTER_RE.exec(normalized)) !== null) {
+      const resolved = resolveCandidate(`https://${bareMatch[1]}`);
+      if (!resolved || isStaticAsset(resolved)) continue;
+      allUrls.add(resolved);
+      priorityUrls.add(resolved);
+    }
+    if (depth === 0) {
+      const b64Matches = normalized.match(/aHR0c(?:Dov|HM6)[A-Za-z0-9+/_-]{8,}={0,2}/g) || [];
+      for (const b64 of b64Matches.slice(0, 40)) {
+        try {
+          let std = b64.replace(/-/g, "+").replace(/_/g, "/");
+          while (std.length % 4 !== 0) std += "=";
+          const decoded = atob(std);
+          if (/^https?:\/\//i.test(decoded)) {
+            extractUrlsFromText(decoded, requireDownloadIntent, 1);
+          }
+        } catch (_) {}
       }
     }
   }
@@ -873,6 +903,27 @@ function collectLinksFromFrame(selectionOnly) {
       });
 
     root.querySelectorAll("*").forEach((el) => {
+      if (el.attributes) {
+        for (const attr of el.attributes) {
+          const name = attr.name.toLowerCase();
+          if (
+            name.startsWith("data-") ||
+            name === "x-data" ||
+            name === "x-init" ||
+            name === "ng-click" ||
+            name === "v-on:click" ||
+            name === "@click"
+          ) {
+            const val = attr.value || "";
+            if (val && HOST_ATTR_HINT_RE.test(val)) {
+              extractUrlsFromText(val, false);
+            }
+          }
+        }
+      }
+      if (el.tagName === "TEMPLATE" && el.content) {
+        collectFromRoot(el.content);
+      }
       if (el.shadowRoot) {
         collectFromRoot(el.shadowRoot);
       }
@@ -891,6 +942,7 @@ function collectLinksFromFrame(selectionOnly) {
           priorityUrls: Array.from(priorityUrls),
           allUrls: Array.from(allUrls),
           hasDownloadButtons,
+          scriptUrls: [],
         };
       }
     }
@@ -898,9 +950,26 @@ function collectLinksFromFrame(selectionOnly) {
 
   collectFromRoot(document);
 
+  const scriptUrls = [];
+  const seenScriptUrls = new Set();
+  const VENDOR_SCRIPT_RE =
+    /(?:jquery|bootstrap|tailwind|lucide|fontawesome|gtag|analytics|turnstile|recaptcha|cloudflare|adsbygoogle|popper|alpinejs)/i;
   document.querySelectorAll("script").forEach((s) => {
-    if (!s.src && s.textContent && s.textContent.length <= 600000) {
+    if (!s.src && s.textContent && s.textContent.length <= 1500000) {
       extractUrlsFromText(s.textContent, true);
+    } else if (s.src) {
+      try {
+        const su = new URL(s.src, window.location.href);
+        if (
+          su.origin === window.location.origin &&
+          !VENDOR_SCRIPT_RE.test(su.pathname) &&
+          !seenScriptUrls.has(su.href) &&
+          scriptUrls.length < 12
+        ) {
+          seenScriptUrls.add(su.href);
+          scriptUrls.push(su.href);
+        }
+      } catch (_) {}
     }
   });
 
@@ -914,12 +983,87 @@ function collectLinksFromFrame(selectionOnly) {
     priorityUrls: Array.from(priorityUrls),
     allUrls: Array.from(allUrls),
     hasDownloadButtons,
+    scriptUrls,
   };
+}
+
+function collectMainWorldStateUrls() {
+  const candidates = [];
+  const globals = ["__NEXT_DATA__", "__NUXT__", "__DATA__", "__INITIAL_STATE__", "__APP_STATE__"];
+  for (const key of globals) {
+    try {
+      const val = window[key];
+      if (val && typeof val === "object") {
+        const json = JSON.stringify(val);
+        if (json && json.length <= 1000000) {
+          candidates.push(json);
+        }
+      }
+    } catch (_) {}
+  }
+  return candidates.join("\n");
+}
+
+function extractDownloadUrlsFromBlobText(text) {
+  if (!text || typeof text !== "string") return [];
+  const HOSTER_RE =
+    /(?:^|\.)(?:fileditch|fileditchfiles|fileditchvids|itsfileditchfiles|fileditchhot|theditch|embedditch|filekeeper|pixeldrain|gofile|vikingfile|vik1ngfile|mediafire|buzzheavier|bzzhr|1fichier|mega\.nz|mega\.co\.nz|qiwi\.gg|krakenfiles|akirabox|datanodes|uploadhaven|send\.cm|rapidgator|ddownload|katfile|nitroflare|turbobit|workupload|bowfile|ranoz|rootz|fuckingfast|anonfiles|bayfiles|dropbox\.com|drive\.google\.com|1drv\.ms|onedrive\.live\.com|huggingface\.co|archive\.org)(?:\/|$|\.)/i;
+  const FILE_EXT_RE =
+    /\.(?:rar|zip|7z|tar|gz|bz2|xz|part\d+|r\d{2}|z\d{2}|\d{3}|iso|img|exe|msi|apk|dmg|pkg|deb|rpm|torrent|mp4|mkv|avi|mov|webm|m3u8|mpd|mp3|flac|wav|m4a|pdf|epub)(?:[?#]|$)/i;
+  const BARE_HOSTER_RE =
+    /(?:^|[^a-zA-Z0-9._:/@])((?:fileditchfiles\.(?:me|st)|itsfileditchfiles\.st|fileditchvids\.st|fileditchhot\.st|theditch\.st|embedditch\.st|filekeeper\.net|pixeldrain\.com|gofile\.io|vikingfile\.com|vik1ngfile\.site|buzzheavier\.com|bzzhr\.co|mediafire\.com|1fichier\.com|mega\.nz|akirabox\.com|datanodes\.to)\/[A-Za-z0-9_/?=&.%#+-]+)/gi;
+
+  const found = new Set();
+  const normalized = text
+    .replace(/\\\//g, "/")
+    .replace(/\\u002[fF]/g, "/")
+    .replace(/\\x2[fF]/g, "/")
+    .replace(/\\u003[aA]/g, ":")
+    .replace(/\\x3[aA]/g, ":")
+    .replace(/\\u0026/g, "&")
+    .replace(/&amp;/g, "&");
+
+  const scan = (src) => {
+    const matches = src.match(/(?:https?:\/\/|magnet:\?)[^\s"'<>\\`\]}]+/gi) || [];
+    for (const raw of matches) {
+      const cleaned = raw.trim().replace(/^["'`(<[]+/, "").replace(/["'`>\];,)]+$/, "");
+      if (cleaned.startsWith("magnet:?")) {
+        found.add(cleaned);
+        continue;
+      }
+      try {
+        const u = new URL(cleaned);
+        if (HOSTER_RE.test(u.hostname) || FILE_EXT_RE.test(u.pathname + u.search)) {
+          found.add(u.href);
+        }
+      } catch (_) {}
+    }
+    BARE_HOSTER_RE.lastIndex = 0;
+    let m;
+    while ((m = BARE_HOSTER_RE.exec(src)) !== null) {
+      try {
+        found.add(new URL(`https://${m[1]}`).href);
+      } catch (_) {}
+    }
+  };
+
+  scan(normalized);
+  const b64Matches = normalized.match(/aHR0c(?:Dov|HM6)[A-Za-z0-9+/_-]{8,}={0,2}/g) || [];
+  for (const b64 of b64Matches.slice(0, 40)) {
+    try {
+      let std = b64.replace(/-/g, "+").replace(/_/g, "/");
+      while (std.length % 4 !== 0) std += "=";
+      const decoded = atob(std);
+      if (/^https?:\/\//i.test(decoded)) scan(decoded);
+    } catch (_) {}
+  }
+  return Array.from(found);
 }
 
 async function collectAllTabLinks(tabId, selectionOnly = false) {
   const mergedPriority = new Set();
   const mergedAll = new Set();
+  const scriptUrls = new Set();
   let hasDownloadButtons = false;
 
   try {
@@ -934,6 +1078,46 @@ async function collectAllTabLinks(tabId, selectionOnly = false) {
       if (res.hasDownloadButtons) hasDownloadButtons = true;
       (res.priorityUrls || []).forEach((u) => mergedPriority.add(u));
       (res.allUrls || res.urls || []).forEach((u) => mergedAll.add(u));
+      (res.scriptUrls || []).forEach((u) => scriptUrls.add(u));
+    }
+    if (!selectionOnly) {
+      try {
+        const mainFrames = await chrome.scripting.executeScript({
+          target: { tabId, allFrames: false },
+          world: "MAIN",
+          func: collectMainWorldStateUrls,
+        });
+        for (const mf of mainFrames || []) {
+          if (mf?.result) {
+            extractDownloadUrlsFromBlobText(mf.result).forEach((u) => {
+              mergedPriority.add(u);
+              mergedAll.add(u);
+            });
+          }
+        }
+      } catch (_) {}
+
+      const toFetch = Array.from(scriptUrls).slice(0, 12);
+      if (toFetch.length > 0) {
+        const texts = await Promise.all(
+          toFetch.map(async (su) => {
+            try {
+              const resp = await fetch(su, { signal: AbortSignal.timeout(3000) });
+              if (!resp.ok) return "";
+              const txt = await resp.text();
+              return txt.length <= 1500000 ? txt : "";
+            } catch (_) {
+              return "";
+            }
+          })
+        );
+        for (const txt of texts) {
+          extractDownloadUrlsFromBlobText(txt).forEach((u) => {
+            mergedPriority.add(u);
+            mergedAll.add(u);
+          });
+        }
+      }
     }
     const urls = mergedPriority.size > 0 ? Array.from(mergedPriority) : Array.from(mergedAll);
     return { urls, hasDownloadButtons };

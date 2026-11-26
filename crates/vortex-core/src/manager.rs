@@ -291,29 +291,53 @@ impl DownloadManager {
     }
 
     pub fn pump_queue(self: &Arc<Self>) {
+        const MAX_ACTIVE_PER_HOST: usize = 2;
         let max_concurrent = self.settings.read().max_concurrent_downloads.max(1);
         let to_start: Vec<DownloadId> = {
             let dls = self.downloads.read();
-            let active = dls
-                .iter()
-                .filter(|d| {
-                    matches!(
-                        d.status,
-                        DownloadStatus::Probing
-                            | DownloadStatus::Downloading
-                            | DownloadStatus::Merging
-                    )
-                })
-                .count();
-            if active >= max_concurrent {
+            let mut active_total = 0usize;
+            let mut active_per_host: HashMap<String, usize> = HashMap::new();
+            for d in dls.iter() {
+                if matches!(
+                    d.status,
+                    DownloadStatus::Probing | DownloadStatus::Downloading | DownloadStatus::Merging
+                ) {
+                    active_total += 1;
+                    if d.kind == DownloadKind::Http {
+                        if let Some(host) = url::Url::parse(&d.url)
+                            .ok()
+                            .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+                        {
+                            *active_per_host.entry(host).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            if active_total >= max_concurrent {
                 return;
             }
-            let slots = max_concurrent - active;
-            dls.iter()
-                .filter(|d| d.status == DownloadStatus::Queued)
-                .take(slots)
-                .map(|d| d.id)
-                .collect()
+            let mut remaining_slots = max_concurrent - active_total;
+            let mut chosen = Vec::new();
+            for d in dls.iter().filter(|d| d.status == DownloadStatus::Queued) {
+                if remaining_slots == 0 {
+                    break;
+                }
+                if d.kind == DownloadKind::Http {
+                    if let Some(host) = url::Url::parse(&d.url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+                    {
+                        let count = active_per_host.get(&host).copied().unwrap_or(0);
+                        if count >= MAX_ACTIVE_PER_HOST {
+                            continue;
+                        }
+                        active_per_host.insert(host, count + 1);
+                    }
+                }
+                chosen.push(d.id);
+                remaining_slots -= 1;
+            }
+            chosen
         };
 
         for id in to_start {
@@ -573,8 +597,9 @@ impl DownloadManager {
             let count = links.len();
             {
                 let mut g = mgr.grabbed_links.write();
-                for link in links {
+                for mut link in links {
                     if !g.iter().any(|existing| existing.url == link.url) {
+                        link.selected = is_valid_grabbed_link(&link);
                         g.push(link);
                     }
                 }
@@ -1704,6 +1729,12 @@ impl DownloadManager {
     }
 }
 
+pub fn is_valid_grabbed_link(link: &GrabbedLink) -> bool {
+    link.part_number.is_some()
+        && link.online == Some(true)
+        && link.size_bytes.is_some_and(|s| s > 0)
+}
+
 fn grabbed_link_sort_tier(link: &GrabbedLink) -> u8 {
     let has_size = link.size_bytes.is_some_and(|s| s > 0);
     match (has_size, link.online) {
@@ -1763,5 +1794,31 @@ mod tests {
                 "offline_no_size",
             ]
         );
+    }
+
+    #[test]
+    fn valid_grabbed_link_requires_part_online_and_nonzero_size() {
+        let mut valid = mk_link("game.part1.rar", Some(5_000_000_000), Some(true));
+        valid.part_number = Some(1);
+        assert!(is_valid_grabbed_link(&valid));
+
+        let no_part = mk_link("Fix_Repair.rar", Some(29_000_000), Some(true));
+        assert!(!is_valid_grabbed_link(&no_part));
+
+        let mut offline = valid.clone();
+        offline.online = Some(false);
+        assert!(!is_valid_grabbed_link(&offline));
+
+        let mut unknown_online = valid.clone();
+        unknown_online.online = None;
+        assert!(!is_valid_grabbed_link(&unknown_online));
+
+        let mut no_size = valid.clone();
+        no_size.size_bytes = None;
+        assert!(!is_valid_grabbed_link(&no_size));
+
+        let mut zero_size = valid.clone();
+        zero_size.size_bytes = Some(0);
+        assert!(!is_valid_grabbed_link(&zero_size));
     }
 }

@@ -16,7 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
@@ -727,6 +727,8 @@ async fn download_segmented_workstealing(
 
     // Pre-mark already completed segments
     let max_workers = item.connections.clamp(1, 32);
+    let active_limit = Arc::new(AtomicUsize::new(max_workers));
+    let throttled = Arc::new(AtomicBool::new(false));
     let url_arc = Arc::new(url.to_string());
     let headers_arc = Arc::new(item.headers.clone());
     let part_path_arc = Arc::new(part_path.to_path_buf());
@@ -789,6 +791,8 @@ async fn download_segmented_workstealing(
         let part_path = part_path_arc.clone();
         let segments = segments_shared.clone();
         let active_workers = active_workers.clone();
+        let active_limit = active_limit.clone();
+        let throttled = throttled.clone();
         let limiter = limiter.clone();
         let cancel = cancel.clone();
         let bytes_window = bytes_this_window.clone();
@@ -800,8 +804,21 @@ async fn download_segmented_workstealing(
                     break;
                 }
 
+                let cap = active_limit.load(Ordering::Relaxed).max(1);
+                if worker_idx >= cap {
+                    let any_unfinished = {
+                        let segs = segments.lock();
+                        segs.iter().any(|s| !s.done && s.remaining() > 0)
+                    };
+                    if !any_unfinished {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+
                 // Pick next unclaimed incomplete segment, or work-steal half of the largest remaining segment
-                let seg_idx_opt = {
+                let (seg_idx_opt, any_active_or_pending) = {
                     let mut segs = segments.lock();
                     let mut active = active_workers.lock();
 
@@ -814,8 +831,8 @@ async fn download_segmented_workstealing(
                         }
                     }
 
-                    // Work-stealing: split the largest remaining active segment if >= 512 KiB remains
-                    if chosen.is_none() {
+                    // Work-stealing: split the largest remaining active segment if >= 512 KiB remains (disabled when throttled)
+                    if chosen.is_none() && !throttled.load(Ordering::Relaxed) {
                         let mut best: Option<(usize, u64)> = None;
                         for (i, s) in segs.iter().enumerate() {
                             let rem = s.remaining();
@@ -848,10 +865,16 @@ async fn download_segmented_workstealing(
                     if let Some(idx) = chosen {
                         active[idx] = true;
                     }
-                    chosen
+                    let still_busy = active.iter().any(|&a| a)
+                        || segs.iter().any(|s| !s.done && s.remaining() > 0);
+                    (chosen, still_busy)
                 };
 
                 let Some(seg_idx) = seg_idx_opt else {
+                    if any_active_or_pending {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        continue;
+                    }
                     break;
                 };
 
@@ -861,7 +884,10 @@ async fn download_segmented_workstealing(
                     &headers,
                     &part_path,
                     seg_idx,
+                    worker_idx,
                     &segments,
+                    &active_limit,
+                    &throttled,
                     &limiter,
                     &cancel,
                     &bytes_window,
@@ -909,7 +935,10 @@ async fn download_segment_loop(
     headers: &HashMap<String, String>,
     part_path: &Path,
     seg_idx: usize,
+    worker_idx: usize,
     segments: &Arc<Mutex<Vec<SegmentState>>>,
+    active_limit: &Arc<AtomicUsize>,
+    throttled: &Arc<AtomicBool>,
     limiter: &BandwidthLimiter,
     cancel: &Arc<DownloadCancelHandle>,
     bytes_window: &Arc<AtomicU64>,
@@ -937,22 +966,51 @@ async fn download_segment_loop(
             Ok(r) => r,
             Err(e) => {
                 attempts += 1;
-                if attempts >= 4 {
+                if attempts >= 5 {
                     return Err(e.into());
                 }
-                tokio::time::sleep(Duration::from_millis(500 * attempts as u64)).await;
+                tokio::time::sleep(Duration::from_millis(600 * attempts as u64)).await;
                 continue;
             }
         };
 
-        if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT
-            && resp.status() != reqwest::StatusCode::OK
-        {
-            attempts += 1;
-            if attempts >= 4 {
-                return Err(anyhow!("HTTP {} no segmento {seg_idx}", resp.status()));
+        let status = resp.status();
+        if status != reqwest::StatusCode::PARTIAL_CONTENT && status != reqwest::StatusCode::OK {
+            let is_rate_or_conn_limit = matches!(
+                status,
+                reqwest::StatusCode::FORBIDDEN
+                    | reqwest::StatusCode::TOO_MANY_REQUESTS
+                    | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            );
+
+            if is_rate_or_conn_limit {
+                throttled.store(true, Ordering::Relaxed);
+                let prev = active_limit.load(Ordering::Relaxed);
+                let next_cap = if prev > 1 { (prev / 2).max(1) } else { 1 };
+                let _ = active_limit.compare_exchange(
+                    prev,
+                    next_cap,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                let effective_cap = active_limit.load(Ordering::Relaxed).max(1);
+                if worker_idx >= effective_cap {
+                    // Release this segment so surviving workers can finish it at lower concurrency
+                    return Ok(());
+                }
             }
-            tokio::time::sleep(Duration::from_millis(600 * attempts as u64)).await;
+
+            attempts += 1;
+            let max_attempts = if is_rate_or_conn_limit { 6 } else { 4 };
+            if attempts >= max_attempts {
+                return Err(anyhow!("HTTP {status} no segmento {seg_idx}"));
+            }
+            let delay_ms = if is_rate_or_conn_limit {
+                1200 * attempts as u64 + (worker_idx as u64 * 150)
+            } else {
+                600 * attempts as u64
+            };
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             continue;
         }
 

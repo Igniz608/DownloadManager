@@ -1458,6 +1458,15 @@ impl VortexApp {
         ui.add_space(8.0);
         let total_count = snap.grabbed_links.len();
         let selected_count = snap.grabbed_links.iter().filter(|l| l.selected).count();
+        let valid_count = snap
+            .grabbed_links
+            .iter()
+            .filter(|l| vortex_core::manager::is_valid_grabbed_link(l))
+            .count();
+        let matches_valid_only = snap
+            .grabbed_links
+            .iter()
+            .all(|l| l.selected == vortex_core::manager::is_valid_grabbed_link(l));
         let offline_selected_count = snap
             .grabbed_links
             .iter()
@@ -1480,6 +1489,21 @@ impl VortexApp {
             );
             if total_count > 0 {
                 ui.add_space(8.0);
+                if ui
+                    .add_enabled(
+                        !matches_valid_only,
+                        egui::Button::new(format!("Marcar Válidos ({valid_count})")),
+                    )
+                    .on_hover_text(
+                        "Seleciona apenas links com tag Parte, status Online e tamanho conhecido",
+                    )
+                    .clicked()
+                {
+                    let mut g = self.manager.grabbed_links.write();
+                    for item in g.iter_mut() {
+                        item.selected = vortex_core::manager::is_valid_grabbed_link(item);
+                    }
+                }
                 if ui
                     .add_enabled(selected_count < total_count, egui::Button::new("Marcar Tudo"))
                     .clicked()

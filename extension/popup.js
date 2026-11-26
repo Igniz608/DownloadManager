@@ -19,18 +19,29 @@ function setFeedback(text, isError = false) {
 async function init() {
   const statusBadge = document.getElementById("statusBadge");
   const interceptToggle = document.getElementById("interceptToggle");
+  const videoOverlayToggle = document.getElementById("videoOverlayToggle");
   const mediaList = document.getElementById("mediaList");
   const mediaCount = document.getElementById("mediaCount");
 
   const stored = await chrome.storage.local.get("vortexSettings");
-  const currentSettings = stored.vortexSettings || { interceptDownloads: true };
+  const currentSettings = stored.vortexSettings || { interceptDownloads: true, showVideoOverlay: true };
   interceptToggle.checked = currentSettings.interceptDownloads !== false;
+  videoOverlayToggle.checked = currentSettings.showVideoOverlay !== false;
 
   interceptToggle.addEventListener("change", async () => {
-    await chrome.storage.local.set({
-      vortexSettings: { ...currentSettings, interceptDownloads: interceptToggle.checked },
-    });
+    currentSettings.interceptDownloads = interceptToggle.checked;
+    await chrome.storage.local.set({ vortexSettings: currentSettings });
     setFeedback(interceptToggle.checked ? "Interceptação ativada." : "Interceptação pausada.");
+  });
+
+  videoOverlayToggle.addEventListener("change", async () => {
+    currentSettings.showVideoOverlay = videoOverlayToggle.checked;
+    await chrome.storage.local.set({ vortexSettings: currentSettings });
+    setFeedback(
+      videoOverlayToggle.checked
+        ? "Botão sobre vídeos ativado."
+        : "Botão sobre vídeos ocultado."
+    );
   });
 
   chrome.runtime.sendMessage({ type: "CHECK_STATUS" }, (res) => {

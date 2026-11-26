@@ -14,6 +14,7 @@ const cancellingIds = new Set();
 
 const DEFAULT_SETTINGS = {
   interceptDownloads: true,
+  showVideoOverlay: true,
   minSizeBytes: 512 * 1024, // 512 KB minimum for auto-interception (skip tiny icons/html)
   interceptExtensions: [
     "zip", "rar", "7z", "tar", "gz", "xz", "bz2", "z01", "r00", "001",
@@ -263,6 +264,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     const count = map.size;
     chrome.action.setBadgeText({ tabId: details.tabId, text: count > 0 ? String(count) : "" });
     chrome.action.setBadgeBackgroundColor({ tabId: details.tabId, color: "#7C5CFF" });
+    chrome.tabs.sendMessage(details.tabId, { type: "VORTEX_MEDIA_DETECTED" }).catch(() => {});
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders"]
@@ -692,8 +694,42 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   }
 });
 
-// Messages from popup.js
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+function isKnownVideoPlatformUrl(rawUrl) {
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    return (
+      host === "youtube.com" ||
+      host.endsWith(".youtube.com") ||
+      host === "youtu.be" ||
+      host === "twitch.tv" ||
+      host.endsWith(".twitch.tv") ||
+      host === "vimeo.com" ||
+      host.endsWith(".vimeo.com") ||
+      host === "tiktok.com" ||
+      host.endsWith(".tiktok.com") ||
+      host === "instagram.com" ||
+      host.endsWith(".instagram.com") ||
+      host === "x.com" ||
+      host === "twitter.com" ||
+      host.endsWith(".twitter.com") ||
+      host === "reddit.com" ||
+      host.endsWith(".reddit.com") ||
+      host === "facebook.com" ||
+      host.endsWith(".facebook.com") ||
+      host === "fb.watch" ||
+      host === "dailymotion.com" ||
+      host.endsWith(".dailymotion.com") ||
+      host === "kick.com" ||
+      host === "bilibili.com" ||
+      host.endsWith(".bilibili.com")
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+// Messages from popup.js and content.js
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     if (msg.type === "GET_TAB_MEDIA") {
       const map = tabMedia.get(msg.tabId);
@@ -718,6 +754,50 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         headers,
         is_hls: Boolean(msg.isHls) || msg.url.toLowerCase().includes(".m3u8"),
         is_dash: Boolean(msg.isDash) || msg.url.toLowerCase().includes(".mpd"),
+      });
+      sendResponse(res);
+    } else if (msg.type === "SEND_VIDEO_OVERLAY") {
+      const tabUrl = sender?.tab?.url || msg.pageUrl || "";
+      const frameUrl = msg.frameUrl || tabUrl;
+      const title = sender?.tab?.title || msg.title || null;
+      const tabId = sender?.tab?.id;
+      const videoSrc = (msg.videoSrc || "").trim();
+
+      let targetUrl = tabUrl || frameUrl;
+      let targetHeaders = { Referer: tabUrl || frameUrl };
+      let isHls = false;
+      let isDash = false;
+
+      const usePageExtractor = isKnownVideoPlatformUrl(tabUrl) || isKnownVideoPlatformUrl(frameUrl);
+      if (usePageExtractor) {
+        targetUrl = isKnownVideoPlatformUrl(tabUrl) ? tabUrl : frameUrl;
+      } else if (videoSrc.startsWith("http://") || videoSrc.startsWith("https://")) {
+        targetUrl = videoSrc;
+        targetHeaders = { ...(recentHeaders.get(videoSrc) || {}), Referer: tabUrl || frameUrl };
+        isHls = videoSrc.toLowerCase().includes(".m3u8");
+        isDash = videoSrc.toLowerCase().includes(".mpd");
+      } else if (tabId != null && tabMedia.has(tabId)) {
+        const items = Array.from(tabMedia.get(tabId).values());
+        const preferred =
+          items.slice().reverse().find((i) => i.isHls || i.isDash) ||
+          items[items.length - 1];
+        if (preferred) {
+          targetUrl = preferred.url;
+          targetHeaders = { ...(preferred.headers || {}), Referer: tabUrl || frameUrl };
+          isHls = Boolean(preferred.isHls);
+          isDash = Boolean(preferred.isDash);
+        }
+      }
+
+      const cookie = await collectCookiesHeader(targetUrl);
+      if (cookie && !targetHeaders.Cookie) targetHeaders.Cookie = cookie;
+
+      const res = await sendToVortex("/api/media", {
+        url: targetUrl,
+        title_hint: title,
+        headers: targetHeaders,
+        is_hls: isHls || targetUrl.toLowerCase().includes(".m3u8"),
+        is_dash: isDash || targetUrl.toLowerCase().includes(".mpd"),
       });
       sendResponse(res);
     } else if (msg.type === "SEND_BATCH_LINKS") {

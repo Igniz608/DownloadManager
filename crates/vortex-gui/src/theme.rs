@@ -31,8 +31,9 @@ pub fn apply_theme(ctx: &egui::Context, theme: &ThemeConfig) {
     visuals.extreme_bg_color = bg_primary;
     visuals.faint_bg_color = bg_card;
     visuals.override_text_color = Some(text_primary);
-    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 64);
+    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 140);
     visuals.selection.stroke = Stroke::new(1.0, accent);
+    visuals.slider_trailing_fill = true;
 
     visuals.widgets.noninteractive.bg_fill = bg_card;
     visuals.widgets.noninteractive.weak_bg_fill = bg_secondary;
@@ -40,7 +41,7 @@ pub fn apply_theme(ctx: &egui::Context, theme: &ThemeConfig) {
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text_muted);
     visuals.widgets.noninteractive.corner_radius = cr;
 
-    visuals.widgets.inactive.bg_fill = bg_card;
+    visuals.widgets.inactive.bg_fill = border;
     visuals.widgets.inactive.weak_bg_fill = bg_secondary;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, border);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text_primary);

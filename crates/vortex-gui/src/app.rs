@@ -132,6 +132,8 @@ pub struct VortexApp {
     pw_edit_show_chars: bool,
 
     last_applied_theme_hash: u64,
+    last_api_card_height: f32,
+    last_min_window_height: f32,
 }
 
 impl VortexApp {
@@ -205,6 +207,8 @@ impl VortexApp {
             pw_edit_focus: false,
             pw_edit_show_chars: false,
             last_applied_theme_hash: 0,
+            last_api_card_height: 96.0,
+            last_min_window_height: 0.0,
         }
     }
 
@@ -308,8 +312,8 @@ impl eframe::App for VortexApp {
         let repaint_ms = if snap.active_count > 0 { 150 } else { 500 };
         ctx.request_repaint_after(Duration::from_millis(repaint_ms));
 
-        self.render_top_bar(ui, &snap, &theme);
-        self.render_sidebar(ui, &snap, &theme);
+        let top_bar_h = self.render_top_bar(ui, &snap, &theme);
+        self.render_sidebar(ui, &snap, &theme, top_bar_h);
 
         egui::CentralPanel::default()
             .frame(
@@ -346,8 +350,8 @@ impl eframe::App for VortexApp {
 }
 
 impl VortexApp {
-    fn render_top_bar(&mut self, ui: &mut egui::Ui, snap: &ManagerSnapshot, theme: &ThemeConfig) {
-        egui::Panel::top("top_bar")
+    fn render_top_bar(&mut self, ui: &mut egui::Ui, snap: &ManagerSnapshot, theme: &ThemeConfig) -> f32 {
+        let top_resp = egui::Panel::top("top_bar")
             .frame(
                 Frame::new()
                     .fill(to_c32(theme.bg_secondary))
@@ -377,6 +381,7 @@ impl VortexApp {
                     });
                 }
             });
+        top_resp.response.rect.height()
     }
 
     fn render_top_bar_left(&mut self, ui: &mut egui::Ui, theme: &ThemeConfig) {
@@ -531,7 +536,13 @@ impl VortexApp {
         }
     }
 
-    fn render_sidebar(&mut self, ui: &mut egui::Ui, snap: &ManagerSnapshot, theme: &ThemeConfig) {
+    fn render_sidebar(
+        &mut self,
+        ui: &mut egui::Ui,
+        snap: &ManagerSnapshot,
+        theme: &ThemeConfig,
+        top_bar_h: f32,
+    ) {
         let total = snap.downloads.len();
         let active = snap.active_count;
         let completed = snap
@@ -552,6 +563,8 @@ impl VortexApp {
             .count();
         let grabbed_count = snap.grabbed_links.len();
 
+        let ctx = ui.ctx().clone();
+        let mut required_sidebar_h = 0.0f32;
         egui::Panel::left("sidebar")
             .resizable(false)
             .exact_size(theme.sidebar_width.clamp(170.0, 320.0))
@@ -562,6 +575,7 @@ impl VortexApp {
                     .inner_margin(Margin::same(12)),
             )
             .show(ui, |ui| {
+                let inner_top = ui.max_rect().top();
                 ui.label(
                     RichText::new("BIBLIOTECA")
                         .small()
@@ -594,53 +608,80 @@ impl VortexApp {
                 nav_item(ui, &mut self.active_tab, NavTab::Themes, "Personalizar Tema", None, theme);
                 nav_item(ui, &mut self.active_tab, NavTab::Settings, "Configurações", None, theme);
 
-                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    let ext_count = self
-                        .manager
-                        .settings
-                        .read()
-                        .extractors
-                        .iter()
-                        .filter(|e| e.detected)
-                        .count();
-                    let yt_ok = snap.media_tools.yt_dlp_path.is_some();
-                    let ff_ok = snap.media_tools.ffmpeg_path.is_some();
-                    Frame::new()
-                        .fill(to_c32(theme.bg_card))
-                        .corner_radius(CornerRadius::same(8))
-                        .inner_margin(Margin::same(10))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new("Motores prontos")
-                                    .small()
-                                    .strong()
-                                    .color(to_c32(theme.text_primary)),
-                            );
-                            ui.label(
-                                RichText::new(format!(
-                                    "yt-dlp: {}  |  FFmpeg: {}",
-                                    if yt_ok { "OK" } else { "Ausente" },
-                                    if ff_ok { "OK" } else { "Ausente" }
-                                ))
+                let nav_used_h = (ui.cursor().min.y - inner_top).max(0.0);
+                let min_gap = 10.0;
+                let spacer = (ui.available_height() - self.last_api_card_height).max(min_gap);
+                ui.add_space(spacer);
+
+                let ext_count = self
+                    .manager
+                    .settings
+                    .read()
+                    .extractors
+                    .iter()
+                    .filter(|e| e.detected)
+                    .count();
+                let yt_ok = snap.media_tools.yt_dlp_path.is_some();
+                let ff_ok = snap.media_tools.ffmpeg_path.is_some();
+                let card_resp = Frame::new()
+                    .fill(to_c32(theme.bg_card))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.label(
+                            RichText::new(format!(
+                                "API Local: :{}",
+                                self.manager.settings.read().ipc_port
+                            ))
+                            .small()
+                            .color(to_c32(theme.accent)),
+                        );
+                        ui.label(
+                            RichText::new(format!("Extratores detectados: {ext_count}"))
                                 .small()
                                 .color(to_c32(theme.text_muted)),
-                            );
-                            ui.label(
-                                RichText::new(format!("Extratores detectados: {ext_count}"))
-                                    .small()
-                                    .color(to_c32(theme.text_muted)),
-                            );
-                            ui.label(
-                                RichText::new(format!(
-                                    "API Local: :{}",
-                                    self.manager.settings.read().ipc_port
-                                ))
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "yt-dlp: {}  |  FFmpeg: {}",
+                                if yt_ok { "OK" } else { "Ausente" },
+                                if ff_ok { "OK" } else { "Ausente" }
+                            ))
+                            .small()
+                            .color(to_c32(theme.text_muted)),
+                        );
+                        ui.label(
+                            RichText::new("Motores prontos")
                                 .small()
-                                .color(to_c32(theme.accent)),
-                            );
-                        });
-                });
+                                .strong()
+                                .color(to_c32(theme.text_primary)),
+                        );
+                    });
+
+                let card_h = card_resp.response.rect.height();
+                if card_h > 1.0 {
+                    self.last_api_card_height = card_h;
+                }
+                required_sidebar_h = nav_used_h + min_gap + self.last_api_card_height + 26.0;
             });
+
+        let min_total_h = (top_bar_h + required_sidebar_h).ceil();
+        if (min_total_h - self.last_min_window_height).abs() >= 1.0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(Vec2::new(
+                860.0,
+                min_total_h,
+            )));
+            self.last_min_window_height = min_total_h;
+        }
+        if let Some(inner_rect) = ctx.input(|i| i.viewport().inner_rect) {
+            if inner_rect.height() + 1.0 < min_total_h {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+                    inner_rect.width().max(860.0),
+                    min_total_h,
+                )));
+            }
+        }
     }
 
     fn render_clipboard_banner(&mut self, ui: &mut Ui, theme: &ThemeConfig) {

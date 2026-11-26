@@ -1235,7 +1235,7 @@
     magnetToastHost = null;
   }
 
-  function showMagnetToast(message, kind) {
+  function showMagnetToast(message, kind, durationMs = 2800) {
     removeMagnetToast();
     const host = document.createElement("div");
     host.style.cssText =
@@ -1259,7 +1259,9 @@
     shadow.appendChild(box);
     (document.body || document.documentElement).appendChild(host);
     magnetToastHost = host;
-    magnetToastTimer = setTimeout(removeMagnetToast, 2800);
+    if (durationMs > 0) {
+      magnetToastTimer = setTimeout(removeMagnetToast, durationMs);
+    }
   }
 
   document.addEventListener(
@@ -1294,9 +1296,147 @@
     true
   );
 
+  function initBrowserHosterResolver() {
+    if (window.top !== window) return;
+    if (!/(?:^|\.)(?:vikingfile\.com|vik1ngfile\.site)$/i.test(window.location.hostname)) {
+      return;
+    }
+
+    const cleanPageUrl = window.location.href.split("#")[0];
+    const isAutoResolve = window.location.hash.includes("vortex_resolve");
+
+    const startWatching = () => {
+      let resolved = false;
+      let linkObserver = null;
+      let pollTimer = null;
+      let hintTimer = null;
+
+      const cleanup = () => {
+        if (linkObserver) {
+          linkObserver.disconnect();
+          linkObserver = null;
+        }
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+        if (hintTimer) {
+          clearTimeout(hintTimer);
+          hintTimer = null;
+        }
+      };
+
+      const checkDownloadLink = () => {
+        if (resolved) return;
+        const dlEl = document.getElementById("download-link");
+        if (!dlEl) return;
+
+        const rawAttr = (dlEl.getAttribute("href") || "").trim();
+        const text = (dlEl.textContent || "").trim();
+        const resolvedHref =
+          rawAttr && rawAttr !== "#" && !rawAttr.startsWith("javascript:") ? dlEl.href : "";
+
+        if (resolvedHref && /^https?:\/\//i.test(resolvedHref) && !/^Error\s*:/i.test(text)) {
+          resolved = true;
+          cleanup();
+          const filename = (document.getElementById("filename")?.textContent || "").trim();
+          showMagnetToast("Link capturado, enviando ao VortexDL...", "pending", 0);
+          try {
+            chrome.runtime.sendMessage(
+              {
+                type: "BROWSER_RESOLVED_LINK",
+                pageUrl: cleanPageUrl,
+                directUrl: resolvedHref,
+                filename,
+                userAgent: navigator.userAgent,
+                isAutoResolve,
+              },
+              (resp) => {
+                if (chrome.runtime.lastError || !resp || !resp.ok) {
+                  showMagnetToast(
+                    resp?.error || "VortexDL não respondeu ao envio do link",
+                    "err",
+                    4500
+                  );
+                  return;
+                }
+                if (resp.next_url) {
+                  showMagnetToast(
+                    `Link capturado! Abrindo próximo (${resp.remaining} restante(s))...`,
+                    "ok",
+                    4000
+                  );
+                } else {
+                  showMagnetToast("Link capturado no VortexDL!", "ok", 3000);
+                }
+              }
+            );
+          } catch (_) {
+            showMagnetToast("Falha ao comunicar com extensão VortexDL", "err", 4000);
+          }
+          return;
+        }
+
+        if (/^Error\s*:/i.test(text)) {
+          resolved = true;
+          cleanup();
+          showMagnetToast(`VikingFile: ${text}`, "err", 4000);
+          try {
+            chrome.runtime.sendMessage({
+              type: "BROWSER_RESOLVED_LINK",
+              pageUrl: cleanPageUrl,
+              error: text,
+              isAutoResolve,
+            });
+          } catch (_) {}
+        }
+      };
+
+      showMagnetToast("VortexDL: aguardando Turnstile do VikingFile...", "pending", 0);
+      hintTimer = setTimeout(() => {
+        if (!resolved && document.getElementById("captcha-download")) {
+          showMagnetToast(
+            "VortexDL: marque a verificação do Cloudflare se aparecer",
+            "pending",
+            0
+          );
+        }
+      }, 3500);
+
+      if (document.documentElement) {
+        linkObserver = new MutationObserver(checkDownloadLink);
+        linkObserver.observe(document.documentElement, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["href", "class"],
+        });
+      }
+      pollTimer = setInterval(checkDownloadLink, 400);
+      checkDownloadLink();
+    };
+
+    if (isAutoResolve) {
+      startWatching();
+      return;
+    }
+
+    try {
+      chrome.runtime.sendMessage(
+        { type: "CHECK_VORTEX_PENDING_URL", pageUrl: cleanPageUrl },
+        (resp) => {
+          if (!chrome.runtime.lastError && resp && resp.pending) {
+            startWatching();
+          }
+        }
+      );
+    } catch (_) {}
+  }
+
   window.addEventListener("scroll", schedulePositionUpdate, { passive: true, capture: true });
   window.addEventListener("resize", schedulePositionUpdate, { passive: true });
   document.addEventListener("fullscreenchange", scheduleRescan);
 
   scanVideos();
+  initBrowserHosterResolver();
 })();

@@ -78,6 +78,34 @@ pub struct StatusResponse {
     pub items: Vec<StatusItemSummary>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct BrowserPendingResponse {
+    pub pending_urls: Vec<String>,
+    pub queue_len: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BrowserResolvedPayload {
+    pub page_url: String,
+    #[serde(default)]
+    pub direct_url: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BrowserResolvedResponse {
+    pub ok: bool,
+    pub matched: bool,
+    pub next_url: Option<String>,
+    pub remaining: usize,
+    pub message: String,
+}
+
 pub fn spawn_ipc_server(manager: Arc<DownloadManager>, port: u16) {
     let runtime = tokio::runtime::Handle::current();
     runtime.spawn(async move {
@@ -86,6 +114,8 @@ pub fn spawn_ipc_server(manager: Arc<DownloadManager>, port: u16) {
             .route("/api/status", get(handle_status))
             .route("/api/downloads", post(handle_add_download))
             .route("/api/grab", post(handle_grab))
+            .route("/api/browser-pending", get(handle_browser_pending))
+            .route("/api/browser-resolved", post(handle_browser_resolved))
             .route("/api/media", post(handle_add_media))
             .route("/api/media/probe", post(handle_probe_media))
             .route("/api/torrent", post(handle_add_torrent))
@@ -173,6 +203,36 @@ async fn handle_grab(
         ok: true,
         message: format!("{count} link(s) enviados para o LinkGrabber"),
         id: None,
+    })
+}
+
+async fn handle_browser_pending(
+    State(mgr): State<Arc<DownloadManager>>,
+) -> Json<BrowserPendingResponse> {
+    let (pending_urls, queue_len) = mgr.pending_browser_urls();
+    Json(BrowserPendingResponse {
+        pending_urls,
+        queue_len,
+    })
+}
+
+async fn handle_browser_resolved(
+    State(mgr): State<Arc<DownloadManager>>,
+    Json(payload): Json<BrowserResolvedPayload>,
+) -> Json<BrowserResolvedResponse> {
+    let outcome = mgr.apply_browser_resolution(
+        payload.page_url,
+        payload.direct_url,
+        payload.filename,
+        payload.error,
+        payload.headers,
+    );
+    Json(BrowserResolvedResponse {
+        ok: true,
+        matched: outcome.matched,
+        next_url: outcome.next_url,
+        remaining: outcome.remaining,
+        message: outcome.message,
     })
 }
 

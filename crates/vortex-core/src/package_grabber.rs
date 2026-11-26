@@ -174,7 +174,7 @@ pub fn sanitize_filename(name: &str) -> String {
     }
 }
 
-fn is_html_probe(info: &ProbeResult) -> bool {
+pub fn is_html_probe(info: &ProbeResult) -> bool {
     if info.has_content_disposition {
         return false;
     }
@@ -1336,7 +1336,7 @@ async fn try_special_hoster_resolve(
                         hint_size,
                         Some("FileDitch".to_string()),
                         headers.clone(),
-                        "FileDitch protegido por Cloudflare — clique em Download no navegador"
+                        "FileDitch protegido por Cloudflare — clique em 'Resolver no Navegador' ou Download no site"
                             .to_string(),
                     ),
                 ]));
@@ -1367,7 +1367,7 @@ async fn try_special_hoster_resolve(
                     .filename
                     .unwrap_or_else(|| fallback_filename_from_url(url));
                 let msg = if meta.has_turnstile {
-                    "VikingFile exige Turnstile no navegador — clique em Download no site para capturar pela extensão"
+                    "VikingFile exige Turnstile no navegador — clique em 'Resolver no Navegador' para capturar via extensão"
                 } else {
                     "Não foi possível obter link direto do VikingFile"
                 };

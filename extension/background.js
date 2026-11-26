@@ -174,6 +174,39 @@ async function collectCookiesHeader(url) {
   return "";
 }
 
+async function collectMergedCookiesHeader(urls) {
+  const seenNames = new Set();
+  const pairs = [];
+  for (const url of urls) {
+    if (!url || !url.startsWith("http")) continue;
+    try {
+      const cookies = await chrome.cookies.getAll({ url });
+      for (const c of cookies || []) {
+        if (!seenNames.has(c.name)) {
+          seenNames.add(c.name);
+          pairs.push(`${c.name}=${c.value}`);
+        }
+      }
+    } catch (_) {}
+  }
+  return pairs.join("; ");
+}
+
+function normalizeBrowserPageUrl(raw) {
+  const trimmed = String(raw || "").trim();
+  try {
+    const u = new URL(trimmed);
+    u.hash = "";
+    let s = u.toString();
+    if (s.endsWith("/") && u.pathname.length > 1 && !u.search) {
+      s = s.slice(0, -1);
+    }
+    return s;
+  } catch (_) {
+    return trimmed.split("#")[0].replace(/\/+$/, "");
+  }
+}
+
 function isMediaUrlOrContentType(url, contentType) {
   const lowerUrl = url.toLowerCase().split("?")[0];
   const ct = (contentType || "").toLowerCase();
@@ -1364,6 +1397,69 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.pageUrl) headers.Referer = msg.pageUrl;
       if (cookie) headers.Cookie = cookie;
       const res = await sendToVortex("/api/grab", { urls: msg.urls, headers });
+      sendResponse(res);
+    } else if (msg.type === "CHECK_VORTEX_PENDING_URL") {
+      try {
+        const resp = await fetch(`${API_BASE}/api/browser-pending`, {
+          signal: AbortSignal.timeout(2000),
+        });
+        if (!resp.ok) {
+          sendResponse({ pending: false });
+          return;
+        }
+        const data = await resp.json();
+        const norm = normalizeBrowserPageUrl(msg.pageUrl || "");
+        const list = Array.isArray(data?.pending_urls) ? data.pending_urls : [];
+        const matched = list.some((u) => normalizeBrowserPageUrl(u) === norm);
+        sendResponse({ pending: matched });
+      } catch (_) {
+        sendResponse({ pending: false });
+      }
+    } else if (msg.type === "BROWSER_RESOLVED_LINK") {
+      const pageUrl = String(msg.pageUrl || "");
+      const directUrl = msg.directUrl ? String(msg.directUrl) : null;
+      const headers = {};
+      if (pageUrl) headers.Referer = pageUrl;
+      if (msg.userAgent) headers["User-Agent"] = String(msg.userAgent);
+      const cookieStr = await collectMergedCookiesHeader(
+        directUrl ? [directUrl, pageUrl] : [pageUrl]
+      );
+      if (cookieStr) headers.Cookie = cookieStr;
+
+      let res = { ok: false, error: "VortexDL offline" };
+      try {
+        const resp = await fetch(`${API_BASE}/api/browser-resolved`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            page_url: pageUrl,
+            direct_url: directUrl,
+            filename: msg.filename || null,
+            error: msg.error || null,
+            headers,
+          }),
+        });
+        if (resp.ok) {
+          res = await resp.json();
+        } else {
+          res = { ok: false, error: `HTTP ${resp.status}` };
+        }
+      } catch (err) {
+        res = { ok: false, error: String(err) };
+      }
+
+      const tabId = sender?.tab?.id;
+      if (res.ok && tabId) {
+        if (res.next_url) {
+          setTimeout(() => {
+            chrome.tabs.update(tabId, { url: res.next_url, active: true }).catch(() => {});
+          }, 450);
+        } else if (msg.isAutoResolve) {
+          setTimeout(() => {
+            chrome.tabs.remove(tabId).catch(() => {});
+          }, 1400);
+        }
+      }
       sendResponse(res);
     } else if (msg.type === "CHECK_STATUS") {
       try {

@@ -1933,6 +1933,13 @@ impl VortexApp {
             .iter()
             .filter(|l| l.selected && l.online == Some(false))
             .count();
+        let browser_resolvable_urls: Vec<String> = snap
+            .grabbed_links
+            .iter()
+            .filter(|l| vortex_core::manager::is_browser_resolvable_link(l) && !l.probing)
+            .map(|l| l.url.clone())
+            .collect();
+        let browser_resolvable_count = browser_resolvable_urls.len();
         let total_size: u64 = snap
             .grabbed_links
             .iter()
@@ -1998,6 +2005,26 @@ impl VortexApp {
                         }
                     }
                 }
+                if browser_resolvable_count > 0
+                    && ui
+                        .button(
+                            RichText::new(format!(
+                                "Resolver no Navegador ({browser_resolvable_count})"
+                            ))
+                            .color(to_c32(theme.warning))
+                            .strong(),
+                        )
+                        .on_hover_text(
+                            "Abre os links com Turnstile/Cloudflare sequencialmente no navegador para a extensão VortexDL capturar os links diretos automaticamente",
+                        )
+                        .clicked()
+                {
+                    if let Some(first_url) =
+                        grabber_mgr.queue_browser_resolutions(browser_resolvable_urls.clone())
+                    {
+                        let _ = open::that(&first_url);
+                    }
+                }
             }
             if snap.grabber_probing {
                 ui.add_space(4.0);
@@ -2050,7 +2077,10 @@ impl VortexApp {
         ui.add_space(6.0);
         ScrollArea::vertical().show(ui, |ui| {
             let mut toggles: Vec<(Uuid, bool)> = Vec::new();
+            let mut single_resolve_url: Option<String> = None;
             for link in &snap.grabbed_links {
+                let can_browser_resolve =
+                    vortex_core::manager::is_browser_resolvable_link(link) && !link.probing;
                 Frame::new()
                     .fill(to_c32(theme.bg_card))
                     .stroke(Stroke::new(1.0, to_c32(theme.border)))
@@ -2082,12 +2112,17 @@ impl VortexApp {
                                         let (tag, color) = site_badge_style(site, theme);
                                         pill(ui, &format!("{tag} • {site}"), color, theme);
                                     }
-                                    match link.online {
-                                        Some(true) => pill(ui, "Online", to_c32(theme.success), theme),
-                                        Some(false) => {
-                                            pill(ui, "Offline/Erro", to_c32(theme.error), theme)
+                                    if link.probing {
+                                        ui.spinner();
+                                        pill(ui, "Resolvendo...", to_c32(theme.accent), theme);
+                                    } else {
+                                        match link.online {
+                                            Some(true) => pill(ui, "Online", to_c32(theme.success), theme),
+                                            Some(false) => {
+                                                pill(ui, "Offline/Erro", to_c32(theme.error), theme)
+                                            }
+                                            None => {}
                                         }
-                                        None => {}
                                     }
                                     if let Some(ref pkg) = link.package_key {
                                         pill(
@@ -2112,6 +2147,14 @@ impl VortexApp {
                                     .on_hover_text(&link.url);
                                 },
                                 |ui| {
+                                    if can_browser_resolve
+                                        && ui
+                                            .small_button("Resolver")
+                                            .on_hover_text("Abrir no navegador para resolver Turnstile/Cloudflare")
+                                            .clicked()
+                                    {
+                                        single_resolve_url = Some(link.url.clone());
+                                    }
                                     ui.label(
                                         RichText::new(&size_text).color(to_c32(theme.text_muted)),
                                     );
@@ -2145,12 +2188,25 @@ impl VortexApp {
                                         theme,
                                     );
                                 }
-                                match link.online {
-                                    Some(true) => pill(ui, "Online", to_c32(theme.success), theme),
-                                    Some(false) => {
-                                        pill(ui, "Offline/Erro", to_c32(theme.error), theme)
+                                if link.probing {
+                                    ui.spinner();
+                                    pill(ui, "Resolvendo...", to_c32(theme.accent), theme);
+                                } else {
+                                    match link.online {
+                                        Some(true) => pill(ui, "Online", to_c32(theme.success), theme),
+                                        Some(false) => {
+                                            pill(ui, "Offline/Erro", to_c32(theme.error), theme)
+                                        }
+                                        None => {}
                                     }
-                                    None => {}
+                                }
+                                if can_browser_resolve
+                                    && ui
+                                        .small_button("Resolver")
+                                        .on_hover_text("Abrir no navegador para resolver Turnstile/Cloudflare")
+                                        .clicked()
+                                {
+                                    single_resolve_url = Some(link.url.clone());
                                 }
                                 ui.label(
                                     RichText::new(&size_text).color(to_c32(theme.text_muted)),
@@ -2161,7 +2217,11 @@ impl VortexApp {
                             ui.label(
                                 RichText::new(err)
                                     .small()
-                                    .color(to_c32(theme.error)),
+                                    .color(if link.probing {
+                                        to_c32(theme.accent)
+                                    } else {
+                                        to_c32(theme.error)
+                                    }),
                             );
                         }
                     });
@@ -2173,6 +2233,11 @@ impl VortexApp {
                     if let Some(item) = g.iter_mut().find(|l| l.id == id) {
                         item.selected = sel;
                     }
+                }
+            }
+            if let Some(url) = single_resolve_url {
+                if let Some(first_url) = self.manager.queue_browser_resolutions(vec![url]) {
+                    let _ = open::that(&first_url);
                 }
             }
         });

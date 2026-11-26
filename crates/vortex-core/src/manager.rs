@@ -5,7 +5,8 @@ use crate::extractor::{
 };
 use crate::http_engine::{
     BandwidthLimiter, DownloadCancelHandle, HtmlPageDetected, ProgressSnapshot,
-    apply_custom_headers, build_http_client, run_http_download, run_http_download_with_options,
+    apply_custom_headers, build_http_client, probe_url, run_http_download,
+    run_http_download_with_options,
 };
 use crate::media_engine::{
     MediaToolsStatus, detect_media_tools, detect_media_url, install_ffmpeg_essentials,
@@ -17,8 +18,9 @@ use crate::model::{
     NewMediaRequest, NoticeEntry, PackageId, PasswordPromptRequest, TorrentDownloadMeta,
 };
 use crate::package_grabber::{
-    detect_multipart, extract_urls_from_text, fallback_filename_from_url, find_missing_parts,
-    probe_grabbed_links, resolve_indirect_http_url, sanitize_filename,
+    assign_package_totals, detect_multipart, extract_urls_from_text, fallback_filename_from_url,
+    find_missing_parts, is_html_probe, probe_grabbed_links, resolve_indirect_http_url,
+    sanitize_filename,
 };
 use crate::state::{PersistedState, load_settings, load_state, save_settings, save_state};
 use crate::torrent_engine::{
@@ -42,6 +44,14 @@ pub struct SpeedSample {
 }
 
 #[derive(Debug, Clone)]
+pub struct BrowserResolvedOutcome {
+    pub matched: bool,
+    pub next_url: Option<String>,
+    pub remaining: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ManagerSnapshot {
     pub downloads: Vec<DownloadItem>,
     pub packages: Vec<DownloadPackage>,
@@ -61,6 +71,7 @@ pub struct DownloadManager {
     pub downloads: Arc<RwLock<Vec<DownloadItem>>>,
     pub packages: Arc<RwLock<Vec<DownloadPackage>>>,
     pub grabbed_links: Arc<RwLock<Vec<GrabbedLink>>>,
+    browser_resolve_queue: Arc<RwLock<VecDeque<String>>>,
     grabber_probe_count: Arc<AtomicUsize>,
     focus_grabber_requested: Arc<AtomicBool>,
     pub speed_history: Arc<RwLock<VecDeque<SpeedSample>>>,
@@ -111,6 +122,7 @@ impl DownloadManager {
             downloads: Arc::new(RwLock::new(persisted.downloads)),
             packages: Arc::new(RwLock::new(persisted.packages)),
             grabbed_links: Arc::new(RwLock::new(Vec::new())),
+            browser_resolve_queue: Arc::new(RwLock::new(VecDeque::new())),
             grabber_probe_count: Arc::new(AtomicUsize::new(0)),
             focus_grabber_requested: Arc::new(AtomicBool::new(false)),
             speed_history: Arc::new(RwLock::new(hist)),
@@ -840,6 +852,209 @@ impl DownloadManager {
             mgr.grabber_probe_count.fetch_sub(1, Ordering::Relaxed);
             mgr.push_notice(format!("{count} link(s) analisados no LinkGrabber."));
         });
+    }
+
+    pub fn queue_browser_resolutions(&self, urls: Vec<String>) -> Option<String> {
+        let mut unique = Vec::new();
+        let mut seen = HashSet::new();
+        for raw in urls {
+            let norm = normalize_browser_page_url(&raw);
+            if !(norm.starts_with("http://") || norm.starts_with("https://")) {
+                continue;
+            }
+            if seen.insert(norm.clone()) {
+                unique.push(norm);
+            }
+        }
+        if unique.is_empty() {
+            return None;
+        }
+
+        let target_set: HashSet<String> = unique.iter().cloned().collect();
+        {
+            let mut g = self.grabbed_links.write();
+            for link in g.iter_mut() {
+                if target_set.contains(&normalize_browser_page_url(&link.url)) {
+                    link.probing = true;
+                    link.error = Some("Aguardando resolução Turnstile no navegador...".to_string());
+                }
+            }
+        }
+
+        let total = unique.len();
+        let mut iter = unique.into_iter();
+        let first = iter.next()?;
+        {
+            let mut q = self.browser_resolve_queue.write();
+            q.clear();
+            q.extend(iter);
+        }
+
+        self.push_notice(format!(
+            "Abrindo 1/{total} no navegador para resolver Turnstile..."
+        ));
+        Some(format!("{first}#vortex_resolve"))
+    }
+
+    pub fn pending_browser_urls(&self) -> (Vec<String>, usize) {
+        let g = self.grabbed_links.read();
+        let mut urls = Vec::new();
+        let mut seen = HashSet::new();
+        for link in g.iter() {
+            if link.online == Some(true) {
+                continue;
+            }
+            if is_browser_resolvable_link(link) || link.probing {
+                let norm = normalize_browser_page_url(&link.url);
+                if seen.insert(norm.clone()) {
+                    urls.push(norm);
+                }
+            }
+        }
+        let queue_len = self.browser_resolve_queue.read().len();
+        (urls, queue_len)
+    }
+
+    pub fn apply_browser_resolution(
+        self: &Arc<Self>,
+        page_url: String,
+        direct_url: Option<String>,
+        filename: Option<String>,
+        error: Option<String>,
+        headers: HashMap<String, String>,
+    ) -> BrowserResolvedOutcome {
+        let norm_page = normalize_browser_page_url(&page_url);
+        let (next_url, remaining) = {
+            let mut q = self.browser_resolve_queue.write();
+            q.retain(|u| normalize_browser_page_url(u) != norm_page);
+            let next = q.pop_front().map(|u| format!("{u}#vortex_resolve"));
+            (next, q.len())
+        };
+
+        let clean_direct = direct_url
+            .map(|s| s.trim().to_string())
+            .filter(|s| s.starts_with("http://") || s.starts_with("https://"));
+
+        let mut matched_ids: Vec<(Uuid, String, HashMap<String, String>)> = Vec::new();
+        {
+            let mut g = self.grabbed_links.write();
+            for link in g.iter_mut() {
+                if normalize_browser_page_url(&link.url) != norm_page {
+                    continue;
+                }
+                if let Some(ref direct) = clean_direct {
+                    link.url = direct.clone();
+                    for (k, v) in &headers {
+                        if !v.trim().is_empty() {
+                            link.headers.insert(k.clone(), v.clone());
+                        }
+                    }
+                    if let Some(ref fname) = filename {
+                        let clean_fname = sanitize_filename(fname.trim());
+                        let looks_generic = !link.filename.contains('.')
+                            || link.filename.len() <= 16 && link.part_number.is_none();
+                        if !clean_fname.is_empty() && (looks_generic || link.filename.is_empty()) {
+                            let mp = detect_multipart(&clean_fname);
+                            link.category = FileCategory::from_filename(&clean_fname);
+                            link.package_key = mp.as_ref().map(|m| m.package_key.clone());
+                            link.part_number = mp.as_ref().map(|m| m.part_number);
+                            link.filename = clean_fname;
+                        }
+                    }
+                    link.online = Some(true);
+                    link.error = None;
+                    link.selected = true;
+                    link.probing = true;
+                    matched_ids.push((link.id, direct.clone(), link.headers.clone()));
+                } else {
+                    link.probing = false;
+                    link.online = Some(false);
+                    link.error = Some(
+                        error
+                            .clone()
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| "Falha ao resolver Turnstile no navegador".to_string()),
+                    );
+                    matched_ids.push((link.id, String::new(), HashMap::new()));
+                }
+            }
+            if !matched_ids.is_empty() {
+                assign_package_totals(&mut g);
+                sort_grabbed_links(&mut g);
+            }
+        }
+
+        let matched = !matched_ids.is_empty();
+        if clean_direct.is_some() && matched {
+            let mgr = self.clone();
+            let client = self.client.clone();
+            let probe_targets: Vec<(Uuid, String, HashMap<String, String>)> = matched_ids
+                .into_iter()
+                .filter(|(_, u, _)| !u.is_empty())
+                .collect();
+            self.runtime.spawn(async move {
+                for (id, direct, hdrs) in probe_targets {
+                    let probe_res = probe_url(&client, &direct, &hdrs).await;
+                    let mut g = mgr.grabbed_links.write();
+                    if let Some(link) = g.iter_mut().find(|l| l.id == id) {
+                        link.probing = false;
+                        if let Ok(info) = probe_res {
+                            if !is_html_probe(&info) {
+                                if let Some(sz) = info.total_bytes {
+                                    link.size_bytes = Some(sz);
+                                }
+                                link.supports_ranges = info.supports_ranges;
+                                if let Some(cd_name) = info.filename {
+                                    let clean = sanitize_filename(&cd_name);
+                                    if !clean.is_empty() {
+                                        let mp = detect_multipart(&clean);
+                                        link.category = FileCategory::from_filename(&clean);
+                                        if link.package_key.is_none() {
+                                            link.package_key = mp.as_ref().map(|m| m.package_key.clone());
+                                        }
+                                        if link.part_number.is_none() {
+                                            link.part_number = mp.as_ref().map(|m| m.part_number);
+                                        }
+                                        link.filename = clean;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    assign_package_totals(&mut g);
+                    sort_grabbed_links(&mut g);
+                }
+            });
+
+            if remaining > 0 {
+                self.push_notice(format!(
+                    "Link resolvido no navegador! Avançando ({remaining} restante(s))..."
+                ));
+            } else {
+                self.push_notice("Links Turnstile resolvidos no LinkGrabber!".to_string());
+            }
+        } else if matched && remaining > 0 {
+            self.push_notice(format!(
+                "Falha em 1 link Turnstile; avançando ({remaining} restante(s))..."
+            ));
+        }
+
+        let message = if clean_direct.is_some() {
+            if matched {
+                "Link atualizado no LinkGrabber".to_string()
+            } else {
+                "Link capturado, mas não estava pendente no LinkGrabber".to_string()
+            }
+        } else {
+            error.unwrap_or_else(|| "Erro ao resolver no navegador".to_string())
+        };
+
+        BrowserResolvedOutcome {
+            matched,
+            next_url,
+            remaining,
+            message,
+        }
     }
 
     pub fn enqueue_selected_grabbed(
@@ -2139,6 +2354,49 @@ pub fn is_valid_grabbed_link(link: &GrabbedLink) -> bool {
         && link.size_bytes.is_some_and(|s| s > 0)
 }
 
+pub fn normalize_browser_page_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Ok(mut parsed) = url::Url::parse(trimmed) {
+        parsed.set_fragment(None);
+        let mut s = parsed.to_string();
+        if s.ends_with('/') && parsed.path().len() > 1 && parsed.query().is_none() {
+            s.pop();
+        }
+        return s;
+    }
+    trimmed
+        .split('#')
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+pub fn is_browser_resolvable_link(link: &GrabbedLink) -> bool {
+    if link.online == Some(true) {
+        return false;
+    }
+    if let Ok(parsed) = url::Url::parse(&link.url) {
+        if let Some(host) = parsed.host_str() {
+            let h = host.to_ascii_lowercase();
+            if h == "vikingfile.com"
+                || h.ends_with(".vikingfile.com")
+                || h == "vik1ngfile.site"
+                || h.ends_with(".vik1ngfile.site")
+            {
+                return true;
+            }
+        }
+    }
+    if matches!(link.source_site.as_deref(), Some("VikingFile")) {
+        return true;
+    }
+    link.error.as_deref().is_some_and(|e| {
+        let low = e.to_ascii_lowercase();
+        low.contains("turnstile") || low.contains("cloudflare")
+    })
+}
+
 fn grabbed_link_sort_tier(link: &GrabbedLink) -> u8 {
     let has_size = link.size_bytes.is_some_and(|s| s > 0);
     match (has_size, link.online) {
@@ -2531,5 +2789,91 @@ mod tests {
         assert!(!save_dir.exists());
         assert!(outside.exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalize_browser_page_url_strips_fragment_and_preserves_case() {
+        assert_eq!(
+            normalize_browser_page_url("https://VikingFile.com/f/8obvHhvQET/#vortex_resolve"),
+            "https://vikingfile.com/f/8obvHhvQET"
+        );
+        assert_eq!(
+            normalize_browser_page_url("https://vik1ngfile.site/f/AbCdEf12"),
+            "https://vik1ngfile.site/f/AbCdEf12"
+        );
+    }
+
+    #[test]
+    fn browser_resolvable_link_matches_vikingfile_and_cloudflare_errors() {
+        let mut vf = mk_link("game.part1.rar", None, Some(false));
+        vf.url = "https://vikingfile.com/f/8obvHhvQET".into();
+        vf.source_site = Some("VikingFile".into());
+        assert!(is_browser_resolvable_link(&vf));
+
+        vf.online = Some(true);
+        assert!(!is_browser_resolvable_link(&vf));
+
+        let mut cf = mk_link("archive.rar", None, Some(false));
+        cf.error = Some("FileDitch protegido por Cloudflare".into());
+        assert!(is_browser_resolvable_link(&cf));
+
+        let regular_dead = mk_link("dead.rar", None, Some(false));
+        assert!(!is_browser_resolvable_link(&regular_dead));
+    }
+
+    #[tokio::test]
+    async fn browser_resolution_queue_advances_and_updates_link() {
+        let mgr = DownloadManager::new(tokio::runtime::Handle::current());
+        let mut l1 = mk_link("game.part1.rar", None, Some(false));
+        l1.url = "https://vikingfile.com/f/PartOne11".into();
+        l1.source_site = Some("VikingFile".into());
+        l1.selected = false;
+
+        let mut l2 = mk_link("game.part2.rar", None, Some(false));
+        l2.url = "https://vikingfile.com/f/PartTwo22".into();
+        l2.source_site = Some("VikingFile".into());
+        l2.selected = false;
+
+        *mgr.grabbed_links.write() = vec![l1.clone(), l2.clone()];
+
+        let first = mgr.queue_browser_resolutions(vec![l1.url.clone(), l2.url.clone()]);
+        assert_eq!(
+            first.as_deref(),
+            Some("https://vikingfile.com/f/PartOne11#vortex_resolve")
+        );
+
+        let (pending, q_len) = mgr.pending_browser_urls();
+        assert_eq!(q_len, 1);
+        assert_eq!(pending.len(), 2);
+
+        let mut hdrs = HashMap::new();
+        hdrs.insert("User-Agent".into(), "Chrome/131".into());
+        let out = mgr.apply_browser_resolution(
+            "https://vikingfile.com/f/PartOne11#vortex_resolve".into(),
+            Some("https://cdn.vikingfile.com/dl/token123/game.part1.rar".into()),
+            None,
+            None,
+            hdrs,
+        );
+        assert!(out.matched);
+        assert_eq!(out.remaining, 0);
+        assert_eq!(
+            out.next_url.as_deref(),
+            Some("https://vikingfile.com/f/PartTwo22#vortex_resolve")
+        );
+
+        let links = mgr.grabbed_links.read();
+        let updated1 = links.iter().find(|l| l.id == l1.id).unwrap();
+        assert_eq!(
+            updated1.url,
+            "https://cdn.vikingfile.com/dl/token123/game.part1.rar"
+        );
+        assert_eq!(updated1.online, Some(true));
+        assert!(updated1.selected);
+        assert_eq!(updated1.error, None);
+        assert_eq!(
+            updated1.headers.get("User-Agent").map(String::as_str),
+            Some("Chrome/131")
+        );
     }
 }

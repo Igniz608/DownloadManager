@@ -6,11 +6,12 @@ use md5::{Digest as Md5Digest, Md5};
 use parking_lot::Mutex;
 use reqwest::Client;
 use reqwest::header::{
-    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderMap,
-    HeaderName, HeaderValue, LAST_MODIFIED, RANGE, USER_AGENT,
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+    HeaderMap, HeaderName, HeaderValue, LAST_MODIFIED, RANGE, USER_AGENT,
 };
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -20,9 +21,29 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 #[derive(Debug, Clone)]
+pub struct HtmlPageDetected {
+    pub final_url: String,
+    pub content_type: String,
+}
+
+impl fmt::Display for HtmlPageDetected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "URL retornou página HTML ({}) em vez de arquivo direto: {}",
+            self.content_type, self.final_url
+        )
+    }
+}
+
+impl std::error::Error for HtmlPageDetected {}
+
+#[derive(Debug, Clone)]
 pub struct ProbeResult {
     pub final_url: String,
     pub filename: Option<String>,
+    pub content_type: Option<String>,
+    pub has_content_disposition: bool,
     pub total_bytes: Option<u64>,
     pub supports_ranges: bool,
     pub etag: Option<String>,
@@ -104,11 +125,17 @@ pub async fn probe_url(
     if let Ok(resp) = head_req.send().await {
         if resp.status().is_success() {
             let final_url = resp.url().to_string();
-            let cd = resp
+            let raw_cd = resp
                 .headers()
                 .get(CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok());
+            let has_content_disposition = raw_cd.is_some();
+            let cd = raw_cd.and_then(parse_content_disposition);
+            let content_type = resp
+                .headers()
+                .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .and_then(parse_content_disposition);
+                .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase());
             let total_bytes = resp
                 .headers()
                 .get(CONTENT_LENGTH)
@@ -136,6 +163,8 @@ pub async fn probe_url(
                 return Ok(ProbeResult {
                     final_url,
                     filename: cd,
+                    content_type,
+                    has_content_disposition,
                     total_bytes,
                     supports_ranges,
                     etag,
@@ -153,11 +182,17 @@ pub async fn probe_url(
     }
 
     let final_url = resp.url().to_string();
-    let cd = resp
+    let raw_cd = resp
         .headers()
         .get(CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok());
+    let has_content_disposition = raw_cd.is_some();
+    let cd = raw_cd.and_then(parse_content_disposition);
+    let content_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .and_then(parse_content_disposition);
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase());
 
     let mut supports_ranges = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     let mut total_bytes = None;
@@ -198,6 +233,8 @@ pub async fn probe_url(
     Ok(ProbeResult {
         final_url,
         filename: cd,
+        content_type,
+        has_content_disposition,
         total_bytes,
         supports_ranges,
         etag,
@@ -358,6 +395,27 @@ pub async fn run_http_download(
     cancel: Arc<DownloadCancelHandle>,
     on_progress: Arc<dyn Fn(ProgressSnapshot) + Send + Sync>,
 ) -> Result<DownloadItem> {
+    run_http_download_with_options(
+        client,
+        item,
+        categorize_subfolders,
+        false,
+        limiter,
+        cancel,
+        on_progress,
+    )
+    .await
+}
+
+pub async fn run_http_download_with_options(
+    client: Client,
+    item: DownloadItem,
+    categorize_subfolders: bool,
+    allow_html: bool,
+    limiter: BandwidthLimiter,
+    cancel: Arc<DownloadCancelHandle>,
+    on_progress: Arc<dyn Fn(ProgressSnapshot) + Send + Sync>,
+) -> Result<DownloadItem> {
     let mut current = item;
 
     // 1. Probe if we don't know total_bytes or we're starting fresh
@@ -383,6 +441,20 @@ pub async fn run_http_download(
         });
 
         let probe = probe_url(&client, &current.url, &current.headers).await?;
+        if !allow_html
+            && !probe.has_content_disposition
+            && current.downloaded_bytes == 0
+            && current.checksum_expected.is_none()
+        {
+            if let Some(ref ct) = probe.content_type {
+                if ct == "text/html" || ct == "application/xhtml+xml" {
+                    return Err(anyhow::Error::new(HtmlPageDetected {
+                        final_url: probe.final_url,
+                        content_type: ct.clone(),
+                    }));
+                }
+            }
+        }
         download_url = probe.final_url.clone();
 
         if current.filename.is_empty() || current.filename == "download.bin" {

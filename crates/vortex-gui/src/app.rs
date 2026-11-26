@@ -2061,6 +2061,22 @@ impl VortexApp {
                     }
                 });
 
+                let detected_media =
+                    vortex_core::media_engine::detect_media_url(self.new_http_url.trim());
+                if let Some(media_match) = detected_media {
+                    let kind_label = if media_match.is_hls {
+                        "Stream HLS detectado — será baixado via motor de vídeo."
+                    } else if media_match.is_dash {
+                        "Stream DASH detectado — será baixado via motor de vídeo."
+                    } else {
+                        "Link de vídeo detectado — será baixado automaticamente em alta qualidade (yt-dlp)."
+                    };
+                    ui.colored_label(
+                        to_c32(theme.accent),
+                        kind_label,
+                    );
+                }
+
                 ui.label("Nome do arquivo (opcional — detectado via servidor):");
                 ui.add(egui::TextEdit::singleline(&mut self.new_http_filename).desired_width(f32::INFINITY));
 
@@ -2101,8 +2117,34 @@ impl VortexApp {
                     if ui.button("Cancelar").clicked() {
                         self.show_new_http_modal = false;
                     }
+                    if detected_media.is_some() && ui.button("Escolher Qualidade...").clicked() {
+                        let url = self.new_http_url.trim().to_string();
+                        if !url.is_empty() {
+                            self.media_url = url.clone();
+                            self.media_save_dir = self.new_http_dir.clone();
+                            *self.media_probing.lock() = true;
+                            *self.media_probe_result.lock() = None;
+                            let mgr = self.manager.clone();
+                            let probing = self.media_probing.clone();
+                            let res_slot = self.media_probe_result.clone();
+                            self.runtime.spawn(async move {
+                                let res = mgr.probe_media(&url).await.map_err(|e| e.to_string());
+                                *res_slot.lock() = Some(res);
+                                *probing.lock() = false;
+                            });
+                            self.active_tab = NavTab::Media;
+                            self.new_http_url.clear();
+                            self.new_http_filename.clear();
+                            self.show_new_http_modal = false;
+                        }
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if accent_button(ui, "Iniciar Download", theme).clicked()
+                        let btn_label = if detected_media.is_some() {
+                            "Baixar Vídeo"
+                        } else {
+                            "Iniciar Download"
+                        };
+                        if accent_button(ui, btn_label, theme).clicked()
                             && !self.new_http_url.trim().is_empty()
                         {
                             let mut headers = HashMap::new();

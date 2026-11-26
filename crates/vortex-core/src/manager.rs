@@ -3,11 +3,12 @@ use crate::extractor::{
     is_extractable_archive, select_best_extractor,
 };
 use crate::http_engine::{
-    BandwidthLimiter, DownloadCancelHandle, ProgressSnapshot, build_http_client, run_http_download,
+    BandwidthLimiter, DownloadCancelHandle, HtmlPageDetected, ProgressSnapshot, build_http_client,
+    run_http_download, run_http_download_with_options,
 };
 use crate::media_engine::{
-    MediaToolsStatus, detect_media_tools, install_ffmpeg_essentials, install_yt_dlp,
-    probe_media_url, run_media_download,
+    MediaToolsStatus, detect_media_tools, detect_media_url, install_ffmpeg_essentials,
+    install_yt_dlp, probe_media_url, probe_single_media_url, run_media_download,
 };
 use crate::model::{
     AppSettings, DownloadId, DownloadItem, DownloadKind, DownloadPackage, DownloadStatus,
@@ -273,6 +274,26 @@ impl DownloadManager {
             return self.add_torrent_async(&url_trimmed, save_dir);
         }
 
+        if req.checksum.is_none() {
+            if let Some(media_match) = detect_media_url(&url_trimmed) {
+                return self.add_media_download_with_start(
+                    NewMediaRequest {
+                        url: url_trimmed,
+                        save_dir: req.save_dir,
+                        format_id: None,
+                        quality_label: Some("Melhor".to_string()),
+                        audio_only: false,
+                        embed_subtitles: false,
+                        headers: req.headers,
+                        title_hint: req.filename,
+                        is_hls: media_match.is_hls,
+                        is_dash: media_match.is_dash,
+                    },
+                    req.start_immediately,
+                );
+            }
+        }
+
         let settings = self.settings.read().clone();
         let filename = req
             .filename
@@ -339,6 +360,14 @@ impl DownloadManager {
     }
 
     pub fn add_media_download(self: &Arc<Self>, req: NewMediaRequest) -> Result<DownloadId> {
+        self.add_media_download_with_start(req, None)
+    }
+
+    fn add_media_download_with_start(
+        self: &Arc<Self>,
+        req: NewMediaRequest,
+        start_immediately: Option<bool>,
+    ) -> Result<DownloadId> {
         let settings = self.settings.read().clone();
         let base_dir = req.save_dir.unwrap_or_else(|| settings.default_download_dir.clone());
         let save_dir = if settings.categorize_into_subfolders {
@@ -357,6 +386,7 @@ impl DownloadManager {
             .clone()
             .map(|t| sanitize_filename(&t))
             .unwrap_or_else(|| fallback_filename_from_url(&req.url));
+        let auto_start = start_immediately.unwrap_or(settings.auto_start_downloads);
 
         let id = Uuid::new_v4();
         let item = DownloadItem {
@@ -365,7 +395,11 @@ impl DownloadManager {
             part_index: None,
             part_total: None,
             kind: DownloadKind::Media,
-            status: DownloadStatus::Queued,
+            status: if auto_start {
+                DownloadStatus::Queued
+            } else {
+                DownloadStatus::Paused
+            },
             url: req.url,
             filename: title_clean.clone(),
             save_dir: save_dir.clone(),
@@ -643,25 +677,133 @@ impl DownloadManager {
                     });
 
                     let res = run_http_download(
-                        client,
+                        client.clone(),
                         item.clone(),
                         cat_subfolders,
-                        limiter,
+                        limiter.clone(),
                         cancel.clone(),
-                        on_prog,
+                        on_prog.clone(),
                     )
                     .await;
 
-                    mgr.cancel_handles.write().remove(&id);
                     match res {
                         Ok(finished_item) => {
+                            mgr.cancel_handles.write().remove(&id);
                             let is_done = finished_item.status == DownloadStatus::Completed;
                             mgr.replace_item(finished_item.clone());
                             if is_done {
                                 mgr.handle_post_download_completion(finished_item).await;
                             }
                         }
+                        Err(e) if e.downcast_ref::<HtmlPageDetected>().is_some() => {
+                            let tools = detect_media_tools(&mgr.settings.read());
+                            let media_probe = if let Some(ref yt_dlp) = tools.yt_dlp_path {
+                                probe_single_media_url(yt_dlp, &item.url, &item.headers)
+                                    .await
+                                    .ok()
+                                    .filter(|p| !p.formats.is_empty() || !p.title.is_empty())
+                            } else {
+                                None
+                            };
+
+                            if cancel.is_stopped() {
+                                mgr.cancel_handles.write().remove(&id);
+                                if cancel.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                                    mgr.downloads.write().retain(|d| d.id != id);
+                                } else if let Some(slot) = mgr.downloads.write().iter_mut().find(|d| d.id == id) {
+                                    slot.status = DownloadStatus::Paused;
+                                    slot.speed_bps = 0;
+                                    slot.eta_seconds = None;
+                                }
+                            } else if let Some(probe) = media_probe {
+                                let mut media_item = item.clone();
+                                media_item.kind = DownloadKind::Media;
+                                media_item.category = FileCategory::Video;
+                                if cat_subfolders {
+                                    if let Some(parent) = media_item.save_dir.parent() {
+                                        if media_item.save_dir.ends_with(item.category.subfolder()) {
+                                            media_item.save_dir =
+                                                parent.join(FileCategory::Video.subfolder());
+                                        }
+                                    }
+                                }
+                                let clean_title = sanitize_filename(&probe.title);
+                                if !clean_title.is_empty() {
+                                    media_item.filename = clean_title;
+                                }
+                                media_item.file_path = media_item.save_dir.join(&media_item.filename);
+                                media_item.media_info = Some(MediaDownloadMeta {
+                                    format_id: None,
+                                    quality_label: Some("Melhor".to_string()),
+                                    title: Some(probe.title),
+                                    duration_secs: probe.duration_secs,
+                                    is_hls: false,
+                                    is_dash: false,
+                                    audio_only: false,
+                                    embed_subtitles: false,
+                                    extractor_used: "yt-dlp".into(),
+                                });
+                                mgr.replace_item(media_item.clone());
+
+                                let mgr_cb = mgr.clone();
+                                let media_res = run_media_download(
+                                    client,
+                                    media_item,
+                                    tools.yt_dlp_path,
+                                    tools.ffmpeg_path,
+                                    cancel.clone(),
+                                    move |status, filename, file_path, downloaded, total, speed, eta| {
+                                        mgr_cb.apply_progress_snapshot(ProgressSnapshot {
+                                            id,
+                                            status,
+                                            filename,
+                                            file_path,
+                                            category: None,
+                                            total_bytes: total,
+                                            downloaded_bytes: downloaded,
+                                            speed_bps: speed,
+                                            eta_seconds: eta,
+                                            supports_ranges: None,
+                                            segments: None,
+                                            etag: None,
+                                            last_modified: None,
+                                            checksum_verified: None,
+                                        });
+                                    },
+                                )
+                                .await;
+
+                                mgr.cancel_handles.write().remove(&id);
+                                match media_res {
+                                    Ok(finished_item) => mgr.replace_item(finished_item),
+                                    Err(err) => mgr.mark_failed(id, err.to_string()),
+                                }
+                            } else {
+                                let fallback_res = run_http_download_with_options(
+                                    client,
+                                    item.clone(),
+                                    cat_subfolders,
+                                    true,
+                                    limiter,
+                                    cancel.clone(),
+                                    on_prog,
+                                )
+                                .await;
+                                mgr.cancel_handles.write().remove(&id);
+                                match fallback_res {
+                                    Ok(finished_item) => {
+                                        let is_done = finished_item.status == DownloadStatus::Completed;
+                                        mgr.replace_item(finished_item.clone());
+                                        if is_done {
+                                            mgr.handle_post_download_completion(finished_item).await;
+                                        }
+                                    }
+                                    Err(err) => mgr.mark_failed(id, err.to_string()),
+                                }
+                            }
+                        }
                         Err(e) => {
+                            mgr.cancel_handles.write().remove(&id);
                             mgr.mark_failed(id, e.to_string());
                         }
                     }

@@ -156,6 +156,155 @@ fn walkdir_shallow(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaUrlMatch {
+    pub is_hls: bool,
+    pub is_dash: bool,
+}
+
+fn host_matches(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+fn has_direct_non_stream_extension(path_lower: &str) -> bool {
+    let last_seg = path_lower.rsplit('/').next().unwrap_or("");
+    let Some((_, ext)) = last_seg.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        ext,
+        "zip"
+            | "rar"
+            | "7z"
+            | "tar"
+            | "gz"
+            | "tgz"
+            | "xz"
+            | "bz2"
+            | "zst"
+            | "iso"
+            | "img"
+            | "dmg"
+            | "bin"
+            | "exe"
+            | "msi"
+            | "msix"
+            | "apk"
+            | "deb"
+            | "rpm"
+            | "pdf"
+            | "epub"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ppt"
+            | "pptx"
+            | "mp4"
+            | "mkv"
+            | "webm"
+            | "avi"
+            | "mov"
+            | "flv"
+            | "mp3"
+            | "flac"
+            | "wav"
+            | "aac"
+            | "ogg"
+            | "m4a"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "webp"
+            | "gif"
+            | "svg"
+            | "json"
+            | "xml"
+            | "txt"
+            | "csv"
+            | "torrent"
+    )
+}
+
+pub fn detect_media_url(raw_url: &str) -> Option<MediaUrlMatch> {
+    let Ok(parsed) = url::Url::parse(raw_url.trim()) else {
+        return None;
+    };
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let path_lower = parsed.path().to_ascii_lowercase();
+
+    if path_lower.ends_with(".m3u8") {
+        return Some(MediaUrlMatch {
+            is_hls: true,
+            is_dash: false,
+        });
+    }
+    if path_lower.ends_with(".mpd") {
+        return Some(MediaUrlMatch {
+            is_hls: false,
+            is_dash: true,
+        });
+    }
+
+    if has_direct_non_stream_extension(&path_lower) {
+        return None;
+    }
+
+    let is_media_platform = is_youtube_url(raw_url)
+        || ((host_matches(&host, "x.com") || host_matches(&host, "twitter.com"))
+            && (path_lower.contains("/status/")
+                || path_lower.contains("/i/broadcasts/")
+                || path_lower.contains("/i/spaces/")))
+        || host_matches(&host, "vxtwitter.com")
+        || host_matches(&host, "fxtwitter.com")
+        || host_matches(&host, "fixupx.com")
+        || host_matches(&host, "tiktok.com")
+        || (host_matches(&host, "instagram.com")
+            && (path_lower.starts_with("/reel")
+                || path_lower.starts_with("/p/")
+                || path_lower.starts_with("/tv/")
+                || path_lower.starts_with("/stories/")))
+        || host_matches(&host, "twitch.tv")
+        || host_matches(&host, "vimeo.com")
+        || (host_matches(&host, "reddit.com")
+            && (path_lower.contains("/comments/") || path_lower.starts_with("/s/")))
+        || host_matches(&host, "v.redd.it")
+        || host_matches(&host, "fb.watch")
+        || (host_matches(&host, "facebook.com")
+            && (path_lower.starts_with("/watch")
+                || path_lower.contains("/videos/")
+                || path_lower.starts_with("/reel")
+                || path_lower.starts_with("/share/v/")
+                || path_lower.starts_with("/share/r/")))
+        || host_matches(&host, "kick.com")
+        || host_matches(&host, "rumble.com")
+        || host_matches(&host, "dailymotion.com")
+        || host_matches(&host, "dai.ly")
+        || host_matches(&host, "streamable.com")
+        || host_matches(&host, "bilibili.com")
+        || host_matches(&host, "b23.tv")
+        || host_matches(&host, "odysee.com")
+        || host_matches(&host, "soundcloud.com")
+        || host_matches(&host, "bandcamp.com")
+        || (host_matches(&host, "loom.com") && path_lower.starts_with("/share/"))
+        || (host_matches(&host, "bsky.app") && path_lower.contains("/post/"))
+        || ((host_matches(&host, "threads.net") || host_matches(&host, "threads.com"))
+            && path_lower.contains("/post/"))
+        || host_matches(&host, "redgifs.com");
+
+    if is_media_platform {
+        Some(MediaUrlMatch {
+            is_hls: false,
+            is_dash: false,
+        })
+    } else {
+        None
+    }
+}
+
 fn is_youtube_url(raw_url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(raw_url.trim()) else {
         return false;
@@ -1090,5 +1239,45 @@ mod tests {
         assert!(!has_cookie_header(&hdrs));
         hdrs.insert("Cookie".to_string(), "SID=abc".to_string());
         assert!(has_cookie_header(&hdrs));
+    }
+
+    #[test]
+    fn detects_video_platform_and_stream_urls() {
+        assert_eq!(
+            detect_media_url("https://youtu.be/R7LeRXiYh68?si=6jkrk1582m_PXrRr"),
+            Some(MediaUrlMatch {
+                is_hls: false,
+                is_dash: false
+            })
+        );
+        assert_eq!(
+            detect_media_url("https://x.com/user/status/1234567890"),
+            Some(MediaUrlMatch {
+                is_hls: false,
+                is_dash: false
+            })
+        );
+        assert_eq!(
+            detect_media_url("https://www.tiktok.com/@creator/video/987654321"),
+            Some(MediaUrlMatch {
+                is_hls: false,
+                is_dash: false
+            })
+        );
+        assert_eq!(
+            detect_media_url("https://cdn.example.com/live/master.m3u8?token=1"),
+            Some(MediaUrlMatch {
+                is_hls: true,
+                is_dash: false
+            })
+        );
+        assert_eq!(
+            detect_media_url("https://cdn.example.com/file.mp4"),
+            None
+        );
+        assert_eq!(
+            detect_media_url("https://github.com/org/repo/archive/main.zip"),
+            None
+        );
     }
 }

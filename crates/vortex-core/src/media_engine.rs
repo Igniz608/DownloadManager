@@ -91,7 +91,10 @@ pub async fn install_ffmpeg_essentials(client: &Client) -> Result<PathBuf> {
     let _ = tokio::fs::remove_dir_all(&extract_dir).await;
     tokio::fs::create_dir_all(&extract_dir).await?;
 
-    let out = Command::new("tar.exe")
+    let tar_bin = crate::extractor::find_windows_tar().unwrap_or_else(|| "tar.exe".to_string());
+    let mut tar_cmd = Command::new(tar_bin);
+    crate::extractor::configure_silent_command(&mut tar_cmd);
+    let out = tar_cmd
         .args([
             "-xf",
             &zip_path.to_string_lossy(),
@@ -159,6 +162,7 @@ pub async fn probe_media_url(
     headers: &HashMap<String, String>,
 ) -> Result<MediaProbeResult> {
     let mut cmd = Command::new(yt_dlp_path);
+    crate::extractor::configure_silent_command(&mut cmd);
     cmd.args(["-J", "--no-warnings", "--flat-playlist"]);
     for (k, v) in headers {
         cmd.arg("--add-header").arg(format!("{k}:{v}"));
@@ -355,6 +359,7 @@ where
         .to_string();
 
     let mut cmd = Command::new(yt_dlp_path);
+    crate::extractor::configure_silent_command(&mut cmd);
     cmd.arg("--newline")
         .arg("--no-warnings")
         .arg("--continue")
@@ -787,7 +792,9 @@ where
     }
 
     let final_output = if let Some(ffmpeg) = ffmpeg_path {
-        let out = Command::new(&ffmpeg)
+        let mut ff_cmd = Command::new(&ffmpeg);
+        crate::extractor::configure_silent_command(&mut ff_cmd);
+        let out = ff_cmd
             .args([
                 "-y",
                 "-i",

@@ -801,26 +801,85 @@ impl VortexApp {
                             if ui.button("Abrir").clicked() {
                                 let _ = open::that(&item.file_path);
                             }
-                            if item.category == FileCategory::Archive {
+                        }
+                        let is_archive = (item.category == FileCategory::Archive
+                            || vortex_core::extractor::is_extractable_archive(&item.file_path))
+                            && (!item.status.is_finished() || item.file_path.exists());
+                        if is_archive {
+                            let combo_label = if !item.status.is_finished() {
+                                if !item.auto_extract {
+                                    "Não extrair".to_string()
+                                } else if let Some(ref ov_id) = item.extractor_override {
+                                    extractors
+                                        .iter()
+                                        .find(|p| &p.id == ov_id)
+                                        .map(|p| {
+                                            let short = if p.id == "windows_native" {
+                                                "Win. Nativo"
+                                            } else {
+                                                p.name.as_str()
+                                            };
+                                            format!("Extrair: {short}")
+                                        })
+                                        .unwrap_or_else(|| "Extrair com...".to_string())
+                                } else {
+                                    "Extrair com...".to_string()
+                                }
+                            } else {
+                                "Extrair com...".to_string()
+                            };
+
+                            let can_interact = item.status != DownloadStatus::Extracting;
+                            ui.add_enabled_ui(can_interact, |ui| {
                                 egui::ComboBox::from_id_salt(("ext_now", item.id))
-                                    .selected_text("Extrair com...")
-                                    .width(115.0)
+                                    .selected_text(combo_label)
+                                    .width(122.0)
                                     .show_ui(ui, |ui| {
-                                        if ui.button("Padrão (Auto)").clicked() {
-                                            self.manager.trigger_manual_extract(item.id, None);
+                                        let auto_selected =
+                                            item.auto_extract && item.extractor_override.is_none();
+                                        if ui.selectable_label(auto_selected, "Padrão (Auto)").clicked()
+                                        {
+                                            self.manager.set_extractor_override(item.id, None, true);
+                                            if item.status.is_finished() && item.file_path.exists() {
+                                                self.manager.trigger_manual_extract(item.id, None);
+                                            }
                                         }
                                         for prof in &extractors {
                                             if prof.detected && prof.enabled {
-                                                if ui.button(&prof.name).clicked() {
-                                                    self.manager.trigger_manual_extract(
+                                                let prof_selected = item.auto_extract
+                                                    && item.extractor_override.as_deref()
+                                                        == Some(prof.id.as_str());
+                                                if ui
+                                                    .selectable_label(prof_selected, &prof.name)
+                                                    .clicked()
+                                                {
+                                                    self.manager.set_extractor_override(
                                                         item.id,
                                                         Some(prof.id.clone()),
+                                                        true,
                                                     );
+                                                    if item.status.is_finished()
+                                                        && item.file_path.exists()
+                                                    {
+                                                        self.manager.trigger_manual_extract(
+                                                            item.id,
+                                                            Some(prof.id.clone()),
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
+                                        if !item.status.is_finished() {
+                                            if ui
+                                                .selectable_label(!item.auto_extract, "Não extrair")
+                                                .clicked()
+                                            {
+                                                self.manager
+                                                    .set_extractor_override(item.id, None, false);
+                                            }
+                                        }
                                     });
-                            }
+                            });
                         }
                         if item.status.is_active() || item.status == DownloadStatus::Queued {
                             if ui.button("Pausar").clicked() {
@@ -912,6 +971,32 @@ impl VortexApp {
                                 .small()
                                 .color(to_c32(theme.success)),
                         );
+                        if item.status == DownloadStatus::Extracting {
+                            ui.add_space(4.0);
+                            if let Some(ex_frac) = item.extraction_progress {
+                                let frac = ex_frac.clamp(0.0, 1.0);
+                                ui.add(
+                                    egui::ProgressBar::new(frac)
+                                        .desired_width(96.0)
+                                        .desired_height(6.0)
+                                        .fill(to_c32(theme.accent)),
+                                );
+                                ui.label(
+                                    RichText::new(format!("{:.0}%", frac * 100.0))
+                                        .small()
+                                        .color(to_c32(theme.text_muted)),
+                                );
+                            } else {
+                                let pulse =
+                                    ((ui.input(|i| i.time) * 1.6).sin() * 0.5 + 0.5) as f32;
+                                ui.add(
+                                    egui::ProgressBar::new(0.15 + pulse * 0.7)
+                                        .desired_width(96.0)
+                                        .desired_height(6.0)
+                                        .fill(to_c32(theme.accent)),
+                                );
+                            }
+                        }
                     }
                     if let Some(ref err) = item.error {
                         ui.label(RichText::new(err).small().color(to_c32(theme.error)));
@@ -1083,6 +1168,21 @@ impl VortexApp {
                             );
                             if let Some(ref st) = pkg.extraction_status {
                                 ui.label(RichText::new(format!("• {st}")).small().color(to_c32(theme.success)));
+                                if let Some(ex_frac) = pkg.extraction_progress {
+                                    let frac = ex_frac.clamp(0.0, 1.0);
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::ProgressBar::new(frac)
+                                            .desired_width(96.0)
+                                            .desired_height(6.0)
+                                            .fill(to_c32(theme.accent)),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!("{:.0}%", frac * 100.0))
+                                            .small()
+                                            .color(to_c32(theme.text_muted)),
+                                    );
+                                }
                             } else if pkg.auto_extract {
                                 ui.label(
                                     RichText::new(format!(

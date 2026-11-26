@@ -1,4 +1,7 @@
-use crate::extractor::{detect_default_extractors, extract_archive, is_extractable_archive, select_best_extractor};
+use crate::extractor::{
+    ProgressCallback, detect_default_extractors, extract_archive_with_progress,
+    is_extractable_archive, select_best_extractor,
+};
 use crate::http_engine::{
     BandwidthLimiter, DownloadCancelHandle, ProgressSnapshot, build_http_client, run_http_download,
 };
@@ -323,6 +326,7 @@ impl DownloadManager {
             extract_password: req.extract_password,
             extracted_to: None,
             extraction_status: None,
+            extraction_progress: None,
             created_at: Utc::now(),
             completed_at: None,
             error: None,
@@ -402,6 +406,7 @@ impl DownloadManager {
             extract_password: None,
             extracted_to: None,
             extraction_status: None,
+            extraction_progress: None,
             created_at: Utc::now(),
             completed_at: None,
             error: None,
@@ -564,6 +569,7 @@ impl DownloadManager {
                     extract_password: password.clone(),
                     extracted_to: None,
                     extraction_status: None,
+                    extraction_progress: None,
                     created_at: Utc::now(),
                     completed_at: None,
                     error: None,
@@ -585,6 +591,7 @@ impl DownloadManager {
                 extract_password: password.clone(),
                 delete_archives_after_extract: delete_archives,
                 extraction_status: None,
+                extraction_progress: None,
                 extracted_to: None,
                 created_at: Utc::now(),
             };
@@ -836,6 +843,31 @@ impl DownloadManager {
         }
     }
 
+    pub fn set_extractor_override(
+        &self,
+        id: DownloadId,
+        extractor_id: Option<String>,
+        auto_extract: bool,
+    ) {
+        let mut package_id = None;
+        {
+            let mut dls = self.downloads.write();
+            if let Some(d) = dls.iter_mut().find(|x| x.id == id) {
+                d.extractor_override = extractor_id.clone();
+                d.auto_extract = auto_extract;
+                package_id = d.package_id;
+            }
+        }
+        if let Some(pid) = package_id {
+            let mut pkgs = self.packages.write();
+            if let Some(p) = pkgs.iter_mut().find(|x| x.id == pid) {
+                p.extractor_id = extractor_id;
+                p.auto_extract = auto_extract;
+            }
+        }
+        self.persist_now();
+    }
+
     pub fn trigger_manual_extract(self: &Arc<Self>, id: DownloadId, extractor_id: Option<String>) {
         let item_opt = self.downloads.read().iter().find(|d| d.id == id).cloned();
         let Some(item) = item_opt else {
@@ -876,27 +908,55 @@ impl DownloadManager {
             return Err(anyhow!("Nenhum utilitário de extração configurado/detectado"));
         };
 
+        let initial_progress = match profile.kind {
+            crate::model::ExtractorKind::NanaZip
+            | crate::model::ExtractorKind::SevenZip
+            | crate::model::ExtractorKind::PeaZip => Some(0.0),
+            _ => None,
+        };
+
         {
             let mut dls = self.downloads.write();
             if let Some(d) = dls.iter_mut().find(|x| x.id == item_id) {
                 d.status = DownloadStatus::Extracting;
                 d.extraction_status = Some(format!("Extraindo com {}...", profile.name));
+                d.extraction_progress = initial_progress;
             }
         }
         if let Some(pid) = package_id {
             let mut pkgs = self.packages.write();
             if let Some(p) = pkgs.iter_mut().find(|x| x.id == pid) {
                 p.extraction_status = Some(format!("Extraindo com {}...", profile.name));
+                p.extraction_progress = initial_progress;
             }
         }
 
-        let res = extract_archive(
+        let downloads_ref = self.downloads.clone();
+        let packages_ref = self.packages.clone();
+        let progress_cb: ProgressCallback = Arc::new(move |frac: f32| {
+            let clamped = frac.clamp(0.0, 1.0);
+            {
+                let mut dls = downloads_ref.write();
+                if let Some(d) = dls.iter_mut().find(|x| x.id == item_id) {
+                    d.extraction_progress = Some(clamped);
+                }
+            }
+            if let Some(pid) = package_id {
+                let mut pkgs = packages_ref.write();
+                if let Some(p) = pkgs.iter_mut().find(|x| x.id == pid) {
+                    p.extraction_progress = Some(clamped);
+                }
+            }
+        });
+
+        let res = extract_archive_with_progress(
             &archive_path,
             &dest_dir,
             &profile,
             explicit_password.as_deref(),
             &settings.password_list,
             settings.extract_into_subfolder,
+            Some(progress_cb),
         )
         .await;
 
@@ -913,6 +973,7 @@ impl DownloadManager {
                         d.status = DownloadStatus::Completed;
                         d.extracted_to = Some(out_dir.clone());
                         d.extraction_status = Some(format!("Extraído via {}", profile.name));
+                        d.extraction_progress = None;
                     }
                 }
                 if let Some(pid) = package_id {
@@ -920,6 +981,7 @@ impl DownloadManager {
                     if let Some(p) = pkgs.iter_mut().find(|x| x.id == pid) {
                         p.extracted_to = Some(out_dir.clone());
                         p.extraction_status = Some(format!("Extraído via {}", profile.name));
+                        p.extraction_progress = None;
                     }
                 }
                 self.push_notice(format!(
@@ -937,12 +999,14 @@ impl DownloadManager {
                     if let Some(d) = dls.iter_mut().find(|x| x.id == item_id) {
                         d.status = DownloadStatus::Completed;
                         d.extraction_status = Some(msg.clone());
+                        d.extraction_progress = None;
                     }
                 }
                 if let Some(pid) = package_id {
                     let mut pkgs = self.packages.write();
                     if let Some(p) = pkgs.iter_mut().find(|x| x.id == pid) {
                         p.extraction_status = Some(msg.clone());
+                        p.extraction_progress = None;
                     }
                 }
                 self.push_notice(msg);

@@ -131,6 +131,7 @@ impl TorrentEngine {
             extract_password: None,
             extracted_to: None,
             extraction_status: None,
+            extraction_progress: None,
             created_at: Utc::now(),
             completed_at: None,
             error: None,

@@ -1,10 +1,34 @@
 use crate::model::{AppSettings, ExtractorKind, ExtractorProfile};
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 #[cfg(windows)]
 use winreg::{RegKey, enums::*};
+
+pub type ProgressCallback = Arc<dyn Fn(f32) + Send + Sync>;
+
+pub(crate) fn configure_silent_command(cmd: &mut Command) {
+    cmd.stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
+pub(crate) fn find_windows_tar() -> Option<String> {
+    if let Some(sys_root) = std::env::var_os("SystemRoot") {
+        let candidate = PathBuf::from(sys_root).join("System32").join("tar.exe");
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    find_in_path("tar.exe")
+}
 
 pub fn detect_default_extractors(existing: &[ExtractorProfile]) -> Vec<ExtractorProfile> {
     let mut profiles = Vec::new();
@@ -71,7 +95,7 @@ pub fn detect_default_extractors(existing: &[ExtractorProfile]) -> Vec<Extractor
         enabled: true,
     });
 
-    let win_tar = find_in_path("tar.exe");
+    let win_tar = find_windows_tar();
     profiles.push(ExtractorProfile {
         id: "windows_native".into(),
         name: "Windows Nativo (tar.exe / PowerShell)".into(),
@@ -177,6 +201,27 @@ pub async fn extract_archive(
     password_list: &[String],
     into_subfolder: bool,
 ) -> Result<PathBuf> {
+    extract_archive_with_progress(
+        archive_path,
+        dest_dir,
+        profile,
+        explicit_password,
+        password_list,
+        into_subfolder,
+        None,
+    )
+    .await
+}
+
+pub async fn extract_archive_with_progress(
+    archive_path: &Path,
+    dest_dir: &Path,
+    profile: &ExtractorProfile,
+    explicit_password: Option<&str>,
+    password_list: &[String],
+    into_subfolder: bool,
+    on_progress: Option<ProgressCallback>,
+) -> Result<PathBuf> {
     if !archive_path.exists() {
         return Err(anyhow!(
             "Arquivo para extração não encontrado: {}",
@@ -205,7 +250,15 @@ pub async fn extract_archive(
 
     let mut last_err = None;
     for pw in passwords_to_try {
-        match run_extractor_once(archive_path, &final_dest, profile, pw.as_deref()).await {
+        match run_extractor_once(
+            archive_path,
+            &final_dest,
+            profile,
+            pw.as_deref(),
+            on_progress.as_ref(),
+        )
+        .await
+        {
             Ok(()) => return Ok(final_dest),
             Err(err) => {
                 last_err = Some(err);
@@ -224,22 +277,27 @@ async fn run_extractor_once(
     dest_dir: &Path,
     profile: &ExtractorProfile,
     password: Option<&str>,
+    on_progress: Option<&ProgressCallback>,
 ) -> Result<()> {
     let archive_str = archive_path.to_string_lossy().to_string();
     let dest_str = dest_dir.to_string_lossy().to_string();
 
     if profile.kind == ExtractorKind::WindowsNative {
-        // Try Windows 11 libarchive `tar.exe -xf "<archive>" -C "<dest>"`
-        let output = Command::new(&profile.executable)
-            .arg("-xf")
-            .arg(&archive_str)
-            .arg("-C")
-            .arg(&dest_str)
-            .output()
-            .await;
+        let tar_bin = if Path::new(&profile.executable).is_file()
+            && !profile
+                .executable
+                .to_lowercase()
+                .contains("\\git\\usr\\bin\\tar.exe")
+        {
+            profile.executable.clone()
+        } else {
+            find_windows_tar().unwrap_or_else(|| profile.executable.clone())
+        };
+        let mut cmd = Command::new(&tar_bin);
+        cmd.arg("-xf").arg(&archive_str).arg("-C").arg(&dest_str);
 
-        if let Ok(out) = output {
-            if out.status.success() {
+        if let Ok((status, _stdout, stderr)) = run_command_with_progress(cmd, on_progress).await {
+            if status.success() {
                 return Ok(());
             }
             // Fallback for .zip using PowerShell Expand-Archive
@@ -249,22 +307,16 @@ async fn run_extractor_once(
                     archive_str.replace('\'', "''"),
                     dest_str.replace('\'', "''")
                 );
-                let ps_out = Command::new("powershell")
-                    .args(["-NoProfile", "-Command", &ps_cmd])
-                    .output()
-                    .await?;
-                if ps_out.status.success() {
+                let mut ps = Command::new("powershell");
+                ps.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd]);
+                let (ps_status, _ps_stdout, ps_stderr) =
+                    run_command_with_progress(ps, on_progress).await?;
+                if ps_status.success() {
                     return Ok(());
                 }
-                return Err(anyhow!(
-                    "Windows Nativo falhou: {}",
-                    String::from_utf8_lossy(&ps_out.stderr)
-                ));
+                return Err(anyhow!("Windows Nativo falhou: {}", ps_stderr.trim()));
             }
-            return Err(anyhow!(
-                "tar.exe falhou: {}",
-                String::from_utf8_lossy(&out.stderr)
-            ));
+            return Err(anyhow!("tar.exe falhou: {}", stderr.trim()));
         }
     }
 
@@ -276,19 +328,17 @@ async fn run_extractor_once(
             let bundled_7z = dir.join("res").join("bin").join("7z").join("7z.exe");
             if bundled_7z.exists() {
                 let mut cmd = Command::new(&bundled_7z);
-                cmd.arg("x").arg("-y");
+                cmd.arg("x").arg("-y").arg("-bsp1");
                 if let Some(pw) = password {
                     cmd.arg(format!("-p{pw}"));
                 }
                 cmd.arg(format!("-o{dest_str}")).arg(&archive_str);
-                let out = cmd.output().await?;
-                if out.status.success() {
+                let (status, _stdout, stderr) =
+                    run_command_with_progress(cmd, on_progress).await?;
+                if status.success() {
                     return Ok(());
                 }
-                return Err(anyhow!(
-                    "PeaZip/7z falhou: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                ));
+                return Err(anyhow!("PeaZip/7z falhou: {}", stderr.trim()));
             }
         }
     }
@@ -305,26 +355,132 @@ async fn run_extractor_once(
         }
     }
 
-    let args = split_command_args(&rendered);
-    let out = Command::new(&profile.executable)
-        .args(&args)
-        .output()
+    let mut args = split_command_args(&rendered);
+    if matches!(
+        profile.kind,
+        ExtractorKind::NanaZip | ExtractorKind::SevenZip
+    ) && !args.iter().any(|a| a.starts_with("-bsp"))
+    {
+        args.push("-bsp1".to_string());
+    }
+
+    let mut cmd = Command::new(&profile.executable);
+    cmd.args(&args);
+    let (status, stdout, stderr) = run_command_with_progress(cmd, on_progress)
         .await
         .with_context(|| format!("Não foi possível executar {}", profile.executable))?;
 
-    if out.status.success() {
+    if status.success() {
         Ok(())
     } else {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let stdout = String::from_utf8_lossy(&out.stdout);
         Err(anyhow!(
             "{} retornou erro ({}): {} {}",
             profile.name,
-            out.status,
+            status,
             stderr.trim(),
             stdout.trim()
         ))
     }
+}
+
+async fn run_command_with_progress(
+    mut cmd: Command,
+    on_progress: Option<&ProgressCallback>,
+) -> Result<(std::process::ExitStatus, String, String)> {
+    configure_silent_command(&mut cmd);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let cb_out = on_progress.cloned();
+    let stdout_task = tokio::spawn(async move {
+        let mut collected = String::new();
+        if let Some(mut reader) = stdout {
+            let mut buf = [0u8; 4096];
+            let mut pending = String::new();
+            while let Ok(n) = reader.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                let chunk = String::from_utf8_lossy(&buf[..n]);
+                collected.push_str(&chunk);
+                if let Some(ref cb) = cb_out {
+                    pending.push_str(&chunk);
+                    while let Some(pos) = pending.find(['\r', '\n']) {
+                        let line = &pending[..pos];
+                        if let Some(pct) = parse_progress_percent(line) {
+                            cb((pct as f32 / 100.0).clamp(0.0, 1.0));
+                        }
+                        pending.drain(..=pos);
+                    }
+                }
+            }
+            if let Some(ref cb) = cb_out {
+                if let Some(pct) = parse_progress_percent(&pending) {
+                    cb((pct as f32 / 100.0).clamp(0.0, 1.0));
+                }
+            }
+        }
+        collected
+    });
+
+    let cb_err = on_progress.cloned();
+    let stderr_task = tokio::spawn(async move {
+        let mut collected = String::new();
+        if let Some(mut reader) = stderr {
+            let mut buf = [0u8; 4096];
+            let mut pending = String::new();
+            while let Ok(n) = reader.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                let chunk = String::from_utf8_lossy(&buf[..n]);
+                collected.push_str(&chunk);
+                if let Some(ref cb) = cb_err {
+                    pending.push_str(&chunk);
+                    while let Some(pos) = pending.find(['\r', '\n', '\x08']) {
+                        let line = &pending[..pos];
+                        if let Some(pct) = parse_progress_percent(line) {
+                            cb((pct as f32 / 100.0).clamp(0.0, 1.0));
+                        }
+                        pending.drain(..=pos);
+                    }
+                }
+            }
+            if let Some(ref cb) = cb_err {
+                if let Some(pct) = parse_progress_percent(&pending) {
+                    cb((pct as f32 / 100.0).clamp(0.0, 1.0));
+                }
+            }
+        }
+        collected
+    });
+
+    let status = child.wait().await?;
+    let stdout_str = stdout_task.await.unwrap_or_default();
+    let stderr_str = stderr_task.await.unwrap_or_default();
+    Ok((status, stdout_str, stderr_str))
+}
+
+fn parse_progress_percent(segment: &str) -> Option<u8> {
+    let trimmed = segment.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    for token in trimmed.split_whitespace() {
+        if let Some(num_str) = token.strip_suffix('%') {
+            if !num_str.is_empty() && num_str.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(val) = num_str.parse::<u8>() {
+                    if val <= 100 {
+                        return Some(val);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn split_command_args(input: &str) -> Vec<String> {
@@ -506,5 +662,14 @@ mod tests {
     fn splits_quoted_command_args() {
         let args = split_command_args(r#"x -y -o"{dest}" "{archive}""#);
         assert_eq!(args, vec!["x", "-y", "-o{dest}", "{archive}"]);
+    }
+
+    #[test]
+    fn parses_7z_and_nanazip_progress_percent() {
+        assert_eq!(parse_progress_percent("  0%"), Some(0));
+        assert_eq!(parse_progress_percent(" 42% - folder/file.iso"), Some(42));
+        assert_eq!(parse_progress_percent("100%"), Some(100));
+        assert_eq!(parse_progress_percent("file%20name.zip"), None);
+        assert_eq!(parse_progress_percent("Everything is Ok"), None);
     }
 }

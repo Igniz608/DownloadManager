@@ -218,6 +218,8 @@ pub struct DownloadItem {
     pub extract_password: Option<String>,
     pub extracted_to: Option<PathBuf>,
     pub extraction_status: Option<String>,
+    #[serde(default)]
+    pub extraction_progress: Option<f32>,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
@@ -252,6 +254,8 @@ pub struct DownloadPackage {
     pub extract_password: Option<String>,
     pub delete_archives_after_extract: bool,
     pub extraction_status: Option<String>,
+    #[serde(default)]
+    pub extraction_progress: Option<f32>,
     pub extracted_to: Option<PathBuf>,
     pub created_at: DateTime<Utc>,
 }

@@ -7,7 +7,9 @@ const tabMedia = new Map();
 const recentHeaders = new Map();
 // URLs temporarily bypassed so browser handles them natively if user disables or app is offline
 const bypassUrls = new Set();
-// Download IDs handed off to VortexDL that must be cancelled & erased in Chromium
+// Download IDs currently held while deciding whether to hand off to VortexDL
+const heldDownloads = new Map();
+// Download IDs handed off to VortexDL that must be cancelled & erased in the browser
 const cancellingIds = new Set();
 
 const DEFAULT_SETTINGS = {
@@ -21,9 +23,67 @@ const DEFAULT_SETTINGS = {
   ],
 };
 
+let cachedSettings = { ...DEFAULT_SETTINGS };
+
 async function getSettings() {
   const stored = await chrome.storage.local.get("vortexSettings");
-  return { ...DEFAULT_SETTINGS, ...(stored.vortexSettings || {}) };
+  cachedSettings = { ...DEFAULT_SETTINGS, ...(stored.vortexSettings || {}) };
+  return cachedSettings;
+}
+
+const settingsReady = getSettings().catch(() => cachedSettings);
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === "local" && changes.vortexSettings) {
+    cachedSettings = { ...DEFAULT_SETTINGS, ...(changes.vortexSettings.newValue || {}) };
+  }
+});
+
+function downloadsCall(fn) {
+  return new Promise((resolve) => {
+    try {
+      fn((result) => {
+        const err = chrome.runtime.lastError;
+        resolve({ ok: !err, error: err ? err.message : null, result });
+      });
+    } catch (err) {
+      resolve({ ok: false, error: String(err), result: undefined });
+    }
+  });
+}
+
+async function addBypassUrl(url) {
+  bypassUrls.add(url);
+  if (chrome.storage.session) {
+    try {
+      const data = await chrome.storage.session.get("vortexBypassUrls");
+      const list = Array.isArray(data.vortexBypassUrls) ? data.vortexBypassUrls : [];
+      if (!list.includes(url)) {
+        list.push(url);
+        await chrome.storage.session.set({ vortexBypassUrls: list.slice(-50) });
+      }
+    } catch (_) {}
+  }
+}
+
+async function consumeBypassUrl(url) {
+  if (bypassUrls.has(url)) {
+    bypassUrls.delete(url);
+    return true;
+  }
+  if (chrome.storage.session) {
+    try {
+      const data = await chrome.storage.session.get("vortexBypassUrls");
+      const list = Array.isArray(data.vortexBypassUrls) ? data.vortexBypassUrls : [];
+      const idx = list.indexOf(url);
+      if (idx !== -1) {
+        list.splice(idx, 1);
+        await chrome.storage.session.set({ vortexBypassUrls: list });
+        return true;
+      }
+    } catch (_) {}
+  }
+  return false;
 }
 
 async function sendToVortex(endpoint, payload) {
@@ -188,6 +248,18 @@ function extractDownloadFilename(item) {
   return (item.filename || "").split(/[/\\]/).pop() || "";
 }
 
+function isClearlyIgnoredAsset(item) {
+  const url = item.finalUrl || item.url || "";
+  const filename = extractDownloadFilename(item);
+  const extFromName = filename.includes(".") ? filename.split(".").pop().toLowerCase() : "";
+  const urlPath = url.toLowerCase().split("?")[0].split("#")[0];
+  const lastSeg = urlPath.split("/").pop() || "";
+  const extFromUrl = lastSeg.includes(".") ? lastSeg.split(".").pop() : "";
+  const ext = extFromName || extFromUrl;
+  const ignoredWebExts = ["html", "htm", "css", "js", "mjs", "json", "xml", "svg", "txt"];
+  return Boolean(ext && ignoredWebExts.includes(ext));
+}
+
 function shouldInterceptDownload(item, settings) {
   const url = item.finalUrl || item.url || "";
   const filename = extractDownloadFilename(item);
@@ -197,8 +269,7 @@ function shouldInterceptDownload(item, settings) {
   const extFromUrl = lastSeg.includes(".") ? lastSeg.split(".").pop() : "";
   const ext = extFromName || extFromUrl;
 
-  const ignoredWebExts = ["html", "htm", "css", "js", "mjs", "json", "xml", "svg", "txt"];
-  if (ext && ignoredWebExts.includes(ext)) {
+  if (isClearlyIgnoredAsset(item)) {
     return false;
   }
 
@@ -226,7 +297,8 @@ function shouldInterceptDownload(item, settings) {
     mime === "application/pdf" ||
     mime === "application/epub+zip";
 
-  const largeEnough = item.fileSize > 0 && item.fileSize >= settings.minSizeBytes;
+  const totalSize = item.fileSize > 0 ? item.fileSize : item.totalBytes > 0 ? item.totalBytes : 0;
+  const largeEnough = totalSize > 0 && totalSize >= settings.minSizeBytes;
   return matchesExt || matchesMime || largeEnough;
 }
 
@@ -243,8 +315,188 @@ async function buildDownloadHeaders(item, url) {
   return headers;
 }
 
+function callSuggestOnce(entry) {
+  if (!entry || !entry.suggest || entry.suggested) return;
+  entry.suggested = true;
+  try {
+    entry.suggest();
+  } catch (err) {
+    console.warn("[VortexDL] suggest failed:", err);
+  }
+}
+
+async function forceCancelDownload(id, entry) {
+  cancellingIds.add(id);
+  await downloadsCall((cb) => chrome.downloads.cancel(id, cb));
+  await downloadsCall((cb) => chrome.downloads.erase({ id }, cb));
+
+  // Verify the download actually left in_progress; some Chromium states require suggest() before cancel()
+  const verifyAndFinish = async () => {
+    const res = await downloadsCall((cb) => chrome.downloads.search({ id }, cb));
+    const found = Array.isArray(res.result) ? res.result[0] : null;
+    if (found && found.state === "in_progress") {
+      callSuggestOnce(entry);
+      await downloadsCall((cb) => chrome.downloads.cancel(id, cb));
+      await downloadsCall((cb) => chrome.downloads.erase({ id }, cb));
+    } else if (found) {
+      await downloadsCall((cb) => chrome.downloads.erase({ id }, cb));
+    }
+  };
+
+  await verifyAndFinish();
+  setTimeout(() => {
+    verifyAndFinish().catch(() => {});
+  }, 150);
+  setTimeout(() => {
+    verifyAndFinish().catch(() => {});
+    cancellingIds.delete(id);
+  }, 1500);
+}
+
+async function releaseHeldDownload(entry) {
+  if (!entry || entry.decided) return;
+  entry.decided = true;
+  if (entry.decisionTimer) {
+    clearTimeout(entry.decisionTimer);
+    entry.decisionTimer = null;
+  }
+  heldDownloads.delete(entry.id);
+  callSuggestOnce(entry);
+  await downloadsCall((cb) => chrome.downloads.resume(entry.id, cb));
+}
+
+async function decideHeldDownload(entry, trigger) {
+  if (!entry || entry.decided) return;
+  if (entry.processing) {
+    entry.pendingTrigger = trigger;
+    return;
+  }
+  entry.processing = true;
+  try {
+    const settings = await settingsReady.then(() => getSettings());
+    const searchRes = await downloadsCall((cb) => chrome.downloads.search({ id: entry.id }, cb));
+    const latest = Array.isArray(searchRes.result) ? searchRes.result[0] : null;
+    if (latest) {
+      entry.item = { ...entry.item, ...latest };
+    }
+    const item = entry.item;
+    const url = item.finalUrl || item.url;
+
+    if (!url || !url.startsWith("http") || item.byExtensionId) {
+      await releaseHeldDownload(entry);
+      return;
+    }
+
+    if (await consumeBypassUrl(url)) {
+      await releaseHeldDownload(entry);
+      return;
+    }
+
+    if (!settings.interceptDownloads || isClearlyIgnoredAsset(item)) {
+      await releaseHeldDownload(entry);
+      return;
+    }
+
+    const matched = shouldInterceptDownload(item, settings);
+    const hasDetermining = Boolean(chrome.downloads.onDeterminingFilename);
+    const hasFilename = Boolean(extractDownloadFilename(item));
+
+    if (matched) {
+      // Wait briefly for onDeterminingFilename only if filename isn't known yet on Chromium
+      if (trigger === "onCreated" && hasDetermining && !hasFilename && !entry.suggest) {
+        if (!entry.decisionTimer) {
+          entry.decisionTimer = setTimeout(() => {
+            decideHeldDownload(entry, "timeout");
+          }, 500);
+        }
+        return;
+      }
+
+      entry.decided = true;
+      entry.intercepting = true;
+      cancellingIds.add(entry.id);
+      if (entry.decisionTimer) {
+        clearTimeout(entry.decisionTimer);
+        entry.decisionTimer = null;
+      }
+
+      const filename = extractDownloadFilename(item);
+      const headers = await buildDownloadHeaders(item, url);
+      const res = await sendToVortex("/api/downloads", {
+        url,
+        filename: filename || null,
+        headers,
+        start_immediately: true,
+      });
+
+      heldDownloads.delete(entry.id);
+      if (res && res.ok !== false) {
+        await forceCancelDownload(entry.id, entry);
+      } else {
+        cancellingIds.delete(entry.id);
+        await addBypassUrl(url);
+        callSuggestOnce(entry);
+        await downloadsCall((cb) => chrome.downloads.resume(entry.id, cb));
+      }
+      return;
+    }
+
+    // Not matched yet: wait briefly for filename/MIME/fileSize updates before releasing
+    if (trigger === "onCreated") {
+      if (!entry.decisionTimer) {
+        entry.decisionTimer = setTimeout(() => {
+          decideHeldDownload(entry, "timeout");
+        }, hasDetermining ? 1200 : 800);
+      }
+      return;
+    }
+
+    if (trigger === "onDeterminingFilename" || trigger === "timeout") {
+      await releaseHeldDownload(entry);
+    }
+  } finally {
+    entry.processing = false;
+    if (entry.pendingTrigger && !entry.decided) {
+      const nextTrigger = entry.pendingTrigger;
+      entry.pendingTrigger = null;
+      decideHeldDownload(entry, nextTrigger);
+    }
+  }
+}
+
+// Universal stage 1: pause synchronously in onCreated on every browser (Edge, Chrome, Brave, Firefox)
+chrome.downloads.onCreated.addListener((item) => {
+  if (!item || item.byExtensionId) return;
+  if (item.state && item.state !== "in_progress") return;
+  const url = item.finalUrl || item.url;
+  if (!url || !url.startsWith("http")) return;
+  if (bypassUrls.has(url)) {
+    bypassUrls.delete(url);
+    return;
+  }
+  if (!cachedSettings.interceptDownloads) return;
+  if (isClearlyIgnoredAsset(item)) return;
+
+  // Pause immediately before any await so the browser stops pulling bytes right away
+  chrome.downloads.pause(item.id, () => {
+    void chrome.runtime.lastError;
+  });
+
+  const entry = {
+    id: item.id,
+    item,
+    suggest: null,
+    suggested: false,
+    decided: false,
+    processing: false,
+    decisionTimer: null,
+  };
+  heldDownloads.set(item.id, entry);
+  decideHeldDownload(entry, "onCreated");
+});
+
+// Stage 2 (Chromium/Edge/Brave/Vivaldi): stash suggest() to defer native Save As and capture Content-Disposition
 if (chrome.downloads.onDeterminingFilename) {
-  // Prefer onDeterminingFilename on Chromium so Content-Disposition filename, MIME, finalUrl, and fileSize are known
   chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
     const url = item.finalUrl || item.url;
     if (!url || !url.startsWith("http") || item.byExtensionId) {
@@ -252,128 +504,86 @@ if (chrome.downloads.onDeterminingFilename) {
       return false;
     }
 
-    let suggested = false;
-    const finishSuggest = (arg) => {
-      if (suggested) return;
-      suggested = true;
-      try {
-        if (arg !== undefined) suggest(arg);
-        else suggest();
-      } catch (err) {
-        console.warn("[VortexDL] suggest failed:", err);
+    let entry = heldDownloads.get(item.id);
+    if (entry && (entry.intercepting || entry.decided)) {
+      entry.suggest = suggest;
+      return true;
+    }
+
+    if (cancellingIds.has(item.id)) {
+      chrome.downloads.cancel(item.id, () => {
+        void chrome.runtime.lastError;
+      });
+      chrome.downloads.erase({ id: item.id }, () => {
+        void chrome.runtime.lastError;
+      });
+      return true;
+    }
+
+    if (!entry) {
+      if (bypassUrls.has(url)) {
+        bypassUrls.delete(url);
+        suggest();
+        return false;
       }
-    };
-
-    (async () => {
-      try {
-        if (bypassUrls.has(url)) {
-          bypassUrls.delete(url);
-          finishSuggest();
-          return;
-        }
-
-        const settings = await getSettings();
-        if (!settings.interceptDownloads || !shouldInterceptDownload(item, settings)) {
-          finishSuggest();
-          return;
-        }
-
-        cancellingIds.add(item.id);
-        try {
-          await chrome.downloads.pause(item.id);
-        } catch (_) {}
-
-        const filename = extractDownloadFilename(item);
-        const headers = await buildDownloadHeaders(item, url);
-        const res = await sendToVortex("/api/downloads", {
-          url,
-          filename: filename || null,
-          headers,
-          start_immediately: true,
-        });
-
-        if (res && res.ok !== false) {
-          // Chromium requires suggest() before cancel() so the DownloadItem leaves filename determination
-          finishSuggest();
-          try {
-            await chrome.downloads.cancel(item.id);
-          } catch (err) {
-            console.warn("[VortexDL] cancel failed:", err);
-          }
-          try {
-            await chrome.downloads.erase({ id: item.id });
-          } catch (err) {
-            console.warn("[VortexDL] erase failed:", err);
-          }
-          setTimeout(() => cancellingIds.delete(item.id), 10000);
-        } else {
-          cancellingIds.delete(item.id);
-          bypassUrls.add(url);
-          try {
-            await chrome.downloads.resume(item.id);
-          } catch (_) {}
-          finishSuggest();
-        }
-      } catch (err) {
-        cancellingIds.delete(item.id);
-        console.warn("[VortexDL] onDeterminingFilename error:", err);
-        try {
-          await chrome.downloads.resume(item.id);
-        } catch (_) {}
-        finishSuggest();
+      if (!cachedSettings.interceptDownloads || isClearlyIgnoredAsset(item)) {
+        suggest();
+        return false;
       }
-    })();
+      chrome.downloads.pause(item.id, () => {
+        void chrome.runtime.lastError;
+      });
+      entry = {
+        id: item.id,
+        item,
+        suggest,
+        suggested: false,
+        decided: false,
+        processing: false,
+        decisionTimer: null,
+      };
+      heldDownloads.set(item.id, entry);
+    } else {
+      entry.item = { ...entry.item, ...item };
+      entry.suggest = suggest;
+    }
 
+    decideHeldDownload(entry, "onDeterminingFilename");
     return true;
   });
+}
 
-  chrome.downloads.onChanged.addListener((delta) => {
-    if (!cancellingIds.has(delta.id)) return;
+// Stage 3: enforce cancellation on any state/attribute change and update metadata on Firefox
+chrome.downloads.onChanged.addListener((delta) => {
+  if (cancellingIds.has(delta.id)) {
     if (delta.state && delta.state.current === "interrupted") {
       cancellingIds.delete(delta.id);
-      chrome.downloads.erase({ id: delta.id }).catch(() => {});
+      chrome.downloads.erase({ id: delta.id }, () => {
+        void chrome.runtime.lastError;
+      });
       return;
     }
-    if (
-      (delta.state && delta.state.current === "in_progress") ||
-      (delta.paused && delta.paused.current === false)
-    ) {
-      chrome.downloads.cancel(delta.id).catch(() => {});
-    }
-  });
-} else {
-  // Fallback for browsers without onDeterminingFilename (e.g. Firefox)
-  chrome.downloads.onCreated.addListener(async (item) => {
-    const url = item.finalUrl || item.url;
-    if (!url || !url.startsWith("http") || item.byExtensionId) return;
-    if (bypassUrls.has(url)) {
-      bypassUrls.delete(url);
-      return;
-    }
-
-    const settings = await getSettings();
-    if (!settings.interceptDownloads || !shouldInterceptDownload(item, settings)) return;
-
-    try {
-      await chrome.downloads.cancel(item.id);
-      await chrome.downloads.erase({ id: item.id });
-    } catch (_) {}
-
-    const filename = extractDownloadFilename(item);
-    const headers = await buildDownloadHeaders(item, url);
-    const res = await sendToVortex("/api/downloads", {
-      url,
-      filename: filename || null,
-      headers,
-      start_immediately: true,
+    chrome.downloads.cancel(delta.id, () => {
+      void chrome.runtime.lastError;
     });
+    return;
+  }
 
-    if (!res || res.ok === false) {
-      bypassUrls.add(url);
-      chrome.downloads.download({ url });
-    }
-  });
-}
+  const entry = heldDownloads.get(delta.id);
+  if (!entry) return;
+  if (delta.filename?.current) {
+    entry.item.filename = delta.filename.current;
+  }
+  if (delta.mime?.current) {
+    entry.item.mime = delta.mime.current;
+  }
+  if (typeof delta.totalBytes?.current === "number") {
+    entry.item.totalBytes = delta.totalBytes.current;
+  }
+  if (delta.filename || delta.mime || delta.totalBytes) {
+    decideHeldDownload(entry, "onChanged");
+  }
+});
 
 // Context menus
 chrome.runtime.onInstalled.addListener(() => {

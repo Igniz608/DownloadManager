@@ -4,8 +4,8 @@ use crate::extractor::{
     select_best_extractor,
 };
 use crate::http_engine::{
-    BandwidthLimiter, DownloadCancelHandle, HtmlPageDetected, ProgressSnapshot, build_http_client,
-    run_http_download, run_http_download_with_options,
+    BandwidthLimiter, DownloadCancelHandle, HtmlPageDetected, ProgressSnapshot,
+    apply_custom_headers, build_http_client, run_http_download, run_http_download_with_options,
 };
 use crate::media_engine::{
     MediaToolsStatus, detect_media_tools, detect_media_url, install_ffmpeg_essentials,
@@ -14,14 +14,16 @@ use crate::media_engine::{
 use crate::model::{
     AppSettings, DownloadId, DownloadItem, DownloadKind, DownloadPackage, DownloadStatus,
     FileCategory, GrabbedLink, MediaDownloadMeta, MediaProbeResult, NewDownloadRequest,
-    NewMediaRequest, NoticeEntry, PackageId, PasswordPromptRequest,
+    NewMediaRequest, NoticeEntry, PackageId, PasswordPromptRequest, TorrentDownloadMeta,
 };
 use crate::package_grabber::{
     detect_multipart, extract_urls_from_text, fallback_filename_from_url, find_missing_parts,
     probe_grabbed_links, resolve_indirect_http_url, sanitize_filename,
 };
 use crate::state::{PersistedState, load_settings, load_state, save_settings, save_state};
-use crate::torrent_engine::TorrentEngine;
+use crate::torrent_engine::{
+    TorrentEngine, extract_magnet_info_hash, fallback_torrent_name,
+};
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use parking_lot::RwLock;
@@ -348,13 +350,16 @@ impl DownloadManager {
         }
     }
 
+    pub fn default_torrent_dir(&self) -> PathBuf {
+        let s = self.settings.read();
+        default_torrent_dir_from_settings(&s)
+    }
+
     pub fn add_http_download(self: &Arc<Self>, req: NewDownloadRequest) -> Result<DownloadId> {
         let url_trimmed = req.url.trim().to_string();
-        if url_trimmed.starts_with("magnet:") || url_trimmed.to_lowercase().ends_with(".torrent") {
-            let save_dir = req
-                .save_dir
-                .unwrap_or_else(|| self.settings.read().default_download_dir.join("Torrents"));
-            return self.add_torrent_async(&url_trimmed, save_dir);
+        if is_torrent_request(&url_trimmed, req.filename.as_deref()) {
+            let save_dir = req.save_dir.unwrap_or_else(|| self.default_torrent_dir());
+            return self.add_torrent_async_with_headers(&url_trimmed, save_dir, req.headers);
         }
 
         if req.checksum.is_none() {
@@ -536,31 +541,246 @@ impl DownloadManager {
     }
 
     pub fn add_torrent_async(self: &Arc<Self>, source: &str, save_dir: PathBuf) -> Result<DownloadId> {
-        let placeholder_id = Uuid::new_v4();
-        let source_owned = source.to_string();
-        let mgr = self.clone();
+        self.add_torrent_async_with_headers(source, save_dir, HashMap::new())
+    }
 
+    pub fn add_torrent_async_with_headers(
+        self: &Arc<Self>,
+        source: &str,
+        save_dir: PathBuf,
+        headers: HashMap<String, String>,
+    ) -> Result<DownloadId> {
+        let source_owned = source.trim().to_string();
+        if source_owned.is_empty() {
+            return Err(anyhow!("Link magnet ou arquivo .torrent vazio."));
+        }
+
+        let initial_hash = extract_magnet_info_hash(&source_owned).unwrap_or_default();
+        let existing_action = {
+            let mut dls = self.downloads.write();
+            let pos = dls.iter().position(|d| {
+                d.kind == DownloadKind::Torrent
+                    && (d.url == source_owned
+                        || (!initial_hash.is_empty()
+                            && d.torrent_info
+                                .as_ref()
+                                .map(|ti| ti.info_hash.eq_ignore_ascii_case(&initial_hash))
+                                .unwrap_or(false)))
+            });
+            match pos {
+                Some(idx) => {
+                    let status = dls[idx].status.clone();
+                    let existing_id = dls[idx].id;
+                    if matches!(status, DownloadStatus::Failed(_)) {
+                        dls.remove(idx);
+                        None
+                    } else if status == DownloadStatus::Paused {
+                        Some((existing_id, true))
+                    } else {
+                        Some((existing_id, false))
+                    }
+                }
+                None => None,
+            }
+        };
+
+        if let Some((existing_id, was_paused)) = existing_action {
+            if was_paused {
+                self.resume_download(existing_id);
+                self.push_notice("Torrent retomado.");
+            } else {
+                self.push_notice("Torrent já está na lista de downloads.");
+            }
+            return Ok(existing_id);
+        }
+
+        let id = Uuid::new_v4();
+        let initial_name = fallback_torrent_name(&source_owned);
+        let item = DownloadItem {
+            id,
+            package_id: None,
+            part_index: None,
+            part_total: None,
+            kind: DownloadKind::Torrent,
+            status: DownloadStatus::Probing,
+            url: source_owned.clone(),
+            filename: initial_name.clone(),
+            save_dir: save_dir.clone(),
+            file_path: save_dir.join(&initial_name),
+            category: FileCategory::Torrent,
+            total_bytes: None,
+            downloaded_bytes: 0,
+            uploaded_bytes: 0,
+            speed_bps: 0,
+            upload_speed_bps: 0,
+            eta_seconds: None,
+            connections: 0,
+            supports_ranges: false,
+            segments: Vec::new(),
+            etag: None,
+            last_modified: None,
+            headers: headers.clone(),
+            checksum_expected: None,
+            checksum_verified: None,
+            media_info: None,
+            torrent_info: Some(TorrentDownloadMeta {
+                info_hash: initial_hash,
+                magnet_or_path: source_owned.clone(),
+                rqbit_id: None,
+                peers_connected: 0,
+                peers_seen: 0,
+                ratio: 0.0,
+                files: Vec::new(),
+            }),
+            auto_extract: false,
+            extractor_override: None,
+            extract_password: None,
+            extracted_to: None,
+            extraction_status: None,
+            extraction_progress: None,
+            created_at: Utc::now(),
+            completed_at: None,
+            error: None,
+        };
+
+        self.downloads.write().insert(0, item);
+        self.persist_now();
+        self.push_notice(format!("Analisando torrent: {initial_name}"));
+        self.spawn_torrent_attach_task(id, source_owned, save_dir, headers, false);
+        Ok(id)
+    }
+
+    fn spawn_torrent_attach_task(
+        self: &Arc<Self>,
+        id: DownloadId,
+        source: String,
+        save_dir: PathBuf,
+        headers: HashMap<String, String>,
+        paused: bool,
+    ) {
+        let cancel = Arc::new(DownloadCancelHandle::new());
+        self.cancel_handles.write().insert(id, cancel.clone());
+
+        let mgr = self.clone();
         self.runtime.spawn(async move {
-            let te = match mgr.ensure_torrent_engine().await {
-                Ok(t) => t,
-                Err(e) => {
-                    mgr.push_notice(format!("Erro ao iniciar motor BitTorrent: {e}"));
-                    return;
+            let attach_fut = async {
+                let is_http = source
+                    .get(..7)
+                    .map(|p| p.eq_ignore_ascii_case("http://"))
+                    .unwrap_or(false)
+                    || source
+                        .get(..8)
+                        .map(|p| p.eq_ignore_ascii_case("https://"))
+                        .unwrap_or(false);
+
+                let bytes_override = if is_http && !headers.is_empty() {
+                    let resp = apply_custom_headers(mgr.client.get(&source), &headers)
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    Some(resp.bytes().await?)
+                } else {
+                    None
+                };
+
+                let te = mgr.ensure_torrent_engine().await?;
+                let attached = te
+                    .add_magnet_or_file_with_id(id, &source, bytes_override, save_dir, paused)
+                    .await?;
+                Ok::<_, anyhow::Error>((te, attached))
+            };
+
+            let outcome = tokio::select! {
+                biased;
+                _ = cancel.notify.notified() => None,
+                res = attach_fut => Some(res),
+            };
+
+            mgr.cancel_handles.write().remove(&id);
+
+            let Some(res) = outcome else {
+                if !cancel.cancelled.load(Ordering::SeqCst) {
+                    let mut dls = mgr.downloads.write();
+                    if let Some(d) = dls.iter_mut().find(|x| x.id == id) {
+                        d.status = DownloadStatus::Paused;
+                        d.speed_bps = 0;
+                        d.eta_seconds = None;
+                    }
+                    drop(dls);
+                    mgr.persist_now();
+                }
+                return;
+            };
+
+            let (still_present, was_paused) = {
+                let dls = mgr.downloads.read();
+                match dls.iter().find(|x| x.id == id) {
+                    Some(d) => (true, d.status == DownloadStatus::Paused || cancel.paused.load(Ordering::SeqCst)),
+                    None => (false, false),
                 }
             };
-            match te.add_magnet_or_file(&source_owned, save_dir, false).await {
-                Ok(item) => {
-                    mgr.downloads.write().insert(0, item);
+
+            match res {
+                Ok((te, attached)) => {
+                    if !still_present || cancel.cancelled.load(Ordering::SeqCst) {
+                        let _ = te.remove(id, false).await;
+                        return;
+                    }
+                    if was_paused {
+                        let _ = te.pause(id).await;
+                    }
+                    let mut final_name = attached.filename.clone();
+                    {
+                        let mut dls = mgr.downloads.write();
+                        if let Some(item) = dls.iter_mut().find(|x| x.id == id) {
+                            item.filename = attached.filename;
+                            final_name = item.filename.clone();
+                            item.save_dir = attached.save_dir;
+                            item.file_path = attached.file_path;
+                            item.status = if was_paused {
+                                DownloadStatus::Paused
+                            } else {
+                                attached.status
+                            };
+                            item.total_bytes = attached.total_bytes.or(item.total_bytes);
+                            item.downloaded_bytes = attached.downloaded_bytes;
+                            item.uploaded_bytes = attached.uploaded_bytes;
+                            item.error = None;
+                            item.torrent_info = Some(TorrentDownloadMeta {
+                                info_hash: attached.info_hash,
+                                magnet_or_path: source,
+                                rqbit_id: Some(attached.rqbit_id),
+                                peers_connected: 0,
+                                peers_seen: 0,
+                                ratio: 0.0,
+                                files: attached.files,
+                            });
+                        }
+                    }
                     mgr.persist_now();
-                    mgr.push_notice("Torrent adicionado com sucesso.");
+                    if !was_paused {
+                        mgr.push_notice(format!("Torrent iniciado: {final_name}"));
+                    }
                 }
                 Err(e) => {
-                    mgr.push_notice(format!("Falha ao adicionar torrent: {e}"));
+                    if !still_present || cancel.cancelled.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let err_str = e.to_string();
+                    {
+                        let mut dls = mgr.downloads.write();
+                        if let Some(item) = dls.iter_mut().find(|x| x.id == id) {
+                            item.status = DownloadStatus::Failed(err_str.clone());
+                            item.error = Some(err_str.clone());
+                            item.speed_bps = 0;
+                            item.eta_seconds = None;
+                        }
+                    }
+                    mgr.persist_now();
+                    mgr.push_error_notice(format!("Falha ao adicionar torrent: {err_str}"));
                 }
             }
         });
-
-        Ok(placeholder_id)
     }
 
     async fn ensure_torrent_engine(&self) -> Result<Arc<TorrentEngine>> {
@@ -568,7 +788,7 @@ impl DownloadManager {
         if let Some(ref existing) = *guard {
             return Ok(existing.clone());
         }
-        let dir = self.settings.read().default_download_dir.join("Torrents");
+        let dir = self.default_torrent_dir();
         let engine = Arc::new(TorrentEngine::new(dir).await?);
         *guard = Some(engine.clone());
         Ok(engine)
@@ -1620,7 +1840,7 @@ impl DownloadManager {
         let kind = {
             let mut dls = self.downloads.write();
             if let Some(d) = dls.iter_mut().find(|x| x.id == id) {
-                if d.status == DownloadStatus::Queued {
+                if matches!(d.status, DownloadStatus::Queued | DownloadStatus::Probing) {
                     d.status = DownloadStatus::Paused;
                 }
                 d.speed_bps = 0;
@@ -1642,23 +1862,45 @@ impl DownloadManager {
     }
 
     pub fn resume_download(self: &Arc<Self>, id: DownloadId) {
-        let kind = {
+        let torrent_attach_info = {
             let mut dls = self.downloads.write();
             if let Some(d) = dls.iter_mut().find(|x| x.id == id) {
                 d.error = None;
                 if matches!(d.status, DownloadStatus::Paused | DownloadStatus::Failed(_)) {
-                    d.status = DownloadStatus::Queued;
+                    d.status = if d.kind == DownloadKind::Torrent {
+                        DownloadStatus::Probing
+                    } else {
+                        DownloadStatus::Queued
+                    };
                 }
-                Some(d.kind)
+                if d.kind == DownloadKind::Torrent {
+                    let source = d
+                        .torrent_info
+                        .as_ref()
+                        .map(|ti| ti.magnet_or_path.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| d.url.clone());
+                    Some((true, source, d.save_dir.clone(), d.headers.clone()))
+                } else {
+                    Some((false, String::new(), PathBuf::new(), HashMap::new()))
+                }
             } else {
                 None
             }
         };
-        if kind == Some(DownloadKind::Torrent) {
-            let mgr_te = self.torrent_engine.clone();
+        if let Some((true, source, save_dir, headers)) = torrent_attach_info {
+            let mgr = self.clone();
             self.runtime.spawn(async move {
-                if let Some(te) = mgr_te.lock().await.as_ref() {
-                    let _ = te.resume(id).await;
+                let has_handle = {
+                    let guard = mgr.torrent_engine.lock().await;
+                    guard.as_ref().map(|te| te.has_handle(id)).unwrap_or(false)
+                };
+                if has_handle {
+                    if let Some(te) = mgr.torrent_engine.lock().await.as_ref() {
+                        let _ = te.resume(id).await;
+                    }
+                } else if !source.is_empty() {
+                    mgr.spawn_torrent_attach_task(id, source, save_dir, headers, false);
                 }
             });
         } else {
@@ -1780,6 +2022,32 @@ impl DownloadManager {
             .ok_or_else(|| anyhow!("yt-dlp não encontrado. Instale com 1 clique na aba Mídia ou Configurações."))?;
         probe_media_url(&yt_dlp, url, &HashMap::new()).await
     }
+}
+
+pub fn default_torrent_dir_from_settings(settings: &AppSettings) -> PathBuf {
+    if settings.categorize_into_subfolders {
+        settings.default_download_dir.join("Torrents")
+    } else {
+        settings.default_download_dir.clone()
+    }
+}
+
+pub fn is_torrent_request(url: &str, filename_hint: Option<&str>) -> bool {
+    let trimmed = url.trim();
+    if trimmed
+        .get(..7)
+        .map(|p| p.eq_ignore_ascii_case("magnet:"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let path_part = trimmed.split(['?', '#']).next().unwrap_or("");
+    if path_part.to_ascii_lowercase().ends_with(".torrent") {
+        return true;
+    }
+    filename_hint
+        .map(|f| f.trim().to_ascii_lowercase().ends_with(".torrent"))
+        .unwrap_or(false)
 }
 
 fn merge_completed_download_item(live_slot: &DownloadItem, mut updated: DownloadItem) -> DownloadItem {
@@ -1946,5 +2214,30 @@ mod tests {
         assert_eq!(merged.extractor_override.as_deref(), Some("windows_native"));
         assert_eq!(merged.extract_password.as_deref(), Some("secret123"));
         assert!(merged.auto_extract);
+    }
+
+    #[test]
+    fn detects_torrent_requests_including_query_strings_and_filename_hints() {
+        assert!(is_torrent_request("magnet:?xt=urn:btih:1234", None));
+        assert!(is_torrent_request("  MAGNET:?xt=urn:btih:1234", None));
+        assert!(is_torrent_request(
+            "https://itorrents.org/torrent/ABC.torrent?title=Demo",
+            None
+        ));
+        assert!(is_torrent_request(
+            "https://tracker.example/download.php?id=42",
+            Some("release.TORRENT")
+        ));
+        assert!(!is_torrent_request("https://example.com/archive.zip", None));
+    }
+
+    #[test]
+    fn default_torrent_dir_respects_categorize_setting() {
+        let mut s = AppSettings::default();
+        s.default_download_dir = PathBuf::from("D:/Downloads");
+        s.categorize_into_subfolders = true;
+        assert_eq!(default_torrent_dir_from_settings(&s), PathBuf::from("D:/Downloads/Torrents"));
+        s.categorize_into_subfolders = false;
+        assert_eq!(default_torrent_dir_from_settings(&s), PathBuf::from("D:/Downloads"));
     }
 }

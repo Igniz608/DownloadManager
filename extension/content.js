@@ -7,6 +7,7 @@
 
   let overlayEnabled = true;
   let overlayOnlyOnHover = false;
+  let interceptEnabled = true;
   let sitePosition = { ...DEFAULT_POSITION };
   let tabHasDetectedMedia = false;
   let rescanScheduled = false;
@@ -68,6 +69,7 @@
     if (s) {
       overlayEnabled = s.showVideoOverlay !== false;
       overlayOnlyOnHover = Boolean(s.overlayOnlyOnHover);
+      interceptEnabled = s.interceptDownloads !== false;
     }
     const savedPos = data?.vortexOverlayPositions?.[SITE_KEY];
     if (savedPos && Number.isFinite(savedPos.rx) && Number.isFinite(savedPos.ry)) {
@@ -86,6 +88,7 @@
       const next = changes.vortexSettings.newValue || {};
       overlayEnabled = next.showVideoOverlay !== false;
       overlayOnlyOnHover = Boolean(next.overlayOnlyOnHover);
+      interceptEnabled = next.interceptDownloads !== false;
       if (!overlayEnabled) {
         removeAllOverlays();
       } else {
@@ -1217,6 +1220,79 @@
       closeActiveMenu();
     }
   });
+
+  let magnetToastHost = null;
+  let magnetToastTimer = null;
+
+  function removeMagnetToast() {
+    if (magnetToastTimer) {
+      clearTimeout(magnetToastTimer);
+      magnetToastTimer = null;
+    }
+    if (magnetToastHost && magnetToastHost.parentNode) {
+      magnetToastHost.parentNode.removeChild(magnetToastHost);
+    }
+    magnetToastHost = null;
+  }
+
+  function showMagnetToast(message, kind) {
+    removeMagnetToast();
+    const host = document.createElement("div");
+    host.style.cssText =
+      "position:fixed;right:16px;bottom:16px;z-index:2147483647;pointer-events:none;";
+    const shadow = host.attachShadow({ mode: "open" });
+    const bg =
+      kind === "ok"
+        ? "rgba(22, 163, 74, 0.96)"
+        : kind === "err"
+        ? "rgba(220, 38, 38, 0.96)"
+        : "rgba(18, 18, 28, 0.96)";
+    const border =
+      kind === "ok"
+        ? "rgba(74, 222, 128, 0.55)"
+        : kind === "err"
+        ? "rgba(248, 113, 113, 0.55)"
+        : "rgba(124, 92, 255, 0.65)";
+    const box = document.createElement("div");
+    box.style.cssText = `font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:12px;font-weight:600;color:#fff;background:${bg};border:1px solid ${border};border-radius:8px;padding:9px 14px;box-shadow:0 8px 24px rgba(0,0,0,0.35);max-width:340px;`;
+    box.textContent = message;
+    shadow.appendChild(box);
+    (document.body || document.documentElement).appendChild(host);
+    magnetToastHost = host;
+    magnetToastTimer = setTimeout(removeMagnetToast, 2800);
+  }
+
+  document.addEventListener(
+    "click",
+    (e) => {
+      if (!interceptEnabled) return;
+      if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      const anchor = e.target && e.target.closest ? e.target.closest("a[href]") : null;
+      if (!anchor) return;
+      const rawHref = anchor.getAttribute("href") || anchor.href || "";
+      const trimmed = rawHref.trim();
+      if (!/^magnet:/i.test(trimmed)) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+
+      showMagnetToast("Enviando magnet para o VortexDL...", "pending");
+      try {
+        chrome.runtime.sendMessage({ type: "SEND_TORRENT", source: trimmed }, (resp) => {
+          if (chrome.runtime.lastError || !resp || !resp.ok) {
+            removeMagnetToast();
+            window.location.href = trimmed;
+            return;
+          }
+          showMagnetToast("Torrent enviado ao VortexDL", "ok");
+        });
+      } catch (_) {
+        removeMagnetToast();
+        window.location.href = trimmed;
+      }
+    },
+    true
+  );
 
   window.addEventListener("scroll", schedulePositionUpdate, { passive: true, capture: true });
   window.addEventListener("resize", schedulePositionUpdate, { passive: true });

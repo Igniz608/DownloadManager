@@ -148,6 +148,8 @@ async function sendToVortex(endpoint, payload) {
           ? "media_probe"
           : endpoint === "/api/grab"
           ? "grab"
+          : endpoint === "/api/torrent"
+          ? "torrent"
           : "ping";
       chrome.runtime.sendNativeMessage(NATIVE_HOST, { action, payload }, (res) => {
         if (chrome.runtime.lastError) {
@@ -665,6 +667,10 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === "vortex-download-link") {
     const targetUrl = info.linkUrl || info.srcUrl;
     if (!targetUrl) return;
+    if (/^magnet:/i.test(targetUrl.trim())) {
+      await sendToVortex("/api/torrent", { source: targetUrl.trim() });
+      return;
+    }
     const cookie = await collectCookiesHeader(targetUrl);
     const headers = {};
     if (info.pageUrl) headers.Referer = info.pageUrl;
@@ -1290,6 +1296,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         headers,
         start_immediately: true,
       });
+      sendResponse(res);
+    } else if (msg.type === "SEND_TORRENT") {
+      const source = typeof msg.source === "string" ? msg.source.trim() : "";
+      if (!source) {
+        sendResponse({ ok: false, error: "Fonte de torrent vazia" });
+        return;
+      }
+      const res = await sendToVortex("/api/torrent", { source });
       sendResponse(res);
     } else if (msg.type === "SEND_MEDIA") {
       const cookie = await collectCookiesHeader(msg.url);

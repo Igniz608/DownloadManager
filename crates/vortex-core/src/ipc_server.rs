@@ -246,7 +246,7 @@ async fn handle_add_torrent(
     State(mgr): State<Arc<DownloadManager>>,
     Json(payload): Json<TorrentPayload>,
 ) -> (StatusCode, Json<ApiActionResponse>) {
-    let dir = mgr.settings.read().default_download_dir.join("Torrents");
+    let dir = mgr.default_torrent_dir();
     match mgr.add_torrent_async(&payload.source, dir) {
         Ok(id) => (
             StatusCode::OK,
@@ -366,4 +366,47 @@ pub fn register_browser_native_host(native_host_exe: &Path, chrome_extension_id:
         }
     }
     Ok(registered)
+}
+
+/// Registers VortexDL as the Windows HKCU `magnet:` URL protocol handler.
+pub fn register_magnet_protocol_handler(gui_exe: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let exe_str = gui_exe.to_string_lossy();
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (root, _) = hkcu.create_subkey(r"Software\Classes\magnet")?;
+        root.set_value("", &"URL:Magnet Protocol")?;
+        root.set_value("URL Protocol", &"")?;
+
+        let (icon_key, _) = hkcu.create_subkey(r"Software\Classes\magnet\DefaultIcon")?;
+        icon_key.set_value("", &format!("\"{exe_str}\",0"))?;
+
+        let (cmd_key, _) = hkcu.create_subkey(r"Software\Classes\magnet\shell\open\command")?;
+        cmd_key.set_value("", &format!("\"{exe_str}\" \"%1\""))?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = gui_exe;
+    }
+    Ok(())
+}
+
+pub fn is_magnet_protocol_registered(gui_exe: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let Ok(cmd_key) = hkcu.open_subkey(r"Software\Classes\magnet\shell\open\command") else {
+            return false;
+        };
+        let Ok(val) = cmd_key.get_value::<String, _>("") else {
+            return false;
+        };
+        let expected_exe = gui_exe.to_string_lossy().to_ascii_lowercase();
+        val.to_ascii_lowercase().contains(&expected_exe)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = gui_exe;
+        false
+    }
 }

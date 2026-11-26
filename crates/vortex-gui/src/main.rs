@@ -4,12 +4,18 @@ mod app;
 mod format;
 mod theme;
 
-use app::{TrayControls, VortexApp};
+use app::{NavTab, TrayControls, VortexApp};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::Arc;
+use std::time::Duration;
 use tray_icon::menu::{Menu, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 use vortex_core::ipc_server::spawn_ipc_server;
-use vortex_core::manager::DownloadManager;
+use vortex_core::manager::{DownloadManager, is_torrent_request};
+use vortex_core::model::NewDownloadRequest;
+use vortex_core::state::load_settings;
 
 fn build_tray_icon() -> Option<TrayControls> {
     let size = 32u32;
@@ -68,6 +74,46 @@ fn build_tray_icon() -> Option<TrayControls> {
     })
 }
 
+fn forward_arg_to_running_instance(port: u16, arg: &str) -> bool {
+    let addr: std::net::SocketAddr = match format!("127.0.0.1:{port}").parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+
+    let (path, body) = if is_torrent_request(arg, None) {
+        (
+            "/api/torrent",
+            serde_json::json!({ "source": arg }).to_string(),
+        )
+    } else if arg.starts_with("http://") || arg.starts_with("https://") {
+        (
+            "/api/downloads",
+            serde_json::json!({ "url": arg, "start_immediately": true }).to_string(),
+        )
+    } else {
+        return false;
+    };
+
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    if stream.write_all(req.as_bytes()).is_err() || stream.write_all(body.as_bytes()).is_err() {
+        return false;
+    }
+    let mut resp = String::new();
+    let _ = stream.read_to_string(&mut resp);
+    resp.lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .is_some_and(|code| (200..300).contains(&code))
+}
+
 fn main() -> eframe::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -75,6 +121,22 @@ fn main() -> eframe::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .try_init();
+
+    let cli_args: Vec<String> = std::env::args()
+        .skip(1)
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect();
+
+    if !cli_args.is_empty() {
+        let port = load_settings().ipc_port;
+        let forwarded_any = cli_args
+            .iter()
+            .fold(false, |acc, arg| forward_arg_to_running_instance(port, arg) || acc);
+        if forwarded_any {
+            return Ok(());
+        }
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -88,6 +150,28 @@ fn main() -> eframe::Result<()> {
         spawn_ipc_server(mgr.clone(), port);
         mgr
     };
+
+    let mut opened_torrent = false;
+    for arg in &cli_args {
+        if is_torrent_request(arg, None) {
+            let dir = manager.default_torrent_dir();
+            let _ = manager.add_torrent_async(arg, dir);
+            opened_torrent = true;
+        } else if arg.starts_with("http://") || arg.starts_with("https://") {
+            let _ = manager.add_http_download(NewDownloadRequest {
+                url: arg.clone(),
+                filename: None,
+                save_dir: None,
+                connections: None,
+                headers: HashMap::new(),
+                checksum: None,
+                auto_extract: None,
+                extractor_override: None,
+                extract_password: None,
+                start_immediately: Some(true),
+            });
+        }
+    }
 
     let tray = build_tray_icon();
 
@@ -103,6 +187,12 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "VortexDL",
         native_options,
-        Box::new(move |cc| Ok(Box::new(VortexApp::new(cc, manager, rt_handle, tray)))),
+        Box::new(move |cc| {
+            let mut app = VortexApp::new(cc, manager, rt_handle, tray);
+            if opened_torrent {
+                app.set_active_tab(NavTab::Torrents);
+            }
+            Ok(Box::new(app))
+        }),
     )
 }

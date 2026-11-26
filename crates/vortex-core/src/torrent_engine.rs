@@ -19,6 +19,20 @@ pub struct TorrentEngine {
     handles: Arc<Mutex<Vec<(Uuid, Arc<ManagedTorrent>)>>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TorrentAttachResult {
+    pub filename: String,
+    pub save_dir: PathBuf,
+    pub file_path: PathBuf,
+    pub status: DownloadStatus,
+    pub total_bytes: Option<u64>,
+    pub downloaded_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub info_hash: String,
+    pub rqbit_id: usize,
+    pub files: Vec<TorrentFileEntry>,
+}
+
 impl TorrentEngine {
     pub async fn new(default_output_folder: PathBuf) -> Result<Self> {
         tokio::fs::create_dir_all(&default_output_folder).await?;
@@ -33,14 +47,20 @@ impl TorrentEngine {
         })
     }
 
-    pub async fn add_magnet_or_file(
+    pub fn has_handle(&self, id: Uuid) -> bool {
+        self.handles.lock().iter().any(|(i, _)| *i == id)
+    }
+
+    pub async fn add_magnet_or_file_with_id(
         &self,
+        id: Uuid,
         source: &str,
+        bytes_override: Option<bytes::Bytes>,
         output_folder: PathBuf,
         paused: bool,
-    ) -> Result<DownloadItem> {
+    ) -> Result<TorrentAttachResult> {
         tokio::fs::create_dir_all(&output_folder).await?;
-        let list_add = make_add_torrent(source)?;
+        let list_add = make_add_torrent(source, bytes_override)?;
         let list_opts = AddTorrentOptions {
             list_only: true,
             ..Default::default()
@@ -49,7 +69,7 @@ impl TorrentEngine {
         let list = match self.session.add_torrent(list_add, Some(list_opts)).await? {
             AddTorrentResponse::ListOnly(resp) => resp,
             AddTorrentResponse::Added(_, h) | AddTorrentResponse::AlreadyManaged(_, h) => {
-                return self.build_item_from_handle(source, h, paused);
+                return self.register_handle(id, source, h, paused);
             }
         };
 
@@ -78,33 +98,19 @@ impl TorrentEngine {
             AddTorrentResponse::ListOnly(_) => return Err(anyhow!("Resposta list-only inesperada")),
         };
 
-        self.build_item_from_handle(source, handle, paused)
+        self.register_handle(id, source, handle, paused)
     }
 
-    fn build_item_from_handle(
+    pub async fn add_magnet_or_file(
         &self,
         source: &str,
-        handle: Arc<ManagedTorrent>,
+        output_folder: PathBuf,
         paused: bool,
     ) -> Result<DownloadItem> {
         let id = Uuid::new_v4();
-        let name = handle
-            .name()
-            .unwrap_or_else(|| fallback_torrent_name(source));
-
-        let info_hash = format!("{:?}", handle.info_hash());
-        let stats = handle.stats();
-
-        let files = extract_torrent_files(&handle, &stats.file_progress);
-        let save_dir = handle.output_folder().to_path_buf();
-        let file_path = resolve_display_file_path(&handle, &save_dir, &files, &name);
-        let total = if stats.total_bytes > 0 {
-            Some(stats.total_bytes)
-        } else {
-            None
-        };
-
-        self.handles.lock().push((id, handle.clone()));
+        let attached = self
+            .add_magnet_or_file_with_id(id, source, None, output_folder, paused)
+            .await?;
 
         Ok(DownloadItem {
             id,
@@ -112,19 +118,15 @@ impl TorrentEngine {
             part_index: None,
             part_total: None,
             kind: DownloadKind::Torrent,
-            status: if paused {
-                DownloadStatus::Paused
-            } else {
-                DownloadStatus::Downloading
-            },
+            status: attached.status,
             url: source.to_string(),
-            filename: name,
-            save_dir,
-            file_path,
+            filename: attached.filename,
+            save_dir: attached.save_dir,
+            file_path: attached.file_path,
             category: FileCategory::Torrent,
-            total_bytes: total,
-            downloaded_bytes: stats.progress_bytes,
-            uploaded_bytes: stats.uploaded_bytes,
+            total_bytes: attached.total_bytes,
+            downloaded_bytes: attached.downloaded_bytes,
+            uploaded_bytes: attached.uploaded_bytes,
             speed_bps: 0,
             upload_speed_bps: 0,
             eta_seconds: None,
@@ -138,13 +140,13 @@ impl TorrentEngine {
             checksum_verified: None,
             media_info: None,
             torrent_info: Some(TorrentDownloadMeta {
-                info_hash,
+                info_hash: attached.info_hash,
                 magnet_or_path: source.to_string(),
-                rqbit_id: Some(handle.id()),
+                rqbit_id: Some(attached.rqbit_id),
                 peers_connected: 0,
                 peers_seen: 0,
                 ratio: 0.0,
-                files,
+                files: attached.files,
             }),
             auto_extract: false,
             extractor_override: None,
@@ -155,6 +157,58 @@ impl TorrentEngine {
             created_at: Utc::now(),
             completed_at: None,
             error: None,
+        })
+    }
+
+    fn register_handle(
+        &self,
+        id: Uuid,
+        source: &str,
+        handle: Arc<ManagedTorrent>,
+        paused: bool,
+    ) -> Result<TorrentAttachResult> {
+        let name = handle
+            .name()
+            .unwrap_or_else(|| fallback_torrent_name(source));
+
+        let info_hash = format!("{:?}", handle.info_hash());
+        let stats = handle.stats();
+
+        let files = extract_torrent_files(&handle, &stats.file_progress);
+        let save_dir = handle.output_folder().to_path_buf();
+        let file_path = resolve_display_file_path(&handle, &save_dir, &files, &name);
+        let total_bytes = if stats.total_bytes > 0 {
+            Some(stats.total_bytes)
+        } else {
+            None
+        };
+
+        {
+            let mut g = self.handles.lock();
+            if let Some(existing) = g.iter_mut().find(|(existing_id, _)| *existing_id == id) {
+                existing.1 = handle.clone();
+            } else {
+                g.push((id, handle.clone()));
+            }
+        }
+
+        let status = if paused || handle.is_paused() {
+            DownloadStatus::Paused
+        } else {
+            DownloadStatus::Downloading
+        };
+
+        Ok(TorrentAttachResult {
+            filename: name,
+            save_dir,
+            file_path,
+            status,
+            total_bytes,
+            downloaded_bytes: stats.progress_bytes,
+            uploaded_bytes: stats.uploaded_bytes,
+            info_hash,
+            rqbit_id: handle.id(),
+            files,
         })
     }
 
@@ -297,22 +351,66 @@ pub struct TorrentPollUpdate {
     pub finished: bool,
 }
 
-fn make_add_torrent(source: &str) -> Result<AddTorrent<'_>> {
-    if source.starts_with("magnet:")
-        || source.starts_with("http://")
-        || source.starts_with("https://")
-    {
+fn is_magnet_uri(source: &str) -> bool {
+    source
+        .trim_start()
+        .get(..7)
+        .map(|p| p.eq_ignore_ascii_case("magnet:"))
+        .unwrap_or(false)
+}
+
+fn is_http_url(source: &str) -> bool {
+    let trimmed = source.trim_start();
+    trimmed
+        .get(..7)
+        .map(|p| p.eq_ignore_ascii_case("http://"))
+        .unwrap_or(false)
+        || trimmed
+            .get(..8)
+            .map(|p| p.eq_ignore_ascii_case("https://"))
+            .unwrap_or(false)
+}
+
+fn make_add_torrent(source: &str, bytes_override: Option<bytes::Bytes>) -> Result<AddTorrent<'_>> {
+    if let Some(bytes) = bytes_override {
+        return Ok(AddTorrent::TorrentFileBytes(bytes));
+    }
+    if is_magnet_uri(source) || is_http_url(source) {
         Ok(AddTorrent::from_url(source))
     } else {
         AddTorrent::from_local_filename(source)
     }
 }
 
-fn magnet_display_name(source: &str) -> Option<String> {
-    if !source.starts_with("magnet:") {
+pub fn extract_magnet_info_hash(source: &str) -> Option<String> {
+    if !is_magnet_uri(source) {
         return None;
     }
-    let parsed = url::Url::parse(source).ok()?;
+    let parsed = url::Url::parse(source.trim()).ok()?;
+    for (k, v) in parsed.query_pairs() {
+        if k.eq_ignore_ascii_case("xt") {
+            let lower = v.to_ascii_lowercase();
+            if let Some(hash) = lower.strip_prefix("urn:btih:") {
+                let clean = hash.trim();
+                if !clean.is_empty() {
+                    return Some(clean.to_string());
+                }
+            } else if let Some(hash) = lower.strip_prefix("urn:btmh:") {
+                let clean = hash.trim();
+                if !clean.is_empty() {
+                    return Some(clean.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn magnet_display_name(source: &str) -> Option<String> {
+    if !is_magnet_uri(source) {
+        return None;
+    }
+    let parsed = url::Url::parse(source.trim()).ok()?;
     parsed
         .query_pairs()
         .find(|(k, _)| k == "dn")
@@ -320,17 +418,34 @@ fn magnet_display_name(source: &str) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-fn fallback_torrent_name(source: &str) -> String {
-    if source.starts_with("magnet:") {
-        magnet_display_name(source)
-            .unwrap_or_else(|| "Torrent (carregando metadados...)".to_string())
-    } else {
-        Path::new(source)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("Torrent")
-            .to_string()
+pub fn fallback_torrent_name(source: &str) -> String {
+    let trimmed = source.trim();
+    if is_magnet_uri(trimmed) {
+        if let Some(dn) = magnet_display_name(trimmed) {
+            return dn;
+        }
+        if let Some(hash) = extract_magnet_info_hash(trimmed) {
+            let short: String = hash.chars().take(10).collect();
+            return format!("Magnet ({short})");
+        }
+        return "Torrent (carregando metadados...)".to_string();
     }
+    if is_http_url(trimmed) {
+        if let Ok(parsed) = url::Url::parse(trimmed) {
+            if let Some(seg) = parsed.path_segments().and_then(|s| s.last()) {
+                let clean = seg.trim_end_matches(".torrent").trim();
+                if !clean.is_empty() {
+                    return clean.to_string();
+                }
+            }
+        }
+        return "Torrent".to_string();
+    }
+    Path::new(trimmed)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Torrent")
+        .to_string()
 }
 
 fn sanitize_torrent_folder_name(raw: &str) -> Option<String> {
@@ -518,8 +633,19 @@ mod tests {
     }
 
     #[test]
-    fn extracts_magnet_display_name() {
-        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=My%20Cool%20Game";
+    fn extracts_magnet_display_name_and_hash() {
+        let magnet = "magnet:?xt=urn:btih:0123456789ABCDEF0123456789abcdef01234567&dn=My%20Cool%20Game";
         assert_eq!(magnet_display_name(magnet).as_deref(), Some("My Cool Game"));
+        assert_eq!(
+            extract_magnet_info_hash(magnet).as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(fallback_torrent_name(magnet), "My Cool Game");
+
+        let bare_magnet = "MAGNET:?xt=urn:btih:AABBCCDDEEFF00112233445566778899AABBCCDD";
+        assert_eq!(fallback_torrent_name(bare_magnet), "Magnet (aabbccddee)");
+
+        let http_torrent = "https://itorrents.org/torrent/12345.torrent?title=Ubuntu";
+        assert_eq!(fallback_torrent_name(http_torrent), "12345");
     }
 }

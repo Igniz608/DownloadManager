@@ -11,8 +11,10 @@ use std::time::{Duration, Instant};
 use tray_icon::TrayIcon;
 use tray_icon::menu::{MenuEvent, MenuId};
 use uuid::Uuid;
-use vortex_core::ipc_server::register_browser_native_host;
-use vortex_core::manager::{DownloadManager, ManagerSnapshot};
+use vortex_core::ipc_server::{
+    is_magnet_protocol_registered, register_browser_native_host, register_magnet_protocol_handler,
+};
+use vortex_core::manager::{DownloadManager, ManagerSnapshot, default_torrent_dir_from_settings};
 use vortex_core::model::{
     DownloadId, DownloadItem, DownloadKind, DownloadStatus, ExtractorKind, ExtractorProfile,
     FileCategory, MediaProbeResult, NewDownloadRequest, NewMediaRequest, PackageId, ThemeConfig,
@@ -172,9 +174,7 @@ impl VortexApp {
             new_http_password: String::new(),
             show_new_torrent_modal: false,
             new_torrent_source: String::new(),
-            new_torrent_dir: settings
-                .default_download_dir
-                .join("Torrents")
+            new_torrent_dir: default_torrent_dir_from_settings(&settings)
                 .to_string_lossy()
                 .to_string(),
             grabber_input: String::new(),
@@ -210,6 +210,10 @@ impl VortexApp {
             last_api_card_height: 96.0,
             last_min_window_height: 0.0,
         }
+    }
+
+    pub fn set_active_tab(&mut self, tab: NavTab) {
+        self.active_tab = tab;
     }
 
     fn handle_tray_events(&self, ctx: &egui::Context) {
@@ -262,7 +266,7 @@ impl VortexApp {
             let path = file.path();
             let s = path.to_string_lossy().to_string();
             if s.to_lowercase().ends_with(".torrent") {
-                let dir = self.manager.settings.read().default_download_dir.join("Torrents");
+                let dir = self.manager.default_torrent_dir();
                 let _ = self.manager.add_torrent_async(&s, dir);
                 self.active_tab = NavTab::Torrents;
             } else if let Ok(content) = std::fs::read_to_string(path) {
@@ -416,6 +420,11 @@ impl VortexApp {
             .on_hover_text("Adicionar Torrent ou Magnet")
             .clicked()
         {
+            self.new_torrent_dir = self
+                .manager
+                .default_torrent_dir()
+                .to_string_lossy()
+                .to_string();
             self.show_new_torrent_modal = true;
         }
 
@@ -2546,30 +2555,54 @@ impl VortexApp {
                     );
                 });
                 ui.add_space(8.0);
-                if accent_button(ui, "Registrar Native Messaging Host no Windows", theme).clicked() {
-                    let host_exe = std::env::current_exe()
-                        .ok()
-                        .and_then(|p| p.parent().map(|d| d.join("vortex-native-host.exe")))
-                        .unwrap_or_else(|| PathBuf::from("vortex-native-host.exe"));
+                let gui_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("vortex-gui.exe"));
+                let magnet_registered = is_magnet_protocol_registered(&gui_exe);
+                ui.horizontal_wrapped(|ui| {
+                    if accent_button(ui, "Registrar Native Messaging Host no Windows", theme).clicked() {
+                        let host_exe = gui_exe
+                            .parent()
+                            .map(|d| d.join("vortex-native-host.exe"))
+                            .unwrap_or_else(|| PathBuf::from("vortex-native-host.exe"));
 
-                    let id_opt = if self.chrome_ext_id_input.trim().is_empty() {
-                        None
-                    } else {
-                        Some(self.chrome_ext_id_input.as_str())
-                    };
-                    match register_browser_native_host(&host_exe, id_opt) {
-                        Ok(browsers) => {
-                            self.ext_reg_status = Some(format!(
-                                "Registrado com sucesso para: {} (Host: {})",
-                                browsers.join(", "),
-                                host_exe.display()
-                            ));
-                        }
-                        Err(e) => {
-                            self.ext_reg_status = Some(format!("Erro ao registrar: {e}"));
+                        let id_opt = if self.chrome_ext_id_input.trim().is_empty() {
+                            None
+                        } else {
+                            Some(self.chrome_ext_id_input.as_str())
+                        };
+                        match register_browser_native_host(&host_exe, id_opt) {
+                            Ok(browsers) => {
+                                self.ext_reg_status = Some(format!(
+                                    "Registrado com sucesso para: {} (Host: {})",
+                                    browsers.join(", "),
+                                    host_exe.display()
+                                ));
+                            }
+                            Err(e) => {
+                                self.ext_reg_status = Some(format!("Erro ao registrar: {e}"));
+                            }
                         }
                     }
-                }
+
+                    if ui.button("Associar links magnet:// ao VortexDL").clicked() {
+                        match register_magnet_protocol_handler(&gui_exe) {
+                            Ok(()) => {
+                                self.ext_reg_status = Some(format!(
+                                    "Links magnet:// associados ao VortexDL ({})",
+                                    gui_exe.display()
+                                ));
+                            }
+                            Err(e) => {
+                                self.ext_reg_status = Some(format!("Erro ao associar magnet://: {e}"));
+                            }
+                        }
+                    }
+
+                    if magnet_registered {
+                        pill(ui, "magnet:// associado", to_c32(theme.success), theme);
+                    } else {
+                        pill(ui, "magnet:// não associado", to_c32(theme.text_muted), theme);
+                    }
+                });
                 if let Some(ref st) = self.ext_reg_status {
                     ui.add_space(6.0);
                     ui.label(RichText::new(st).small().color(to_c32(theme.accent)));
@@ -2708,6 +2741,25 @@ impl VortexApp {
                     ui.label(RichText::new("BitTorrent").strong());
                     changed |= ui.checkbox(&mut s.torrent_seed_after_complete, "Continuar semeando após concluir").changed();
                     changed |= ui.add(egui::Slider::new(&mut s.torrent_max_ratio, 0.0..=5.0).text("Ratio máximo de seed (0 = ilimitado)")).changed();
+                    let gui_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("vortex-gui.exe"));
+                    let magnet_registered = is_magnet_protocol_registered(&gui_exe);
+                    ui.horizontal(|ui| {
+                        if ui.button("Associar links magnet:// no Windows").clicked() {
+                            match register_magnet_protocol_handler(&gui_exe) {
+                                Ok(()) => {
+                                    self.ext_reg_status = Some("Links magnet:// associados ao VortexDL.".to_string());
+                                }
+                                Err(e) => {
+                                    self.ext_reg_status = Some(format!("Erro ao associar magnet://: {e}"));
+                                }
+                            }
+                        }
+                        if magnet_registered {
+                            pill(ui, "magnet:// associado", to_c32(theme.success), theme);
+                        } else {
+                            pill(ui, "magnet:// não associado", to_c32(theme.text_muted), theme);
+                        }
+                    });
                 });
         }
         if changed {

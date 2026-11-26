@@ -653,52 +653,128 @@ impl VortexApp {
             .corner_radius(CornerRadius::same(theme.corner_radius as u8))
             .inner_margin(Margin::symmetric(12, 8))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Link detectado na área de transferência:")
-                            .strong()
-                            .color(to_c32(theme.accent)),
+                let avail_w = ui.available_width();
+                let scale = theme.font_scale.clamp(0.8, 1.4);
+                let preview = if url_or_batch.len() > 70 {
+                    format!("{}...", &url_or_batch[..70])
+                } else {
+                    url_or_batch.clone()
+                };
+                if avail_w >= 820.0 * scale {
+                    egui::Sides::new().shrink_left().truncate().show(
+                        ui,
+                        |ui| {
+                            ui.label(
+                                RichText::new("Link detectado na área de transferência:")
+                                    .strong()
+                                    .color(to_c32(theme.accent)),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&preview).color(to_c32(theme.text_primary)),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&url_or_batch);
+                        },
+                        |ui| {
+                            if ui.button("Ignorar").clicked() {
+                                self.clipboard_banner_url = None;
+                            }
+                            if let Some(count_str) = url_or_batch.strip_prefix("BATCH:") {
+                                if accent_button(
+                                    ui,
+                                    format!("Enviar {count_str} ao LinkGrabber"),
+                                    theme,
+                                )
+                                .clicked()
+                                {
+                                    self.manager.probe_text_into_grabber(
+                                        self.last_clipboard.clone(),
+                                        HashMap::new(),
+                                    );
+                                    self.active_tab = NavTab::LinkGrabber;
+                                    self.clipboard_banner_url = None;
+                                }
+                            } else {
+                                if ui.button("Analisar Mídia").clicked() {
+                                    self.media_url = url_or_batch.clone();
+                                    self.active_tab = NavTab::Media;
+                                    self.clipboard_banner_url = None;
+                                }
+                                if accent_button(ui, "Baixar Agora", theme).clicked() {
+                                    let _ = self.manager.add_http_download(NewDownloadRequest {
+                                        url: url_or_batch.clone(),
+                                        filename: None,
+                                        save_dir: None,
+                                        connections: None,
+                                        headers: HashMap::new(),
+                                        checksum: None,
+                                        auto_extract: None,
+                                        extractor_override: None,
+                                        extract_password: None,
+                                        start_immediately: Some(true),
+                                    });
+                                    self.clipboard_banner_url = None;
+                                }
+                            }
+                        },
                     );
-                    let preview = if url_or_batch.len() > 70 {
-                        format!("{}...", &url_or_batch[..70])
-                    } else {
-                        url_or_batch.clone()
-                    };
-                    ui.label(RichText::new(preview).color(to_c32(theme.text_primary)));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Ignorar").clicked() {
-                            self.clipboard_banner_url = None;
-                        }
-                        if let Some(count_str) = url_or_batch.strip_prefix("BATCH:") {
-                            if accent_button(ui, format!("Enviar {count_str} ao LinkGrabber"), theme).clicked() {
-                                self.manager.probe_text_into_grabber(self.last_clipboard.clone(), HashMap::new());
-                                self.active_tab = NavTab::LinkGrabber;
+                } else {
+                    ui.vertical(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new("Link detectado na área de transferência:")
+                                    .strong()
+                                    .color(to_c32(theme.accent)),
+                            );
+                            ui.label(RichText::new(&preview).color(to_c32(theme.text_primary)))
+                                .on_hover_text(&url_or_batch);
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            if let Some(count_str) = url_or_batch.strip_prefix("BATCH:") {
+                                if accent_button(
+                                    ui,
+                                    format!("Enviar {count_str} ao LinkGrabber"),
+                                    theme,
+                                )
+                                .clicked()
+                                {
+                                    self.manager.probe_text_into_grabber(
+                                        self.last_clipboard.clone(),
+                                        HashMap::new(),
+                                    );
+                                    self.active_tab = NavTab::LinkGrabber;
+                                    self.clipboard_banner_url = None;
+                                }
+                            } else {
+                                if accent_button(ui, "Baixar Agora", theme).clicked() {
+                                    let _ = self.manager.add_http_download(NewDownloadRequest {
+                                        url: url_or_batch.clone(),
+                                        filename: None,
+                                        save_dir: None,
+                                        connections: None,
+                                        headers: HashMap::new(),
+                                        checksum: None,
+                                        auto_extract: None,
+                                        extractor_override: None,
+                                        extract_password: None,
+                                        start_immediately: Some(true),
+                                    });
+                                    self.clipboard_banner_url = None;
+                                }
+                                if ui.button("Analisar Mídia").clicked() {
+                                    self.media_url = url_or_batch.clone();
+                                    self.active_tab = NavTab::Media;
+                                    self.clipboard_banner_url = None;
+                                }
+                            }
+                            if ui.button("Ignorar").clicked() {
                                 self.clipboard_banner_url = None;
                             }
-                        } else {
-                            if ui.button("Analisar Mídia").clicked() {
-                                self.media_url = url_or_batch.clone();
-                                self.active_tab = NavTab::Media;
-                                self.clipboard_banner_url = None;
-                            }
-                            if accent_button(ui, "Baixar Agora", theme).clicked() {
-                                let _ = self.manager.add_http_download(NewDownloadRequest {
-                                    url: url_or_batch.clone(),
-                                    filename: None,
-                                    save_dir: None,
-                                    connections: None,
-                                    headers: HashMap::new(),
-                                    checksum: None,
-                                    auto_extract: None,
-                                    extractor_override: None,
-                                    extract_password: None,
-                                    start_immediately: Some(true),
-                                });
-                                self.clipboard_banner_url = None;
-                            }
-                        }
+                        });
                     });
-                });
+                }
             });
         ui.add_space(8.0);
     }
@@ -715,10 +791,17 @@ impl VortexApp {
             } else {
                 to_c32(theme.text_muted)
             };
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("•").color(dot_color));
-                ui.label(RichText::new(&latest.message).small().color(text_color));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            egui::Sides::new().shrink_left().truncate().show(
+                ui,
+                |ui| {
+                    ui.label(RichText::new("•").color(dot_color));
+                    ui.add(
+                        egui::Label::new(RichText::new(&latest.message).small().color(text_color))
+                            .truncate(),
+                    )
+                    .on_hover_text(&latest.message);
+                },
+                |ui| {
                     if snap.notifications.len() > 1 && ui.small_button("Limpar").clicked() {
                         self.manager.clear_notices();
                     }
@@ -729,8 +812,8 @@ impl VortexApp {
                     {
                         self.manager.dismiss_notice(latest.id);
                     }
-                });
-            });
+                },
+            );
             ui.add_space(4.0);
         }
     }
@@ -832,6 +915,15 @@ impl VortexApp {
             (item.auto_extract, item.extractor_override.clone())
         };
         let margin_y = if theme.compact_mode { 7 } else { 11 };
+        let is_archive = (item.category == FileCategory::Archive
+            || vortex_core::extractor::is_extractable_archive(&item.file_path))
+            && (!item.status.is_finished() || item.file_path.exists());
+        let status_color = match &item.status {
+            DownloadStatus::Completed | DownloadStatus::Seeding => to_c32(theme.success),
+            DownloadStatus::Failed(_) => to_c32(theme.error),
+            DownloadStatus::Paused => to_c32(theme.warning),
+            _ => to_c32(theme.accent),
+        };
 
         Frame::new()
             .fill(to_c32(theme.bg_card))
@@ -839,155 +931,206 @@ impl VortexApp {
             .corner_radius(CornerRadius::same(theme.corner_radius as u8))
             .inner_margin(Margin::symmetric(14, margin_y))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    // Category badge
-                    pill(ui, item.category.label(), to_c32(theme.accent), theme);
+                let avail_w = ui.available_width();
+                let scale = theme.font_scale.clamp(0.8, 1.4);
+                let single_row_needed = if is_archive { 760.0 } else { 560.0 } * scale;
 
-                    if ui
-                        .add(
-                            egui::Label::new(
-                                RichText::new(&item.filename)
-                                    .strong()
-                                    .color(to_c32(theme.text_primary)),
-                            )
-                            .sense(Sense::click()),
-                        )
-                        .clicked()
-                    {
-                        self.selected_id = if is_selected { None } else { Some(item.id) };
-                    }
-
-                    if let (Some(idx), Some(total)) = (item.part_index, item.part_total) {
-                        pill(
-                            ui,
-                            &format!("Parte {idx}/{total}"),
-                            to_c32(theme.warning),
-                            theme,
-                        );
-                    }
-
-                    let status_color = match &item.status {
-                        DownloadStatus::Completed | DownloadStatus::Seeding => to_c32(theme.success),
-                        DownloadStatus::Failed(_) => to_c32(theme.error),
-                        DownloadStatus::Paused => to_c32(theme.warning),
-                        _ => to_c32(theme.accent),
-                    };
-                    pill(ui, item.status.label(), status_color, theme);
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Remover").clicked() {
-                            self.manager.remove_download(item.id, false);
-                        }
-                        if ui.button("Pasta").clicked() {
-                            let _ = open::that(&item.save_dir);
-                        }
-                        if item.status.is_finished() && item.file_path.exists() {
-                            if ui.button("Abrir").clicked() {
-                                let _ = open::that(&item.file_path);
-                            }
-                        }
-                        let is_archive = (item.category == FileCategory::Archive
-                            || vortex_core::extractor::is_extractable_archive(&item.file_path))
-                            && (!item.status.is_finished() || item.file_path.exists());
-                        if is_archive {
-                            let has_pw = item.extract_password.is_some();
-                            let pw_btn_label = if has_pw { "Senha (OK)" } else { "Senha" };
-                            if ui
-                                .button(pw_btn_label)
-                                .on_hover_text("Definir ou alterar senha de extração")
-                                .clicked()
-                            {
-                                self.pw_edit_input =
-                                    item.extract_password.clone().unwrap_or_default();
-                                self.pw_edit_focus = true;
-                                self.pw_edit_show_chars = false;
-                                self.pw_edit_target = Some(PasswordEditTarget::Download {
-                                    id: item.id,
-                                    name: item.filename.clone(),
-                                    is_finished: item.status.is_finished(),
-                                });
-                            }
-
-                            let combo_label = if !item.status.is_finished() {
-                                if !eff_auto_extract {
-                                    "Não extrair".to_string()
-                                } else {
-                                    extractor_combo_label(
-                                        eff_extractor.as_deref(),
-                                        &default_ext_id,
-                                        &extractors,
-                                    )
-                                }
-                            } else {
-                                "Extrair com...".to_string()
-                            };
-
-                            let can_interact = item.status != DownloadStatus::Extracting;
-                            ui.add_enabled_ui(can_interact, |ui| {
-                                egui::ComboBox::from_id_salt(("ext_now", item.id))
-                                    .selected_text(combo_label)
-                                    .width(128.0)
-                                    .show_ui(ui, |ui| {
-                                        let auto_selected =
-                                            eff_auto_extract && eff_extractor.is_none();
-                                        if ui.selectable_label(auto_selected, "Padrão (Auto)").clicked()
-                                        {
-                                            self.manager.set_extractor_override(item.id, None, true);
-                                            if item.status.is_finished() && item.file_path.exists() {
-                                                self.manager.trigger_manual_extract(item.id, None);
-                                            }
-                                        }
-                                        for prof in &extractors {
-                                            if prof.detected && prof.enabled {
-                                                let prof_selected = eff_auto_extract
-                                                    && eff_extractor.as_deref()
-                                                        == Some(prof.id.as_str());
-                                                if ui
-                                                    .selectable_label(prof_selected, &prof.name)
-                                                    .clicked()
-                                                {
-                                                    self.manager.set_extractor_override(
-                                                        item.id,
-                                                        Some(prof.id.clone()),
-                                                        true,
-                                                    );
-                                                    if item.status.is_finished()
-                                                        && item.file_path.exists()
-                                                    {
-                                                        self.manager.trigger_manual_extract(
-                                                            item.id,
-                                                            Some(prof.id.clone()),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if !item.status.is_finished() {
-                                            if ui
-                                                .selectable_label(!eff_auto_extract, "Não extrair")
-                                                .clicked()
-                                            {
-                                                self.manager
-                                                    .set_extractor_override(item.id, None, false);
-                                            }
-                                        }
-                                    });
-                            });
-                        }
+                let render_action = |app: &mut Self, ui: &mut Ui, action: u8| match action {
+                    0 => {
                         if item.status.is_active() || item.status == DownloadStatus::Queued {
                             if ui.button("Pausar").clicked() {
-                                self.manager.pause_download(item.id);
+                                app.manager.pause_download(item.id);
                             }
                         } else if matches!(
                             item.status,
                             DownloadStatus::Paused | DownloadStatus::Failed(_)
                         ) {
                             if accent_button(ui, "Retomar", theme).clicked() {
-                                self.manager.resume_download(item.id);
+                                app.manager.resume_download(item.id);
                             }
                         }
+                    }
+                    1 if is_archive => {
+                        let combo_label = if !item.status.is_finished() {
+                            if !eff_auto_extract {
+                                "Não extrair".to_string()
+                            } else {
+                                extractor_combo_label(
+                                    eff_extractor.as_deref(),
+                                    &default_ext_id,
+                                    &extractors,
+                                )
+                            }
+                        } else {
+                            "Extrair com...".to_string()
+                        };
+                        let can_interact = item.status != DownloadStatus::Extracting;
+                        ui.add_enabled_ui(can_interact, |ui| {
+                            egui::ComboBox::from_id_salt(("ext_now", item.id))
+                                .selected_text(combo_label)
+                                .width(128.0)
+                                .show_ui(ui, |ui| {
+                                    let auto_selected =
+                                        eff_auto_extract && eff_extractor.is_none();
+                                    if ui
+                                        .selectable_label(auto_selected, "Padrão (Auto)")
+                                        .clicked()
+                                    {
+                                        app.manager.set_extractor_override(item.id, None, true);
+                                        if item.status.is_finished() && item.file_path.exists() {
+                                            app.manager.trigger_manual_extract(item.id, None);
+                                        }
+                                    }
+                                    for prof in &extractors {
+                                        if prof.detected && prof.enabled {
+                                            let prof_selected = eff_auto_extract
+                                                && eff_extractor.as_deref()
+                                                    == Some(prof.id.as_str());
+                                            if ui
+                                                .selectable_label(prof_selected, &prof.name)
+                                                .clicked()
+                                            {
+                                                app.manager.set_extractor_override(
+                                                    item.id,
+                                                    Some(prof.id.clone()),
+                                                    true,
+                                                );
+                                                if item.status.is_finished()
+                                                    && item.file_path.exists()
+                                                {
+                                                    app.manager.trigger_manual_extract(
+                                                        item.id,
+                                                        Some(prof.id.clone()),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !item.status.is_finished() {
+                                        if ui
+                                            .selectable_label(!eff_auto_extract, "Não extrair")
+                                            .clicked()
+                                        {
+                                            app.manager
+                                                .set_extractor_override(item.id, None, false);
+                                        }
+                                    }
+                                });
+                        });
+                    }
+                    2 if is_archive => {
+                        let has_pw = item.extract_password.is_some();
+                        let pw_btn_label = if has_pw { "Senha (OK)" } else { "Senha" };
+                        if ui
+                            .button(pw_btn_label)
+                            .on_hover_text("Definir ou alterar senha de extração")
+                            .clicked()
+                        {
+                            app.pw_edit_input = item.extract_password.clone().unwrap_or_default();
+                            app.pw_edit_focus = true;
+                            app.pw_edit_show_chars = false;
+                            app.pw_edit_target = Some(PasswordEditTarget::Download {
+                                id: item.id,
+                                name: item.filename.clone(),
+                                is_finished: item.status.is_finished(),
+                            });
+                        }
+                    }
+                    3 => {
+                        if item.status.is_finished() && item.file_path.exists() {
+                            if ui.button("Abrir").clicked() {
+                                let _ = open::that(&item.file_path);
+                            }
+                        }
+                    }
+                    4 => {
+                        if ui.button("Pasta").clicked() {
+                            let _ = open::that(&item.save_dir);
+                        }
+                    }
+                    5 => {
+                        if ui.button("Remover").clicked() {
+                            app.manager.remove_download(item.id, false);
+                        }
+                    }
+                    _ => {}
+                };
+
+                if avail_w >= single_row_needed {
+                    let mut toggle_select = false;
+                    egui::Sides::new().shrink_left().truncate().show(
+                        ui,
+                        |ui| {
+                            pill(ui, item.category.label(), to_c32(theme.accent), theme);
+                            if let (Some(idx), Some(total)) = (item.part_index, item.part_total) {
+                                pill(
+                                    ui,
+                                    &format!("Parte {idx}/{total}"),
+                                    to_c32(theme.warning),
+                                    theme,
+                                );
+                            }
+                            pill(ui, item.status.label(), status_color, theme);
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(&item.filename)
+                                            .strong()
+                                            .color(to_c32(theme.text_primary)),
+                                    )
+                                    .truncate()
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_text(&item.filename)
+                                .clicked()
+                            {
+                                toggle_select = true;
+                            }
+                        },
+                        |ui| {
+                            for action in [5, 4, 3, 2, 1, 0] {
+                                render_action(self, ui, action);
+                            }
+                        },
+                    );
+                    if toggle_select {
+                        self.selected_id = if is_selected { None } else { Some(item.id) };
+                    }
+                } else {
+                    ui.vertical(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            pill(ui, item.category.label(), to_c32(theme.accent), theme);
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(&item.filename)
+                                            .strong()
+                                            .color(to_c32(theme.text_primary)),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .clicked()
+                            {
+                                self.selected_id = if is_selected { None } else { Some(item.id) };
+                            }
+                            if let (Some(idx), Some(total)) = (item.part_index, item.part_total) {
+                                pill(
+                                    ui,
+                                    &format!("Parte {idx}/{total}"),
+                                    to_c32(theme.warning),
+                                    theme,
+                                );
+                            }
+                            pill(ui, item.status.label(), status_color, theme);
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for action in [0, 1, 2, 3, 4, 5] {
+                                render_action(self, ui, action);
+                            }
+                        });
                     });
-                });
+                }
 
                 ui.add_space(4.0);
                 // Progress bar + live segmented chunks visualization
@@ -1009,7 +1152,7 @@ impl VortexApp {
                 }
 
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let size_str = match item.total_bytes {
                         Some(tot) => format!(
                             "{} / {} ({:.1}%)",
@@ -1220,50 +1363,58 @@ impl VortexApp {
                     .corner_radius(CornerRadius::same(theme.corner_radius as u8))
                     .inner_margin(Margin::same(14))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button(if expanded { "[-]" } else { "[+]" })
-                                .clicked()
-                            {
-                                if expanded {
-                                    self.expanded_packages.remove(&pkg.id);
-                                } else {
-                                    self.expanded_packages.insert(pkg.id);
-                                }
-                            }
-                            ui.label(RichText::new(&pkg.name).strong().size(15.0));
-                            pill(
-                                ui,
-                                &format!("{done_count}/{} partes", parts.len()),
-                                to_c32(theme.accent),
-                                theme,
-                            );
-                            if !pkg.missing_parts.is_empty() {
-                                pill(
-                                    ui,
-                                    &format!("Faltando partes: {:?}", pkg.missing_parts),
-                                    to_c32(theme.error),
-                                    theme,
-                                );
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("Pasta").clicked() {
-                                    let _ = open::that(&pkg.save_dir);
-                                }
-                                let pkg_all_done = !parts.is_empty()
-                                    && parts.iter().all(|p| p.status == DownloadStatus::Completed);
-                                let pkg_extracting = pkg
-                                    .extraction_status
-                                    .as_deref()
-                                    .is_some_and(|s| s.starts_with("Extraindo"))
-                                    || parts
-                                        .iter()
-                                        .any(|p| p.status == DownloadStatus::Extracting);
-                                if pkg_all_done {
-                                    if ui.button("Extrair").clicked() {
-                                        self.manager.trigger_package_extract(pkg.id, None);
+                        let avail_w = ui.available_width();
+                        let scale = theme.font_scale.clamp(0.8, 1.4);
+                        let single_row_needed = 780.0 * scale;
+                        let pkg_all_done = !parts.is_empty()
+                            && parts.iter().all(|p| p.status == DownloadStatus::Completed);
+                        let pkg_extracting = pkg
+                            .extraction_status
+                            .as_deref()
+                            .is_some_and(|s| s.starts_with("Extraindo"))
+                            || parts
+                                .iter()
+                                .any(|p| p.status == DownloadStatus::Extracting);
+
+                        let render_pkg_action = |app: &mut Self, ui: &mut Ui, action: u8| match action
+                        {
+                            0 => {
+                                if accent_button(ui, "Retomar Pacote", theme).clicked() {
+                                    for p in &parts {
+                                        app.manager.resume_download(p.id);
                                     }
                                 }
+                            }
+                            1 => {
+                                if ui.button("Pausar Pacote").clicked() {
+                                    for p in &parts {
+                                        app.manager.pause_download(p.id);
+                                    }
+                                }
+                            }
+                            2 => {
+                                let pw_label = if pkg.extract_password.is_some() {
+                                    "Senha (OK)"
+                                } else {
+                                    "Senha"
+                                };
+                                if ui
+                                    .button(pw_label)
+                                    .on_hover_text("Definir senha para extração deste pacote")
+                                    .clicked()
+                                {
+                                    app.pw_edit_input =
+                                        pkg.extract_password.clone().unwrap_or_default();
+                                    app.pw_edit_focus = true;
+                                    app.pw_edit_show_chars = false;
+                                    app.pw_edit_target = Some(PasswordEditTarget::Package {
+                                        id: pkg.id,
+                                        name: pkg.name.clone(),
+                                        all_finished: pkg_all_done,
+                                    });
+                                }
+                            }
+                            3 => {
                                 let pkg_combo_label = if !pkg_all_done {
                                     if !pkg.auto_extract {
                                         "Não extrair".to_string()
@@ -1288,10 +1439,10 @@ impl VortexApp {
                                                 .selectable_label(auto_selected, "Padrão (Auto)")
                                                 .clicked()
                                             {
-                                                self.manager
+                                                app.manager
                                                     .set_package_extractor(pkg.id, None, true);
                                                 if pkg_all_done {
-                                                    self.manager
+                                                    app.manager
                                                         .trigger_package_extract(pkg.id, None);
                                                 }
                                             }
@@ -1304,13 +1455,13 @@ impl VortexApp {
                                                         .selectable_label(prof_selected, &prof.name)
                                                         .clicked()
                                                     {
-                                                        self.manager.set_package_extractor(
+                                                        app.manager.set_package_extractor(
                                                             pkg.id,
                                                             Some(prof.id.clone()),
                                                             true,
                                                         );
                                                         if pkg_all_done {
-                                                            self.manager.trigger_package_extract(
+                                                            app.manager.trigger_package_extract(
                                                                 pkg.id, None,
                                                             );
                                                         }
@@ -1325,44 +1476,111 @@ impl VortexApp {
                                                     )
                                                     .clicked()
                                                 {
-                                                    self.manager
+                                                    app.manager
                                                         .set_package_extractor(pkg.id, None, false);
                                                 }
                                             }
                                         });
                                 });
-                                let pw_label = if pkg.extract_password.is_some() {
-                                    "Senha (OK)"
+                            }
+                            4 => {
+                                if pkg_all_done {
+                                    if ui.button("Extrair").clicked() {
+                                        app.manager.trigger_package_extract(pkg.id, None);
+                                    }
+                                }
+                            }
+                            5 => {
+                                if ui.button("Pasta").clicked() {
+                                    let _ = open::that(&pkg.save_dir);
+                                }
+                            }
+                            _ => {}
+                        };
+
+                        if avail_w >= single_row_needed {
+                            let mut toggle_expand = false;
+                            egui::Sides::new().shrink_left().truncate().show(
+                                ui,
+                                |ui| {
+                                    if ui
+                                        .button(if expanded { "[-]" } else { "[+]" })
+                                        .clicked()
+                                    {
+                                        toggle_expand = true;
+                                    }
+                                    pill(
+                                        ui,
+                                        &format!("{done_count}/{} partes", parts.len()),
+                                        to_c32(theme.accent),
+                                        theme,
+                                    );
+                                    if !pkg.missing_parts.is_empty() {
+                                        pill(
+                                            ui,
+                                            &format!("Faltando partes: {:?}", pkg.missing_parts),
+                                            to_c32(theme.error),
+                                            theme,
+                                        );
+                                    }
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&pkg.name).strong().size(15.0),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(&pkg.name);
+                                },
+                                |ui| {
+                                    for action in [5, 4, 3, 2, 1, 0] {
+                                        render_pkg_action(self, ui, action);
+                                    }
+                                },
+                            );
+                            if toggle_expand {
+                                if expanded {
+                                    self.expanded_packages.remove(&pkg.id);
                                 } else {
-                                    "Senha"
-                                };
-                                if ui
-                                    .button(pw_label)
-                                    .on_hover_text("Definir senha para extração deste pacote")
-                                    .clicked()
-                                {
-                                    self.pw_edit_input =
-                                        pkg.extract_password.clone().unwrap_or_default();
-                                    self.pw_edit_focus = true;
-                                    self.pw_edit_show_chars = false;
-                                    self.pw_edit_target = Some(PasswordEditTarget::Package {
-                                        id: pkg.id,
-                                        name: pkg.name.clone(),
-                                        all_finished: pkg_all_done,
-                                    });
+                                    self.expanded_packages.insert(pkg.id);
                                 }
-                                if ui.button("Pausar Pacote").clicked() {
-                                    for p in &parts {
-                                        self.manager.pause_download(p.id);
+                            }
+                        } else {
+                            ui.vertical(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .button(if expanded { "[-]" } else { "[+]" })
+                                        .clicked()
+                                    {
+                                        if expanded {
+                                            self.expanded_packages.remove(&pkg.id);
+                                        } else {
+                                            self.expanded_packages.insert(pkg.id);
+                                        }
                                     }
-                                }
-                                if accent_button(ui, "Retomar Pacote", theme).clicked() {
-                                    for p in &parts {
-                                        self.manager.resume_download(p.id);
+                                    ui.label(RichText::new(&pkg.name).strong().size(15.0));
+                                    pill(
+                                        ui,
+                                        &format!("{done_count}/{} partes", parts.len()),
+                                        to_c32(theme.accent),
+                                        theme,
+                                    );
+                                    if !pkg.missing_parts.is_empty() {
+                                        pill(
+                                            ui,
+                                            &format!("Faltando partes: {:?}", pkg.missing_parts),
+                                            to_c32(theme.error),
+                                            theme,
+                                        );
                                     }
-                                }
+                                });
+                                ui.add_space(4.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    for action in [0, 1, 2, 3, 4, 5] {
+                                        render_pkg_action(self, ui, action);
+                                    }
+                                });
                             });
-                        });
+                        }
 
                         ui.add_space(6.0);
                         ui.add(
@@ -1371,7 +1589,7 @@ impl VortexApp {
                                 .fill(to_c32(theme.accent)),
                         );
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(
                                 RichText::new(format!(
                                     "{} / {} • {}",
@@ -1574,7 +1792,10 @@ impl VortexApp {
             .filter_map(|l| l.size_bytes)
             .sum();
 
-        ui.horizontal(|ui| {
+        let grabber_avail_w = ui.available_width();
+        let grabber_scale = theme.font_scale.clamp(0.8, 1.4);
+        let grabber_mgr = self.manager.clone();
+        let render_grabber_controls = |ui: &mut Ui| {
             ui.label(
                 RichText::new(format!(
                     "{total_count} link(s) capturados ({selected_count} selecionados • {})",
@@ -1583,7 +1804,7 @@ impl VortexApp {
                 .strong(),
             );
             if total_count > 0 {
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 if ui
                     .add_enabled(
                         !matches_valid_only,
@@ -1594,7 +1815,7 @@ impl VortexApp {
                     )
                     .clicked()
                 {
-                    let mut g = self.manager.grabbed_links.write();
+                    let mut g = grabber_mgr.grabbed_links.write();
                     for item in g.iter_mut() {
                         item.selected = vortex_core::manager::is_valid_grabbed_link(item);
                     }
@@ -1603,7 +1824,7 @@ impl VortexApp {
                     .add_enabled(selected_count < total_count, egui::Button::new("Marcar Tudo"))
                     .clicked()
                 {
-                    let mut g = self.manager.grabbed_links.write();
+                    let mut g = grabber_mgr.grabbed_links.write();
                     for item in g.iter_mut() {
                         item.selected = true;
                     }
@@ -1612,7 +1833,7 @@ impl VortexApp {
                     .add_enabled(selected_count > 0, egui::Button::new("Desmarcar Tudo"))
                     .clicked()
                 {
-                    let mut g = self.manager.grabbed_links.write();
+                    let mut g = grabber_mgr.grabbed_links.write();
                     for item in g.iter_mut() {
                         item.selected = false;
                     }
@@ -1622,7 +1843,7 @@ impl VortexApp {
                         .button(format!("Desmarcar Offline ({offline_selected_count})"))
                         .clicked()
                 {
-                    let mut g = self.manager.grabbed_links.write();
+                    let mut g = grabber_mgr.grabbed_links.write();
                     for item in g.iter_mut() {
                         if item.online == Some(false) {
                             item.selected = false;
@@ -1631,7 +1852,7 @@ impl VortexApp {
                 }
             }
             if snap.grabber_probing {
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 ui.spinner();
                 ui.label(
                     RichText::new("Analisando e resolvendo páginas intermediárias...")
@@ -1639,27 +1860,44 @@ impl VortexApp {
                         .color(to_c32(theme.accent)),
                 );
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if selected_count > 0
-                    && accent_button(ui, format!("Iniciar Download ({selected_count})"), theme).clicked()
-                {
-                    let dir = PathBuf::from(&self.grabber_save_dir);
-                    let pw = if self.grabber_password.trim().is_empty() {
-                        None
-                    } else {
-                        Some(self.grabber_password.trim().to_string())
-                    };
-                    self.manager.enqueue_selected_grabbed(
-                        Some(dir),
-                        self.grabber_auto_extract,
-                        Some(self.grabber_extractor_id.clone()),
-                        pw,
-                        self.grabber_delete_archives,
-                    );
-                    self.active_tab = NavTab::Packages;
+        };
+        let render_grabber_start_btn = |app: &mut Self, ui: &mut Ui| {
+            if selected_count > 0
+                && accent_button(ui, format!("Iniciar Download ({selected_count})"), theme)
+                    .clicked()
+            {
+                let dir = PathBuf::from(&app.grabber_save_dir);
+                let pw = if app.grabber_password.trim().is_empty() {
+                    None
+                } else {
+                    Some(app.grabber_password.trim().to_string())
+                };
+                app.manager.enqueue_selected_grabbed(
+                    Some(dir),
+                    app.grabber_auto_extract,
+                    Some(app.grabber_extractor_id.clone()),
+                    pw,
+                    app.grabber_delete_archives,
+                );
+                app.active_tab = NavTab::Packages;
+            }
+        };
+
+        if grabber_avail_w >= 860.0 * grabber_scale {
+            egui::Sides::new().shrink_left().truncate().show(
+                ui,
+                |ui| render_grabber_controls(ui),
+                |ui| render_grabber_start_btn(self, ui),
+            );
+        } else {
+            ui.vertical(|ui| {
+                ui.horizontal_wrapped(|ui| render_grabber_controls(ui));
+                if selected_count > 0 {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| render_grabber_start_btn(self, ui));
                 }
             });
-        });
+        }
 
         ui.add_space(6.0);
         ScrollArea::vertical().show(ui, |ui| {
@@ -1671,46 +1909,106 @@ impl VortexApp {
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(12, 8))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let mut sel = link.selected;
-                            if ui.checkbox(&mut sel, "").changed() {
-                                toggles.push((link.id, sel));
-                            }
-                            let site_label = link
-                                .source_site
-                                .as_deref()
-                                .map(str::to_string)
-                                .or_else(|| {
-                                    vortex_core::package_grabber::classify_source_site(&link.url)
-                                });
-                            if let Some(ref site) = site_label {
-                                let (tag, color) = site_badge_style(site, theme);
-                                pill(ui, &format!("{tag} • {site}"), color, theme);
-                            }
-                            ui.label(RichText::new(&link.filename).strong())
-                                .on_hover_text(&link.url);
-                            if let Some(ref pkg) = link.package_key {
-                                pill(ui, &format!("Pacote: {pkg}"), to_c32(theme.accent), theme);
-                            }
-                            if let Some(pn) = link.part_number {
-                                pill(ui, &format!("Parte #{pn}"), to_c32(theme.warning), theme);
-                            }
-                            match link.online {
-                                Some(true) => pill(ui, "Online", to_c32(theme.success), theme),
-                                Some(false) => pill(ui, "Offline/Erro", to_c32(theme.error), theme),
-                                None => {}
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(
-                                        link.size_bytes
-                                            .map(format_bytes)
-                                            .unwrap_or_else(|| "Tamanho ?".into()),
+                        let row_avail = ui.available_width();
+                        let size_text = link
+                            .size_bytes
+                            .map(format_bytes)
+                            .unwrap_or_else(|| "Tamanho ?".into());
+                        let site_label = link
+                            .source_site
+                            .as_deref()
+                            .map(str::to_string)
+                            .or_else(|| {
+                                vortex_core::package_grabber::classify_source_site(&link.url)
+                            });
+
+                        if row_avail >= 680.0 * grabber_scale {
+                            egui::Sides::new().shrink_left().truncate().show(
+                                ui,
+                                |ui| {
+                                    let mut sel = link.selected;
+                                    if ui.checkbox(&mut sel, "").changed() {
+                                        toggles.push((link.id, sel));
+                                    }
+                                    if let Some(ref site) = site_label {
+                                        let (tag, color) = site_badge_style(site, theme);
+                                        pill(ui, &format!("{tag} • {site}"), color, theme);
+                                    }
+                                    match link.online {
+                                        Some(true) => pill(ui, "Online", to_c32(theme.success), theme),
+                                        Some(false) => {
+                                            pill(ui, "Offline/Erro", to_c32(theme.error), theme)
+                                        }
+                                        None => {}
+                                    }
+                                    if let Some(ref pkg) = link.package_key {
+                                        pill(
+                                            ui,
+                                            &format!("Pacote: {pkg}"),
+                                            to_c32(theme.accent),
+                                            theme,
+                                        );
+                                    }
+                                    if let Some(pn) = link.part_number {
+                                        pill(
+                                            ui,
+                                            &format!("Parte #{pn}"),
+                                            to_c32(theme.warning),
+                                            theme,
+                                        );
+                                    }
+                                    ui.add(
+                                        egui::Label::new(RichText::new(&link.filename).strong())
+                                            .truncate(),
                                     )
-                                    .color(to_c32(theme.text_muted)),
+                                    .on_hover_text(&link.url);
+                                },
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(&size_text).color(to_c32(theme.text_muted)),
+                                    );
+                                },
+                            );
+                        } else {
+                            ui.horizontal_wrapped(|ui| {
+                                let mut sel = link.selected;
+                                if ui.checkbox(&mut sel, "").changed() {
+                                    toggles.push((link.id, sel));
+                                }
+                                if let Some(ref site) = site_label {
+                                    let (tag, color) = site_badge_style(site, theme);
+                                    pill(ui, &format!("{tag} • {site}"), color, theme);
+                                }
+                                ui.label(RichText::new(&link.filename).strong())
+                                    .on_hover_text(&link.url);
+                                if let Some(ref pkg) = link.package_key {
+                                    pill(
+                                        ui,
+                                        &format!("Pacote: {pkg}"),
+                                        to_c32(theme.accent),
+                                        theme,
+                                    );
+                                }
+                                if let Some(pn) = link.part_number {
+                                    pill(
+                                        ui,
+                                        &format!("Parte #{pn}"),
+                                        to_c32(theme.warning),
+                                        theme,
+                                    );
+                                }
+                                match link.online {
+                                    Some(true) => pill(ui, "Online", to_c32(theme.success), theme),
+                                    Some(false) => {
+                                        pill(ui, "Offline/Erro", to_c32(theme.error), theme)
+                                    }
+                                    None => {}
+                                }
+                                ui.label(
+                                    RichText::new(&size_text).color(to_c32(theme.text_muted)),
                                 );
                             });
-                        });
+                        }
                         if let Some(ref err) = link.error {
                             ui.label(
                                 RichText::new(err)
@@ -1912,19 +2210,30 @@ impl VortexApp {
 
                             ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                                 for fmt in &info.formats {
-                                    ui.horizontal(|ui| {
-                                        pill(ui, &fmt.ext, to_c32(theme.accent), theme);
-                                        ui.label(RichText::new(&fmt.resolution).strong());
-                                        if let Some(fps) = fmt.fps {
-                                            ui.label(RichText::new(format!("{fps:.0}fps")).small().color(to_c32(theme.text_muted)));
-                                        }
-                                        if !fmt.note.is_empty() {
-                                            ui.label(RichText::new(&fmt.note).small().color(to_c32(theme.text_muted)));
-                                        }
-                                        if let Some(sz) = fmt.filesize {
-                                            ui.label(RichText::new(format_bytes(sz)).small().color(to_c32(theme.text_muted)));
-                                        }
-                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    egui::Sides::new().shrink_left().truncate().show(
+                                        ui,
+                                        |ui| {
+                                            pill(ui, &fmt.ext, to_c32(theme.accent), theme);
+                                            ui.label(RichText::new(&fmt.resolution).strong());
+                                            if let Some(fps) = fmt.fps {
+                                                ui.label(RichText::new(format!("{fps:.0}fps")).small().color(to_c32(theme.text_muted)));
+                                            }
+                                            if let Some(sz) = fmt.filesize {
+                                                ui.label(RichText::new(format_bytes(sz)).small().color(to_c32(theme.text_muted)));
+                                            }
+                                            if !fmt.note.is_empty() {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&fmt.note)
+                                                            .small()
+                                                            .color(to_c32(theme.text_muted)),
+                                                    )
+                                                    .truncate(),
+                                                )
+                                                .on_hover_text(&fmt.note);
+                                            }
+                                        },
+                                        |ui| {
                                             if ui.button("Baixar Formato").clicked() {
                                                 let _ = self.manager.add_media_download(NewMediaRequest {
                                                     url: info.url.clone(),
@@ -1940,8 +2249,8 @@ impl VortexApp {
                                                 });
                                                 self.active_tab = NavTab::All;
                                             }
-                                        });
-                                    });
+                                        },
+                                    );
                                     ui.separator();
                                 }
                             });
@@ -2028,7 +2337,7 @@ impl VortexApp {
                         .corner_radius(CornerRadius::same(theme.corner_radius as u8))
                         .inner_margin(Margin::same(12))
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ext_changed |= ui.checkbox(&mut prof.enabled, "").changed();
                                 ui.label(RichText::new(&prof.name).strong().size(14.5));
                                 pill(
@@ -2039,10 +2348,10 @@ impl VortexApp {
                                 );
                                 pill(ui, prof.kind.label(), to_c32(theme.accent), theme);
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new("Executável:").small().color(to_c32(theme.text_muted)));
                                 ext_changed |= ui
-                                    .add(egui::TextEdit::singleline(&mut prof.executable).desired_width(360.0))
+                                    .add(egui::TextEdit::singleline(&mut prof.executable).desired_width(300.0))
                                     .changed();
                                 if ui.button("Selecionar .exe").clicked() {
                                     if let Some(p) = rfd::FileDialog::new()
@@ -2055,10 +2364,10 @@ impl VortexApp {
                                     }
                                 }
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new("Args:").small().color(to_c32(theme.text_muted)));
                                 ext_changed |= ui
-                                    .add(egui::TextEdit::singleline(&mut prof.args_template).desired_width(360.0))
+                                    .add(egui::TextEdit::singleline(&mut prof.args_template).desired_width(300.0))
                                     .changed();
                             });
                         });
@@ -2073,7 +2382,7 @@ impl VortexApp {
                     .inner_margin(Margin::same(12))
                     .show(ui, |ui| {
                         ui.label(RichText::new("Lista de Senhas Automáticas (Estilo JDownloader 2)").strong());
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.new_password_entry)
                                     .hint_text("Adicionar senha comum...")
@@ -2109,7 +2418,7 @@ impl VortexApp {
                     .inner_margin(Margin::same(12))
                     .show(ui, |ui| {
                         ui.label(RichText::new("+ Adicionar Plugin Extrator Customizado").strong());
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Nome:");
                             ui.add(egui::TextEdit::singleline(&mut self.new_ext_name).desired_width(160.0));
                             ui.label("Executável:");
@@ -2120,9 +2429,9 @@ impl VortexApp {
                                 }
                             }
                         });
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Template Args:");
-                            ui.add(egui::TextEdit::singleline(&mut self.new_ext_args).desired_width(280.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.new_ext_args).desired_width(240.0));
                             ui.label("Flag Senha:");
                             ui.add(egui::TextEdit::singleline(&mut self.new_ext_pw_arg).desired_width(120.0));
                             if accent_button(ui, "Salvar Plugin", theme).clicked()
@@ -2293,7 +2602,7 @@ impl VortexApp {
                     });
 
                     ui.add_space(10.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Salvar como tema customizado:");
                         ui.add(egui::TextEdit::singleline(&mut self.custom_theme_name).desired_width(180.0));
                         if accent_button(ui, "Salvar Tema", theme).clicked() && !self.custom_theme_name.trim().is_empty() {
@@ -2330,9 +2639,9 @@ impl VortexApp {
                 .inner_margin(Margin::same(14))
                 .show(ui, |ui| {
                     ui.label(RichText::new("Diretórios & Categorias").strong());
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let mut dir_str = s.default_download_dir.to_string_lossy().to_string();
-                        if ui.add(egui::TextEdit::singleline(&mut dir_str).desired_width(360.0)).changed() {
+                        if ui.add(egui::TextEdit::singleline(&mut dir_str).desired_width(300.0)).changed() {
                             s.default_download_dir = PathBuf::from(dir_str);
                             changed = true;
                         }
@@ -2930,21 +3239,27 @@ fn render_speed_sparkline(ui: &mut Ui, snap: &ManagerSnapshot, theme: &ThemeConf
         .corner_radius(CornerRadius::same(theme.corner_radius as u8))
         .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Tráfego em Tempo Real (60s)")
-                        .small()
-                        .strong()
-                        .color(to_c32(theme.text_muted)),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            egui::Sides::new().shrink_left().truncate().show(
+                ui,
+                |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new("Tráfego em Tempo Real (60s)")
+                                .small()
+                                .strong()
+                                .color(to_c32(theme.text_muted)),
+                        )
+                        .truncate(),
+                    );
+                },
+                |ui| {
                     ui.label(
                         RichText::new(format!("Pico escala: {}", format_speed(max_bps)))
                             .small()
                             .color(to_c32(theme.text_muted)),
                     );
-                });
-            });
+                },
+            );
             ui.add_space(4.0);
             let desired = Vec2::new(ui.available_width(), 46.0);
             let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());

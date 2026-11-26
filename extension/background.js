@@ -7,6 +7,8 @@ const tabMedia = new Map();
 const recentHeaders = new Map();
 // URLs temporarily bypassed so browser handles them natively if user disables or app is offline
 const bypassUrls = new Set();
+// Download IDs handed off to VortexDL that must be cancelled & erased in Chromium
+const cancellingIds = new Set();
 
 const DEFAULT_SETTINGS = {
   interceptDownloads: true,
@@ -250,19 +252,36 @@ if (chrome.downloads.onDeterminingFilename) {
       return false;
     }
 
+    let suggested = false;
+    const finishSuggest = (arg) => {
+      if (suggested) return;
+      suggested = true;
+      try {
+        if (arg !== undefined) suggest(arg);
+        else suggest();
+      } catch (err) {
+        console.warn("[VortexDL] suggest failed:", err);
+      }
+    };
+
     (async () => {
       try {
         if (bypassUrls.has(url)) {
           bypassUrls.delete(url);
-          suggest();
+          finishSuggest();
           return;
         }
 
         const settings = await getSettings();
         if (!settings.interceptDownloads || !shouldInterceptDownload(item, settings)) {
-          suggest();
+          finishSuggest();
           return;
         }
+
+        cancellingIds.add(item.id);
+        try {
+          await chrome.downloads.pause(item.id);
+        } catch (_) {}
 
         const filename = extractDownloadFilename(item);
         const headers = await buildDownloadHeaders(item, url);
@@ -274,24 +293,53 @@ if (chrome.downloads.onDeterminingFilename) {
         });
 
         if (res && res.ok !== false) {
+          // Chromium requires suggest() before cancel() so the DownloadItem leaves filename determination
+          finishSuggest();
           try {
             await chrome.downloads.cancel(item.id);
-          } catch (_) {}
+          } catch (err) {
+            console.warn("[VortexDL] cancel failed:", err);
+          }
           try {
             await chrome.downloads.erase({ id: item.id });
-          } catch (_) {}
+          } catch (err) {
+            console.warn("[VortexDL] erase failed:", err);
+          }
+          setTimeout(() => cancellingIds.delete(item.id), 10000);
         } else {
+          cancellingIds.delete(item.id);
           bypassUrls.add(url);
-          suggest();
+          try {
+            await chrome.downloads.resume(item.id);
+          } catch (_) {}
+          finishSuggest();
         }
-      } catch (_) {
+      } catch (err) {
+        cancellingIds.delete(item.id);
+        console.warn("[VortexDL] onDeterminingFilename error:", err);
         try {
-          suggest();
+          await chrome.downloads.resume(item.id);
         } catch (_) {}
+        finishSuggest();
       }
     })();
 
     return true;
+  });
+
+  chrome.downloads.onChanged.addListener((delta) => {
+    if (!cancellingIds.has(delta.id)) return;
+    if (delta.state && delta.state.current === "interrupted") {
+      cancellingIds.delete(delta.id);
+      chrome.downloads.erase({ id: delta.id }).catch(() => {});
+      return;
+    }
+    if (
+      (delta.state && delta.state.current === "in_progress") ||
+      (delta.paused && delta.paused.current === false)
+    ) {
+      chrome.downloads.cancel(delta.id).catch(() => {});
+    }
   });
 } else {
   // Fallback for browsers without onDeterminingFilename (e.g. Firefox)

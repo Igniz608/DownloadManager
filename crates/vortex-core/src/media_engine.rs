@@ -163,7 +163,7 @@ pub async fn probe_media_url(
 ) -> Result<MediaProbeResult> {
     let mut cmd = Command::new(yt_dlp_path);
     crate::extractor::configure_silent_command(&mut cmd);
-    cmd.args(["-J", "--no-warnings", "--flat-playlist"]);
+    cmd.args(["-J", "--no-warnings", "--flat-playlist", "--playlist-end", "100"]);
     for (k, v) in headers {
         cmd.arg("--add-header").arg(format!("{k}:{v}"));
     }
@@ -306,13 +306,16 @@ where
             &on_progress,
         )
         .await;
-        if res.is_ok() {
-            return Ok(item);
-        }
-        // If yt-dlp couldn't handle raw .m3u8 or stopped due to pause, handle accordingly
+        // Check pause/cancel before treating early exit as completion
         if cancel.paused.load(Ordering::SeqCst) {
             item.status = DownloadStatus::Paused;
             item.speed_bps = 0;
+            return Ok(item);
+        }
+        if cancel.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Download cancelado"));
+        }
+        if res.is_ok() {
             return Ok(item);
         }
         if is_hls {
@@ -360,7 +363,11 @@ where
 
     let mut cmd = Command::new(yt_dlp_path);
     crate::extractor::configure_silent_command(&mut cmd);
-    cmd.arg("--newline")
+    cmd.env("PYTHONUNBUFFERED", "1")
+        .arg("--newline")
+        .arg("--no-quiet")
+        .arg("--progress")
+        .arg("--no-playlist")
         .arg("--no-warnings")
         .arg("--continue")
         .arg("--windows-filenames")
@@ -435,6 +442,8 @@ where
 
     let mut lines = BufReader::new(stdout).lines();
     let mut final_path: Option<PathBuf> = None;
+    let mut completed_streams_bytes: u64 = 0;
+    let mut current_stream_total: Option<u64> = None;
 
     loop {
         if cancel.is_stopped() {
@@ -464,6 +473,9 @@ where
         }
 
         if let Some(dest) = line.strip_prefix("[download] Destination:") {
+            if let Some(prev_tot) = current_stream_total.take() {
+                completed_streams_bytes = completed_streams_bytes.saturating_add(prev_tot);
+            }
             let pb = PathBuf::from(dest.trim());
             if let Some(name) = pb.file_name().and_then(|n| n.to_str()) {
                 item.filename = name.to_string();
@@ -494,18 +506,24 @@ where
         }
 
         if let Some((pct, total_est, speed_bps, eta)) = parse_ytdlp_progress(&line) {
-            let total = total_est.or(item.total_bytes).unwrap_or(100 * 1024 * 1024);
-            let downloaded = ((pct / 100.0) * total as f64) as u64;
-            item.total_bytes = Some(total);
-            item.downloaded_bytes = downloaded;
+            if total_est.is_some() {
+                current_stream_total = total_est;
+            }
+            if let Some(stream_tot) = current_stream_total {
+                let stream_dl = ((pct / 100.0).clamp(0.0, 1.0) * stream_tot as f64) as u64;
+                let total = completed_streams_bytes.saturating_add(stream_tot);
+                let downloaded = completed_streams_bytes.saturating_add(stream_dl);
+                item.total_bytes = Some(total);
+                item.downloaded_bytes = downloaded;
+            }
             item.speed_bps = speed_bps;
             item.eta_seconds = eta;
             on_progress(
                 Some(DownloadStatus::Downloading),
                 None,
                 None,
-                downloaded,
-                Some(total),
+                item.downloaded_bytes,
+                item.total_bytes,
                 speed_bps,
                 eta,
             );
@@ -888,6 +906,20 @@ mod tests {
         assert!(total.is_some());
         assert!(speed > 5_000_000);
         assert_eq!(eta, Some(12));
+
+        let unknown_spd = "[download]  88.5% of   11.04MiB at  Unknown B/s ETA Unknown";
+        let (pct2, tot2, spd2, eta2) = parse_ytdlp_progress(unknown_spd).expect("should parse unknown speed");
+        assert!((pct2 - 88.5).abs() < 0.01);
+        assert!(tot2.unwrap() > 11_000_000);
+        assert_eq!(spd2, 0);
+        assert_eq!(eta2, None);
+
+        let finished = "[download] 100% of   11.04MiB in 00:00:00 at 26.09MiB/s";
+        let (pct3, tot3, spd3, eta3) = parse_ytdlp_progress(finished).expect("should parse finished");
+        assert!((pct3 - 100.0).abs() < 0.01);
+        assert!(tot3.unwrap() > 11_000_000);
+        assert!(spd3 > 25_000_000);
+        assert_eq!(eta3, None);
     }
 
     #[test]

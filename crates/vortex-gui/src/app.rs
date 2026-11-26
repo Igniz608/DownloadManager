@@ -59,6 +59,7 @@ pub struct VortexApp {
 
     // Add HTTP Download modal
     show_new_http_modal: bool,
+    focus_new_http_url: bool,
     new_http_url: String,
     new_http_filename: String,
     new_http_dir: String,
@@ -131,6 +132,7 @@ impl VortexApp {
             last_clipboard_check: Instant::now(),
             clipboard_banner_url: None,
             show_new_http_modal: false,
+            focus_new_http_url: false,
             new_http_url: String::new(),
             new_http_filename: String::new(),
             new_http_dir: settings.default_download_dir.to_string_lossy().to_string(),
@@ -343,6 +345,7 @@ impl VortexApp {
 
         if accent_button(ui, "+ Novo Download", theme).clicked() {
             self.show_new_http_modal = true;
+            self.focus_new_http_url = true;
         }
         if ui
             .button("LinkGrabber")
@@ -1455,9 +1458,14 @@ impl VortexApp {
                     ui.label("URL da Mídia / Vídeo / Stream (.m3u8):");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.media_url)
-                            .desired_width(420.0)
+                            .desired_width(370.0)
                             .hint_text("https://... (página de vídeo, playlist ou stream .m3u8)"),
                     );
+                    if ui.button("Colar").clicked() {
+                        if let Some(txt) = read_clipboard_text() {
+                            self.media_url = txt.trim().to_string();
+                        }
+                    }
                 });
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
@@ -2040,7 +2048,18 @@ impl VortexApp {
             .show(ctx, |ui| {
                 ui.set_min_width(480.0);
                 ui.label("URL (HTTP/HTTPS ou Magnet):");
-                ui.add(egui::TextEdit::singleline(&mut self.new_http_url).desired_width(f32::INFINITY));
+                ui.horizontal(|ui| {
+                    let resp = ui.add(egui::TextEdit::singleline(&mut self.new_http_url).desired_width(410.0));
+                    if self.focus_new_http_url {
+                        resp.request_focus();
+                        self.focus_new_http_url = false;
+                    }
+                    if ui.button("Colar").clicked() {
+                        if let Some(txt) = read_clipboard_text() {
+                            self.new_http_url = txt.trim().to_string();
+                        }
+                    }
+                });
 
                 ui.label("Nome do arquivo (opcional — detectado via servidor):");
                 ui.add(egui::TextEdit::singleline(&mut self.new_http_filename).desired_width(f32::INFINITY));
@@ -2366,6 +2385,10 @@ fn color_row(ui: &mut Ui, label: &str, rgba: &mut [u8; 4]) -> bool {
         ui.label(label);
     });
     changed
+}
+
+fn read_clipboard_text() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get_text().ok()
 }
 
 fn extractor_display_name(id: &str, list: &[ExtractorProfile]) -> String {

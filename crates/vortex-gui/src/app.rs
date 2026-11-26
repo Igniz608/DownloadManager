@@ -357,7 +357,7 @@ impl VortexApp {
             .show(ui, |ui| {
                 let avail_w = ui.available_width();
                 let scale = theme.font_scale.clamp(0.8, 1.4);
-                let single_row_needed = 1090.0 * scale;
+                let single_row_needed = 1190.0 * scale;
 
                 if avail_w >= single_row_needed {
                     ui.horizontal(|ui| {

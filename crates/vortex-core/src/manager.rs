@@ -578,6 +578,7 @@ impl DownloadManager {
                         g.push(link);
                     }
                 }
+                sort_grabbed_links(&mut g);
             }
             mgr.grabber_probe_count.fetch_sub(1, Ordering::Relaxed);
             mgr.push_notice(format!("{count} link(s) analisados no LinkGrabber."));
@@ -1700,5 +1701,67 @@ impl DownloadManager {
             .yt_dlp_path
             .ok_or_else(|| anyhow!("yt-dlp não encontrado. Instale com 1 clique na aba Mídia ou Configurações."))?;
         probe_media_url(&yt_dlp, url, &HashMap::new()).await
+    }
+}
+
+fn grabbed_link_sort_tier(link: &GrabbedLink) -> u8 {
+    let has_size = link.size_bytes.is_some_and(|s| s > 0);
+    match (has_size, link.online) {
+        (true, Some(false)) => 1,
+        (true, _) => 0,
+        (false, Some(true)) => 2,
+        (false, None) => 3,
+        (false, Some(false)) => 4,
+    }
+}
+
+fn sort_grabbed_links(links: &mut [GrabbedLink]) {
+    links.sort_by_key(grabbed_link_sort_tier);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_link(name: &str, size_bytes: Option<u64>, online: Option<bool>) -> GrabbedLink {
+        GrabbedLink {
+            id: Uuid::new_v4(),
+            url: format!("https://example.com/{name}"),
+            filename: name.to_string(),
+            size_bytes,
+            online,
+            probing: false,
+            supports_ranges: false,
+            category: FileCategory::Archive,
+            package_key: None,
+            part_number: None,
+            part_total: None,
+            selected: true,
+            headers: HashMap::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn sorts_sized_links_to_top_preserving_order() {
+        let mut links = vec![
+            mk_link("no_size_online", None, Some(true)),
+            mk_link("offline_no_size", None, Some(false)),
+            mk_link("part1_sized", Some(5_000_000_000), Some(true)),
+            mk_link("zero_size_online", Some(0), Some(true)),
+            mk_link("part2_sized", Some(3_380_000_000), Some(true)),
+        ];
+        sort_grabbed_links(&mut links);
+        let names: Vec<&str> = links.iter().map(|l| l.filename.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "part1_sized",
+                "part2_sized",
+                "no_size_online",
+                "zero_size_online",
+                "offline_no_size",
+            ]
+        );
     }
 }

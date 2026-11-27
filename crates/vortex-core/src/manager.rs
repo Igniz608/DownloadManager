@@ -887,7 +887,7 @@ impl DownloadManager {
                     }
                     kept_count += 1;
                     if !g.iter().any(|existing| existing.url == link.url) {
-                        link.selected = is_valid_grabbed_link(&link);
+                        link.selected = false;
                         g.push(link);
                     }
                 }
@@ -1023,7 +1023,6 @@ impl DownloadManager {
                             }
                             link.online = if same_page_retry { None } else { Some(true) };
                             link.error = None;
-                            link.selected = !same_page_retry;
                             link.probing = true;
                             out.push((
                                 link.id,
@@ -1091,7 +1090,6 @@ impl DownloadManager {
                                 for (k, v) in first.headers {
                                     link.headers.entry(k).or_insert(v);
                                 }
-                                link.selected = is_valid_grabbed_link(link);
                             }
                         }
                         assign_package_totals(&mut g);
@@ -3031,7 +3029,7 @@ mod tests {
             "https://cdn.vikingfile.com/dl/token123/game.part1.rar"
         );
         assert_eq!(updated1.online, Some(true));
-        assert!(updated1.selected);
+        assert!(!updated1.selected);
         assert_eq!(updated1.error, None);
         assert_eq!(
             updated1.headers.get("User-Agent").map(String::as_str),
@@ -3061,7 +3059,7 @@ mod tests {
         let updated = links.iter().find(|l| l.id == l1.id).unwrap();
         assert_eq!(updated.url, "https://cdn.vik1ngf1le.online/dl/xyz/fix.rar");
         assert_eq!(updated.online, Some(true));
-        assert!(updated.selected);
+        assert!(!updated.selected);
     }
 
     #[test]

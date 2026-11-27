@@ -217,6 +217,12 @@ function isVikingFileHost(hostname) {
   return /(?:^|\.)v[i1]k[i1]ngf[i1]le\.[a-z0-9-]+$/i.test(String(hostname || ""));
 }
 
+function isFileDitchHost(hostname) {
+  return /(?:^|\.)(?:fileditch|fileditchfiles|fileditchvids|itsfileditchfiles|fileditchhot|theditch|embedditch)\.[a-z0-9-]+$/i.test(
+    String(hostname || "")
+  );
+}
+
 function browserPageUrlMatches(linkUrl, reportedPageUrl) {
   const a = normalizeBrowserPageUrl(linkUrl);
   const b = normalizeBrowserPageUrl(reportedPageUrl);
@@ -228,6 +234,15 @@ function browserPageUrlMatches(linkUrl, reportedPageUrl) {
       const pa = ua.pathname.replace(/\/+$/, "");
       const pb = ub.pathname.replace(/\/+$/, "");
       return Boolean(pa) && pa === pb && ua.search === ub.search;
+    }
+    if (isFileDitchHost(ua.hostname) && isFileDitchHost(ub.hostname)) {
+      const pa = ua.pathname.replace(/\/+$/, "");
+      const pb = ub.pathname.replace(/\/+$/, "");
+      const sa = new URLSearchParams(ua.search);
+      const sb = new URLSearchParams(ub.search);
+      sa.delete("fdg");
+      sb.delete("fdg");
+      return Boolean(pa) && pa === pb && sa.toString() === sb.toString();
     }
   } catch (_) {}
   return false;

@@ -19,7 +19,7 @@ use crate::model::{
 };
 use crate::package_grabber::{
     assign_package_totals, detect_multipart, extract_urls_from_text, fallback_filename_from_url,
-    find_missing_parts, is_html_probe, is_vikingfile_host, probe_grabbed_links,
+    find_missing_parts, is_fileditch_host, is_html_probe, is_vikingfile_host, probe_grabbed_links,
     resolve_indirect_http_url, sanitize_filename,
 };
 use crate::state::{PersistedState, load_settings, load_state, save_settings, save_state};
@@ -1136,11 +1136,11 @@ impl DownloadManager {
                     "Link resolvido no navegador! Avançando ({remaining} restante(s))..."
                 ));
             } else {
-                self.push_notice("Links Turnstile resolvidos no LinkGrabber!".to_string());
+                self.push_notice("Links resolvidos no LinkGrabber!".to_string());
             }
         } else if matched && remaining > 0 {
             self.push_notice(format!(
-                "Falha em 1 link Turnstile; avançando ({remaining} restante(s))..."
+                "Falha em 1 link; avançando ({remaining} restante(s))..."
             ));
         }
 
@@ -2494,6 +2494,21 @@ pub fn browser_page_url_matches(link_url: &str, reported_page_url: &str) -> bool
                 let pb = ub.path().trim_end_matches('/');
                 return !pa.is_empty() && pa == pb && ua.query() == ub.query();
             }
+            if is_fileditch_host(ha) && is_fileditch_host(hb) {
+                let pa = ua.path().trim_end_matches('/');
+                let pb = ub.path().trim_end_matches('/');
+                let qa: Vec<(String, String)> = ua
+                    .query_pairs()
+                    .filter(|(k, _)| k != "fdg")
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                let qb: Vec<(String, String)> = ub
+                    .query_pairs()
+                    .filter(|(k, _)| k != "fdg")
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                return !pa.is_empty() && pa == pb && qa == qb;
+            }
         }
     }
     false
@@ -2515,7 +2530,13 @@ pub fn is_browser_resolvable_link(link: &GrabbedLink) -> bool {
     }
     link.error.as_deref().is_some_and(|e| {
         let low = e.to_ascii_lowercase();
-        low.contains("turnstile") || low.contains("cloudflare") || low.contains("captcha")
+        low.contains("turnstile")
+            || low.contains("cloudflare")
+            || low.contains("captcha")
+            || low.contains("verificação")
+            || low.contains("resolver no vortex")
+            || low.contains("resolver no navegador")
+            || low.contains("wasm")
     })
 }
 
@@ -2938,6 +2959,25 @@ mod tests {
         let mut cf = mk_link("archive.rar", None, Some(false));
         cf.error = Some("FileDitch protegido por Cloudflare".into());
         assert!(is_browser_resolvable_link(&cf));
+
+        let mut fd_pow = mk_link("game.part1.rar", Some(5_368_709_120), Some(false));
+        fd_pow.url = "https://itsfileditchfiles.st/alpha43/abc/game.part1.rar".into();
+        fd_pow.source_site = Some("FileDitch".into());
+        fd_pow.error = Some(
+            "FileDitch exige verificação automática no navegador — clique em 'Resolver no Vortex' ou 'Resolver no Navegador'".into(),
+        );
+        assert!(is_browser_resolvable_link(&fd_pow));
+
+        let mut fd_dead = mk_link("dead.part1.rar", None, Some(false));
+        fd_dead.url = "https://itsfileditchfiles.st/alpha43/dead/dead.part1.rar".into();
+        fd_dead.source_site = Some("FileDitch".into());
+        fd_dead.error = Some("Arquivo removido ou expirado no FileDitch".into());
+        assert!(!is_browser_resolvable_link(&fd_dead));
+
+        assert!(browser_page_url_matches(
+            "https://itsfileditchfiles.st/alpha43/abc/game.part1.rar",
+            "https://itsfileditchfiles.st/alpha43/abc/game.part1.rar?fdg=1#vortex_resolve"
+        ));
 
         let regular_dead = mk_link("dead.rar", None, Some(false));
         assert!(!is_browser_resolvable_link(&regular_dead));

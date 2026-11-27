@@ -199,26 +199,31 @@ pub fn is_vikingfile_host(host: &str) -> bool {
     })
 }
 
+pub fn is_fileditch_host(host: &str) -> bool {
+    [
+        "fileditch.com",
+        "fileditchfiles.me",
+        "fileditchfiles.st",
+        "fileditchvids.st",
+        "itsfileditchfiles.st",
+        "fileditchhot.st",
+        "theditch.st",
+        "embedditch.st",
+    ]
+    .iter()
+    .any(|d| host_matches(host, d))
+}
+
 pub fn classify_source_site(url_str: &str) -> Option<String> {
     if url_str.starts_with("magnet:?") {
         return Some("Magnet".to_string());
     }
     let parsed = url::Url::parse(url_str).ok()?;
     let host = parsed.host_str()?.to_ascii_lowercase();
+    if is_fileditch_host(&host) {
+        return Some("FileDitch".to_string());
+    }
     let known: &[(&[&str], &str)] = &[
-        (
-            &[
-                "fileditch.com",
-                "fileditchfiles.me",
-                "fileditchfiles.st",
-                "fileditchvids.st",
-                "itsfileditchfiles.st",
-                "fileditchhot.st",
-                "theditch.st",
-                "embedditch.st",
-            ],
-            "FileDitch",
-        ),
         (&["filekeeper.net"], "FileKeeper"),
         (&["pixeldrain.com"], "Pixeldrain"),
         (&["gofile.io"], "Gofile"),
@@ -262,18 +267,10 @@ pub fn classify_source_site(url_str: &str) -> Option<String> {
 }
 
 fn is_known_file_hoster_host(host: &str) -> bool {
-    if is_vikingfile_host(host) {
+    if is_vikingfile_host(host) || is_fileditch_host(host) {
         return true;
     }
     [
-        "fileditch.com",
-        "fileditchfiles.me",
-        "fileditchfiles.st",
-        "fileditchvids.st",
-        "itsfileditchfiles.st",
-        "fileditchhot.st",
-        "theditch.st",
-        "embedditch.st",
         "pixeldrain.com",
         "gofile.io",
         "vikingfile.com",
@@ -403,6 +400,15 @@ fn is_cloudflare_challenge(html: &str) -> bool {
     let low = html.to_ascii_lowercase();
     (low.contains("just a moment...") || low.contains("cf-browser-verification"))
         && (low.contains("cloudflare") || low.contains("turnstile"))
+}
+
+fn is_fileditch_pow_challenge(html: &str) -> bool {
+    let low = html.to_ascii_lowercase();
+    low.contains("powwasm.js")
+        || low.contains("verifying-overlay")
+        || low.contains("verification can&#039;t run")
+        || low.contains("verification can't run")
+        || low.contains("webassembly is disabled")
 }
 
 fn extract_html_download_candidates(base_url: &str, html: &str) -> Vec<(i32, String)> {
@@ -1275,12 +1281,7 @@ async fn try_special_hoster_resolve(
     }
 
     // FileDitch Status API for direct path-style links (/<folder>/<id>/<filename>)
-    if (host_matches(&host, "fileditchfiles.st")
-        || host_matches(&host, "fileditchfiles.me")
-        || host_matches(&host, "itsfileditchfiles.st")
-        || host_matches(&host, "fileditchvids.st")
-        || host_matches(&host, "fileditchhot.st")
-        || host_matches(&host, "embedditch.st"))
+    if is_fileditch_host(&host)
         && segs.len() >= 3
         && !parsed.path().contains("file.php")
     {
@@ -1297,6 +1298,7 @@ async fn try_special_hoster_resolve(
                 .unwrap_or_else(|| (*s).to_string())
         });
         let mut hint_size = None;
+        let mut api_status_true = false;
         if let Ok(resp) = client
             .get(&api_url)
             .header("User-Agent", BROWSER_UA)
@@ -1317,6 +1319,9 @@ async fn try_special_hoster_resolve(
                         ),
                     ]));
                 }
+                if val.get("status").and_then(|s| s.as_bool()) == Some(true) {
+                    api_status_true = true;
+                }
                 hint_size = val.get("size").and_then(|s| s.as_u64());
             }
         }
@@ -1334,18 +1339,59 @@ async fn try_special_hoster_resolve(
                 )]));
             }
         }
-        if let Ok((page_url, html)) = fetch_html_limited(client, url, &dl_headers).await {
-            let cands = extract_html_download_candidates(&page_url, &html);
-            if let Some((_, best)) = cands.into_iter().next() {
-                dl_headers.insert("Referer".to_string(), page_url);
-                return Some(SpecialResolveOutcome::DirectCandidates(vec![(
-                    best,
-                    dl_headers,
-                    hint_name,
-                    hint_size,
-                )]));
+        match fetch_html_limited(client, url, &dl_headers).await {
+            Ok((page_url, html)) => {
+                let cands = extract_html_download_candidates(&page_url, &html);
+                if let Some((_, best)) = cands.into_iter().next() {
+                    dl_headers.insert("Referer".to_string(), page_url);
+                    return Some(SpecialResolveOutcome::DirectCandidates(vec![(
+                        best,
+                        dl_headers,
+                        hint_name,
+                        hint_size,
+                    )]));
+                }
+                if is_fileditch_pow_challenge(&html) {
+                    return Some(SpecialResolveOutcome::StaticLinks(vec![
+                        build_static_error_link(
+                            url.to_string(),
+                            hint_name.unwrap_or_else(|| fallback_filename_from_url(url)),
+                            hint_size,
+                            Some("FileDitch".to_string()),
+                            headers.clone(),
+                            "FileDitch exige verificação automática no navegador — clique em 'Resolver no Vortex' ou 'Resolver no Navegador'"
+                                .to_string(),
+                        ),
+                    ]));
+                }
+                if is_cloudflare_challenge(&html) {
+                    return Some(SpecialResolveOutcome::StaticLinks(vec![
+                        build_static_error_link(
+                            url.to_string(),
+                            hint_name.unwrap_or_else(|| fallback_filename_from_url(url)),
+                            hint_size,
+                            Some("FileDitch".to_string()),
+                            headers.clone(),
+                            "FileDitch protegido por Cloudflare — clique em 'Resolver no Vortex' ou 'Resolver no Navegador'"
+                                .to_string(),
+                        ),
+                    ]));
+                }
+                if api_status_true || hint_size.is_some() {
+                    return Some(SpecialResolveOutcome::StaticLinks(vec![
+                        build_static_error_link(
+                            url.to_string(),
+                            hint_name.unwrap_or_else(|| fallback_filename_from_url(url)),
+                            hint_size,
+                            Some("FileDitch".to_string()),
+                            headers.clone(),
+                            "FileDitch exige verificação no navegador — clique em 'Resolver no Vortex' ou 'Resolver no Navegador'"
+                                .to_string(),
+                        ),
+                    ]));
+                }
             }
-            if is_cloudflare_challenge(&html) {
+            Err(_) if api_status_true || hint_size.is_some() => {
                 return Some(SpecialResolveOutcome::StaticLinks(vec![
                     build_static_error_link(
                         url.to_string(),
@@ -1353,11 +1399,12 @@ async fn try_special_hoster_resolve(
                         hint_size,
                         Some("FileDitch".to_string()),
                         headers.clone(),
-                        "FileDitch protegido por Cloudflare — clique em 'Resolver no Navegador' ou Download no site"
+                        "FileDitch bloqueou a leitura direta — clique em 'Resolver no Vortex' ou 'Resolver no Navegador'"
                             .to_string(),
                     ),
                 ]));
             }
+            Err(_) => {}
         }
     }
 
@@ -1481,9 +1528,11 @@ pub async fn resolve_indirect_http_url(
             break;
         };
         let candidates = extract_html_download_candidates(&page_url, &html);
-        if candidates.is_empty() && is_cloudflare_challenge(&html) {
+        if candidates.is_empty()
+            && (is_cloudflare_challenge(&html) || is_fileditch_pow_challenge(&html))
+        {
             return Err(anyhow::anyhow!(
-                "Protegido por Cloudflare/Captcha — abra no navegador e clique para capturar pela extensão"
+                "Protegido por verificação/Captcha no navegador — clique em 'Resolver no Vortex' ou 'Resolver no Navegador'"
             ));
         }
 
@@ -2094,5 +2143,44 @@ mod tests {
         );
         assert_eq!(wt1.len(), 64);
         assert_eq!(wt1, wt2);
+    }
+
+    #[test]
+    fn detects_fileditch_pow_gate_and_purple_download_button() {
+        let pow_html = r#"
+            <html><body>
+              <div class="verifying-overlay"><div class="spinner"></div><p>Verifying your browser…</p></div>
+              <form method="POST"><input type="hidden" name="x" value="1"></form>
+              <script type="module">import { run } from "https://fileditchassets.b-cdn.net/pow/0e2e2529da/powwasm.js";</script>
+            </body></html>
+        "#;
+        assert!(is_fileditch_pow_challenge(pow_html));
+        assert!(
+            extract_html_download_candidates(
+                "https://itsfileditchfiles.st/alpha43/a163/game.part1.rar?fdg=1",
+                pow_html
+            )
+            .is_empty()
+        );
+
+        let unlocked_html = r#"
+            <html><body>
+              <div class="controls">
+                <a class="btn btn-main" href="https://lumiskipssugardaily.xyz/MTc5NTc3MDgwMTphYmM=/game.part1.rar">↓ Baixar</a>
+                <a class="btn btn-alt" href="/report">Denunciar</a>
+                <a class="btn btn-dlcopy" href="https://lumiskipssugardaily.xyz/MTc5NTc3MDgwMTphYmM=/game.part1.rar">Copiar link de download para JDownloader / FDM</a>
+              </div>
+            </body></html>
+        "#;
+        assert!(!is_fileditch_pow_challenge(unlocked_html));
+        let cands = extract_html_download_candidates(
+            "https://itsfileditchfiles.st/alpha43/a163/game.part1.rar",
+            unlocked_html,
+        );
+        assert!(!cands.is_empty());
+        assert_eq!(
+            cands[0].1,
+            "https://lumiskipssugardaily.xyz/MTc5NTc3MDgwMTphYmM=/game.part1.rar"
+        );
     }
 }

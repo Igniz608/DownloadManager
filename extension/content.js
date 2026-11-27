@@ -1309,10 +1309,97 @@
     );
   }
 
+  function isFileDitchHost(hostname) {
+    return /(?:^|\.)(?:fileditch|fileditchfiles|fileditchvids|itsfileditchfiles|fileditchhot|theditch|embedditch)\.[a-z0-9-]+$/i.test(
+      String(hostname || "")
+    );
+  }
+
+  function isFileDitchPage() {
+    if (isFileDitchHost(window.location.hostname)) return true;
+    const brand = (document.querySelector("a.brand, .brand")?.textContent || "").trim();
+    return /^FILEDITCH\b/i.test(brand);
+  }
+
+  function isFileDitchVerifying() {
+    const overlay = document.querySelector(".verifying-overlay");
+    if (overlay) {
+      try {
+        const st = window.getComputedStyle(overlay);
+        if (!st || (st.display !== "none" && st.visibility !== "hidden")) return true;
+      } catch (_) {
+        return true;
+      }
+    }
+    return Boolean(document.querySelector('script[src*="powwasm"]'));
+  }
+
+  function isValidFileDitchTarget(raw, cleanPageUrl) {
+    const s = String(raw || "").trim();
+    if (!s || s === "#" || s.startsWith("javascript:") || s.startsWith("mailto:")) return false;
+    if (!/^https?:\/\//i.test(s)) return false;
+    if (s.split("#")[0] === cleanPageUrl) return false;
+    if (/\/(?:report|dmca|plans|pricing|login|register|terms|privacy|tos)(?:[/?#]|$)/i.test(s)) {
+      return false;
+    }
+    return true;
+  }
+
+  function findFileDitchDownloadUrl(cleanPageUrl) {
+    const prioritySelectors = [
+      ".controls a.btn-main[href]",
+      "a.btn.btn-main[href]",
+      ".controls a.btn-dlcopy[href]",
+      "a.btn-dlcopy[href]",
+      ".controls [data-clipboard-text]",
+      ".controls [data-url]",
+      ".controls [data-href]",
+      ".btn-dlcopy[data-clipboard-text]",
+      ".btn-dlcopy[data-url]",
+    ];
+    for (const sel of prioritySelectors) {
+      const els = document.querySelectorAll(sel);
+      for (const el of els) {
+        const txt = (el.textContent || "").toLowerCase();
+        if (
+          txt.includes("denunciar") ||
+          txt.includes("report") ||
+          txt.includes("planos") ||
+          txt.includes("pricing")
+        ) {
+          continue;
+        }
+        const candidate =
+          el.tagName === "A"
+            ? el.getAttribute("href")
+              ? el.href
+              : ""
+            : el.getAttribute("data-clipboard-text") ||
+              el.getAttribute("data-url") ||
+              el.getAttribute("data-href") ||
+              "";
+        if (isValidFileDitchTarget(candidate, cleanPageUrl)) {
+          return candidate.trim();
+        }
+      }
+    }
+    const anchors = document.querySelectorAll(".controls a[href]");
+    for (const a of anchors) {
+      if (a.classList.contains("btn-alt")) continue;
+      const txt = (a.textContent || "").toLowerCase();
+      if (txt.includes("denunciar") || txt.includes("report")) continue;
+      const rawAttr = (a.getAttribute("href") || "").trim();
+      if (rawAttr && isValidFileDitchTarget(a.href, cleanPageUrl)) {
+        return a.href.trim();
+      }
+    }
+    return null;
+  }
+
   function initBrowserHosterResolver() {
     if (window.top !== window) return;
     const isAutoResolve = window.location.hash.includes("vortex_resolve");
-    if (!isAutoResolve && !isVikingFilePage()) {
+    if (!isAutoResolve && !isVikingFilePage() && !isFileDitchPage()) {
       if (document.readyState === "loading") {
         document.addEventListener("DOMContentLoaded", initBrowserHosterResolver, { once: true });
       }
@@ -1342,8 +1429,60 @@
         }
       };
 
+      const submitResolvedUrl = (resolvedHref, filename) => {
+        resolved = true;
+        cleanup();
+        showMagnetToast("Link capturado, enviando ao VortexDL...", "pending", 0);
+        try {
+          chrome.runtime.sendMessage(
+            {
+              type: "BROWSER_RESOLVED_LINK",
+              pageUrl: cleanPageUrl,
+              directUrl: resolvedHref,
+              filename: filename || null,
+              userAgent: navigator.userAgent,
+              isAutoResolve,
+            },
+            (resp) => {
+              if (chrome.runtime.lastError || !resp || !resp.ok) {
+                showMagnetToast(
+                  resp?.error || "VortexDL não respondeu ao envio do link",
+                  "err",
+                  4500
+                );
+                return;
+              }
+              if (resp.next_url) {
+                showMagnetToast(
+                  `Link capturado! Abrindo próximo (${resp.remaining} restante(s))...`,
+                  "ok",
+                  4000
+                );
+              } else {
+                showMagnetToast("Link capturado no VortexDL!", "ok", 3000);
+              }
+            }
+          );
+        } catch (_) {
+          showMagnetToast("Falha ao comunicar com extensão VortexDL", "err", 4000);
+        }
+      };
+
       const checkDownloadLink = () => {
         if (resolved) return;
+
+        if (isFileDitchPage()) {
+          if (isFileDitchVerifying()) {
+            showMagnetToast("VortexDL: aguardando verificação do FileDitch...", "pending", 0);
+            return;
+          }
+          const fdUrl = findFileDitchDownloadUrl(cleanPageUrl);
+          if (fdUrl) {
+            submitResolvedUrl(fdUrl, null);
+            return;
+          }
+        }
+
         const dlEl = document.getElementById("download-link");
         if (!dlEl) return;
 
@@ -1353,43 +1492,8 @@
           rawAttr && rawAttr !== "#" && !rawAttr.startsWith("javascript:") ? dlEl.href : "";
 
         if (resolvedHref && /^https?:\/\//i.test(resolvedHref) && !/^Error\s*:/i.test(text)) {
-          resolved = true;
-          cleanup();
           const filename = (document.getElementById("filename")?.textContent || "").trim();
-          showMagnetToast("Link capturado, enviando ao VortexDL...", "pending", 0);
-          try {
-            chrome.runtime.sendMessage(
-              {
-                type: "BROWSER_RESOLVED_LINK",
-                pageUrl: cleanPageUrl,
-                directUrl: resolvedHref,
-                filename,
-                userAgent: navigator.userAgent,
-                isAutoResolve,
-              },
-              (resp) => {
-                if (chrome.runtime.lastError || !resp || !resp.ok) {
-                  showMagnetToast(
-                    resp?.error || "VortexDL não respondeu ao envio do link",
-                    "err",
-                    4500
-                  );
-                  return;
-                }
-                if (resp.next_url) {
-                  showMagnetToast(
-                    `Link capturado! Abrindo próximo (${resp.remaining} restante(s))...`,
-                    "ok",
-                    4000
-                  );
-                } else {
-                  showMagnetToast("Link capturado no VortexDL!", "ok", 3000);
-                }
-              }
-            );
-          } catch (_) {
-            showMagnetToast("Falha ao comunicar com extensão VortexDL", "err", 4000);
-          }
+          submitResolvedUrl(resolvedHref, filename);
           return;
         }
 
@@ -1408,7 +1512,13 @@
         }
       };
 
-      showMagnetToast("VortexDL: aguardando Turnstile do VikingFile...", "pending", 0);
+      showMagnetToast(
+        isFileDitchPage()
+          ? "VortexDL: aguardando verificação do FileDitch..."
+          : "VortexDL: aguardando Turnstile do VikingFile...",
+        "pending",
+        0
+      );
       hintTimer = setTimeout(() => {
         if (!resolved && document.getElementById("captcha-download")) {
           showMagnetToast(

@@ -79,6 +79,77 @@ const INIT_SCRIPT: &str = r####"
     return Boolean(document.getElementById("captcha-download") && document.getElementById("download-link"));
   }
 
+  function isFileDitchPage() {
+    const host = (window.location.hostname || "").toLowerCase();
+    if (/(?:^|\.)(?:fileditch|fileditchfiles|fileditchvids|itsfileditchfiles|fileditchhot|theditch|embedditch)\.[a-z0-9-]+$/i.test(host)) {
+      return true;
+    }
+    const brand = (document.querySelector("a.brand, .brand")?.textContent || "").trim();
+    return /^FILEDITCH\b/i.test(brand);
+  }
+
+  function isFileDitchVerifying() {
+    const overlay = document.querySelector(".verifying-overlay");
+    if (overlay) {
+      try {
+        const st = window.getComputedStyle(overlay);
+        if (!st || (st.display !== "none" && st.visibility !== "hidden")) return true;
+      } catch (_) {
+        return true;
+      }
+    }
+    return Boolean(document.querySelector('script[src*="powwasm"]'));
+  }
+
+  function isValidFileDitchTarget(raw) {
+    const s = String(raw || "").trim();
+    if (!s || s === "#" || s.startsWith("javascript:") || s.startsWith("mailto:")) return false;
+    if (!/^https?:\/\//i.test(s)) return false;
+    if (s.split("#")[0] === cleanUrl()) return false;
+    if (/\/(?:report|dmca|plans|pricing|login|register|terms|privacy|tos)(?:[/?#]|$)/i.test(s)) return false;
+    return true;
+  }
+
+  function findFileDitchDownloadUrl() {
+    const prioritySelectors = [
+      ".controls a.btn-main[href]",
+      "a.btn.btn-main[href]",
+      ".controls a.btn-dlcopy[href]",
+      "a.btn-dlcopy[href]",
+      ".controls [data-clipboard-text]",
+      ".controls [data-url]",
+      ".controls [data-href]",
+      ".btn-dlcopy[data-clipboard-text]",
+      ".btn-dlcopy[data-url]"
+    ];
+    for (const sel of prioritySelectors) {
+      const els = document.querySelectorAll(sel);
+      for (const el of els) {
+        const txt = (el.textContent || "").toLowerCase();
+        if (txt.includes("denunciar") || txt.includes("report") || txt.includes("planos") || txt.includes("pricing")) {
+          continue;
+        }
+        const candidate = el.tagName === "A"
+          ? (el.getAttribute("href") ? el.href : "")
+          : (el.getAttribute("data-clipboard-text") || el.getAttribute("data-url") || el.getAttribute("data-href") || "");
+        if (isValidFileDitchTarget(candidate)) {
+          return candidate.trim();
+        }
+      }
+    }
+    const anchors = document.querySelectorAll(".controls a[href]");
+    for (const a of anchors) {
+      if (a.classList.contains("btn-alt")) continue;
+      const txt = (a.textContent || "").toLowerCase();
+      if (txt.includes("denunciar") || txt.includes("report")) continue;
+      const rawAttr = (a.getAttribute("href") || "").trim();
+      if (rawAttr && isValidFileDitchTarget(a.href)) {
+        return a.href.trim();
+      }
+    }
+    return null;
+  }
+
   function isChallengePage() {
     const title = (document.title || "").toLowerCase();
     if (title.includes("just a moment") || title.includes("attention required")) return true;
@@ -226,6 +297,39 @@ const INIT_SCRIPT: &str = r####"
         });
         return;
       }
+    }
+
+    if (isFileDitchPage()) {
+      if (isChallengePage()) {
+        sawChallenge = true;
+        if (autoCaptureTimer) {
+          clearTimeout(autoCaptureTimer);
+          autoCaptureTimer = null;
+        }
+        setStatus("VortexDL: marque a verificação humana acima...");
+      } else if (isFileDitchVerifying()) {
+        if (autoCaptureTimer) {
+          clearTimeout(autoCaptureTimer);
+          autoCaptureTimer = null;
+        }
+        setStatus("VortexDL: aguardando verificação automática do FileDitch...");
+      } else {
+        const fdUrl = findFileDitchDownloadUrl();
+        if (fdUrl) {
+          resolved = true;
+          setStatus("Link do FileDitch capturado! Enviando ao VortexDL...");
+          sendIpc({
+            type: "resolved",
+            page_url: cleanUrl(),
+            direct_url: fdUrl,
+            filename: null,
+            user_agent: navigator.userAgent
+          });
+          return;
+        }
+        setStatus("VortexDL: aguardando botão de download do FileDitch...");
+      }
+      return;
     }
 
     if (!isVikingFilePage()) {

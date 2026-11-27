@@ -420,7 +420,7 @@ impl BrowserKind {
             BrowserKind::Brave => "Brave",
             BrowserKind::Vivaldi => "Vivaldi",
             BrowserKind::Opera => "Opera / Opera GX",
-            BrowserKind::Firefox => "Mozilla Firefox",
+            BrowserKind::Firefox => "Firefox / Zen",
         }
     }
 
@@ -446,7 +446,8 @@ impl BrowserKind {
             "brave" => Some(BrowserKind::Brave),
             "vivaldi" => Some(BrowserKind::Vivaldi),
             "opera" | "operagx" | "opera-gx" => Some(BrowserKind::Opera),
-            "firefox" | "mozilla-firefox" => Some(BrowserKind::Firefox),
+            "firefox" | "mozilla-firefox" | "zen" | "zen-browser" | "floorp" | "librewolf"
+            | "waterfox" => Some(BrowserKind::Firefox),
             _ => None,
         }
     }
@@ -540,9 +541,20 @@ pub fn detect_installed_browsers() -> Vec<DetectedBrowser> {
             ),
             (
                 BrowserKind::Firefox,
-                &["firefox.exe"],
+                &[
+                    "firefox.exe",
+                    "zen.exe",
+                    "floorp.exe",
+                    "librewolf.exe",
+                    "waterfox.exe",
+                ],
                 &[
                     r"Mozilla Firefox\firefox.exe",
+                    r"Zen Browser\zen.exe",
+                    r"Programs\Zen Browser\zen.exe",
+                    r"Ablaze Floorp\floorp.exe",
+                    r"LibreWolf\librewolf.exe",
+                    r"Waterfox\waterfox.exe",
                 ],
             ),
         ];
@@ -632,7 +644,7 @@ pub fn open_firefox_xpi_installer(anchor_exe: Option<&Path>) -> Result<PathBuf> 
             .spawn()?;
         return Ok(xpi_path);
     }
-    anyhow::bail!("Mozilla Firefox não encontrado no sistema");
+    anyhow::bail!("Firefox / Zen Browser não encontrado no sistema");
 }
 
 pub fn open_browser_extensions_page(kind: BrowserKind) -> Result<()> {
@@ -879,8 +891,13 @@ mod tests {
     #[test]
     fn browser_kind_parses_comma_lists_and_all() {
         assert_eq!(
-            BrowserKind::parse_list("chrome, Edge ,opera-gx,unknown,chrome"),
-            vec![BrowserKind::Chrome, BrowserKind::Edge, BrowserKind::Opera]
+            BrowserKind::parse_list("chrome, Edge ,opera-gx,zen,unknown,chrome"),
+            vec![
+                BrowserKind::Chrome,
+                BrowserKind::Edge,
+                BrowserKind::Opera,
+                BrowserKind::Firefox
+            ]
         );
         assert_eq!(BrowserKind::parse_list("all").len(), BrowserKind::ALL.len());
     }

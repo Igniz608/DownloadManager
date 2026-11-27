@@ -3050,20 +3050,20 @@ impl VortexApp {
                     if ui
                         .add_enabled(
                             firefox_xpi_path.is_some(),
-                            egui::Button::new("Instalar no Firefox (.xpi)").small(),
+                            egui::Button::new("Instalar no Firefox / Zen (.xpi)").small(),
                         )
                         .clicked()
                     {
                         match open_firefox_xpi_installer(Some(&gui_exe)) {
                             Ok(path) => {
                                 self.ext_reg_status = Some(format!(
-                                    "Instalador 1-clique aberto no Firefox ({}). Clique em 'Adicionar' no popup.",
+                                    "Instalador 1-clique aberto ({}). Clique em 'Adicionar' no popup.",
                                     path.display()
                                 ));
                             }
                             Err(e) => {
                                 self.ext_reg_status =
-                                    Some(format!("Erro ao abrir .xpi no Firefox: {e}"));
+                                    Some(format!("Erro ao abrir .xpi: {e}"));
                             }
                         }
                     }

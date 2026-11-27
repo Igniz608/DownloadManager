@@ -139,14 +139,18 @@ begin
   HasBrave   := IsBrowserInstalled('brave.exe',   'BraveSoftware\Brave-Browser\Application\brave.exe', '');
   HasVivaldi := IsBrowserInstalled('vivaldi.exe', 'Vivaldi\Application\vivaldi.exe', '');
   HasOpera   := IsBrowserInstalled('opera.exe',   'Programs\Opera\opera.exe', 'Programs\Opera GX\opera.exe');
-  HasFirefox := IsBrowserInstalled('firefox.exe', 'Mozilla Firefox\firefox.exe', '');
+  HasFirefox := IsBrowserInstalled('firefox.exe', 'Mozilla Firefox\firefox.exe', '') or
+                IsBrowserInstalled('zen.exe',     'Zen Browser\zen.exe', 'Programs\Zen Browser\zen.exe') or
+                IsBrowserInstalled('floorp.exe',  'Ablaze Floorp\floorp.exe', '') or
+                IsBrowserInstalled('librewolf.exe', 'LibreWolf\librewolf.exe', '') or
+                IsBrowserInstalled('waterfox.exe', 'Waterfox\waterfox.exe', '');
 
   if HasChrome then BrowserPage.Add('Google Chrome (detectado)') else BrowserPage.Add('Google Chrome (não detectado)');
   if HasEdge then BrowserPage.Add('Microsoft Edge (detectado)') else BrowserPage.Add('Microsoft Edge (não detectado)');
   if HasBrave then BrowserPage.Add('Brave (detectado)') else BrowserPage.Add('Brave (não detectado)');
   if HasVivaldi then BrowserPage.Add('Vivaldi (detectado)') else BrowserPage.Add('Vivaldi (não detectado)');
   if HasOpera then BrowserPage.Add('Opera / Opera GX (detectado)') else BrowserPage.Add('Opera / Opera GX (não detectado)');
-  if HasFirefox then BrowserPage.Add('Mozilla Firefox (detectado)') else BrowserPage.Add('Mozilla Firefox (não detectado)');
+  if HasFirefox then BrowserPage.Add('Firefox / Zen Browser (detectado)') else BrowserPage.Add('Firefox / Zen Browser (não detectado)');
 
   BrowserPage.Values[0] := HasChrome;
   BrowserPage.Values[1] := HasEdge;

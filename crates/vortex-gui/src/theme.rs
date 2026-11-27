@@ -59,6 +59,12 @@ pub fn apply_theme(ctx: &egui::Context, theme: &ThemeConfig) {
     visuals.widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
     visuals.widgets.active.corner_radius = cr;
 
+    visuals.widgets.open.bg_fill = bg_hover;
+    visuals.widgets.open.weak_bg_fill = bg_hover;
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0, accent);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.2, text_primary);
+    visuals.widgets.open.corner_radius = cr;
+
     visuals.window_corner_radius = cr;
     visuals.window_stroke = Stroke::new(1.0, border);
     visuals.window_shadow = Shadow {
@@ -90,4 +96,21 @@ pub fn apply_theme(ctx: &egui::Context, theme: &ThemeConfig) {
     };
     ctx.set_style_of(egui_theme, style);
     ctx.set_theme(egui_theme);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_dropdown_visuals_follow_active_theme() {
+        let ctx = egui::Context::default();
+        let theme = ThemeConfig::catppuccin_mocha();
+        apply_theme(&ctx, &theme);
+        let style = ctx.style_of(egui::Theme::Dark);
+        assert_eq!(style.visuals.widgets.open.bg_fill, to_c32(theme.bg_hover));
+        assert_eq!(style.visuals.widgets.open.weak_bg_fill, to_c32(theme.bg_hover));
+        assert_eq!(style.visuals.widgets.open.bg_stroke.color, to_c32(theme.accent));
+        assert_eq!(style.visuals.widgets.open.fg_stroke.color, to_c32(theme.text_primary));
+    }
 }

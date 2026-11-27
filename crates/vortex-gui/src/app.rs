@@ -2437,29 +2437,14 @@ impl VortexApp {
             .corner_radius(CornerRadius::same(theme.corner_radius as u8))
             .inner_margin(Margin::same(12))
             .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    let yt_ok = snap.media_tools.yt_dlp_path.is_some();
-                    let ff_ok = snap.media_tools.ffmpeg_path.is_some();
-                    pill(
-                        ui,
-                        if yt_ok { "yt-dlp: Instalado" } else { "yt-dlp: Não encontrado" },
-                        if yt_ok { to_c32(theme.success) } else { to_c32(theme.warning) },
-                        theme,
-                    );
-                    if ui.button(if yt_ok { "Atualizar yt-dlp" } else { "Instalar yt-dlp (1-clique)" }).clicked() {
-                        self.manager.install_yt_dlp_async();
-                    }
-                    ui.add_space(8.0);
-                    pill(
-                        ui,
-                        if ff_ok { "FFmpeg: Instalado" } else { "FFmpeg: Não encontrado" },
-                        if ff_ok { to_c32(theme.success) } else { to_c32(theme.warning) },
-                        theme,
-                    );
-                    if ui.button(if ff_ok { "Reinstalar FFmpeg" } else { "Instalar FFmpeg (1-clique)" }).clicked() {
-                        self.manager.install_ffmpeg_async();
-                    }
-                });
+                render_media_tools_bar(
+                    ui,
+                    snap.media_tools.yt_dlp_path.is_some(),
+                    snap.media_tools.ffmpeg_path.is_some(),
+                    theme,
+                    || self.manager.install_yt_dlp_async(),
+                    || self.manager.install_ffmpeg_async(),
+                );
             });
 
         ui.add_space(10.0);
@@ -3773,16 +3758,95 @@ fn nav_item(
     }
 }
 
+fn pill_with_size(
+    ui: &mut Ui,
+    text: &str,
+    color: Color32,
+    pad: Vec2,
+    min_height: f32,
+    corner_radius: u8,
+) -> egui::Response {
+    let galley = egui::WidgetText::from(RichText::new(text).small().strong().color(color))
+        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Small);
+    let desired = Vec2::new(galley.size().x + pad.x * 2.0, (galley.size().y + pad.y * 2.0).max(min_height));
+    let (rect, response) = ui.allocate_exact_size(desired, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let bg = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 32);
+        let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 90));
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(corner_radius),
+            bg,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+        let text_pos = egui::pos2(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        );
+        ui.painter().galley(text_pos, galley, color);
+    }
+    response
+}
+
 fn pill(ui: &mut Ui, text: &str, color: Color32, _theme: &ThemeConfig) {
-    let bg = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 32);
-    Frame::new()
-        .fill(bg)
-        .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 90)))
-        .corner_radius(CornerRadius::same(6))
-        .inner_margin(Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).small().strong().color(color));
-        });
+    pill_with_size(ui, text, color, egui::vec2(6.0, 2.0), 0.0, 6);
+}
+
+fn render_media_tools_bar(
+    ui: &mut Ui,
+    yt_ok: bool,
+    ff_ok: bool,
+    theme: &ThemeConfig,
+    on_yt_dlp: impl FnOnce(),
+    on_ffmpeg: impl FnOnce(),
+) -> [egui::Rect; 4] {
+    let mut rects = [egui::Rect::NOTHING; 4];
+    let btn_text_h = egui::WidgetText::from("Ag")
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Body,
+        )
+        .size()
+        .y;
+    let button_h = (btn_text_h + 2.0 * ui.spacing().button_padding.y)
+        .max(ui.spacing().interact_size.y);
+    let radius = theme.corner_radius.round().clamp(0.0, 24.0) as u8;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().interact_size.y = button_h;
+        rects[0] = pill_with_size(
+            ui,
+            if yt_ok { "yt-dlp: Instalado" } else { "yt-dlp: Não encontrado" },
+            if yt_ok { to_c32(theme.success) } else { to_c32(theme.warning) },
+            egui::vec2(10.0, 2.0),
+            button_h,
+            radius,
+        )
+        .rect;
+        let yt_btn = ui.button(if yt_ok { "Atualizar yt-dlp" } else { "Instalar yt-dlp (1-clique)" });
+        rects[1] = yt_btn.rect;
+        if yt_btn.clicked() {
+            on_yt_dlp();
+        }
+        ui.add_space(8.0);
+        rects[2] = pill_with_size(
+            ui,
+            if ff_ok { "FFmpeg: Instalado" } else { "FFmpeg: Não encontrado" },
+            if ff_ok { to_c32(theme.success) } else { to_c32(theme.warning) },
+            egui::vec2(10.0, 2.0),
+            button_h,
+            radius,
+        )
+        .rect;
+        let ff_btn = ui.button(if ff_ok { "Reinstalar FFmpeg" } else { "Instalar FFmpeg (1-clique)" });
+        rects[3] = ff_btn.rect;
+        if ff_btn.clicked() {
+            on_ffmpeg();
+        }
+    });
+    rects
 }
 
 fn render_segments_strip(ui: &mut Ui, item: &DownloadItem, theme: &ThemeConfig) {
@@ -4052,6 +4116,28 @@ mod tests {
         assert_eq!(&completed[center_idx..center_idx + 4], &[34, 197, 94, 255]);
         assert_eq!(&error[center_idx..center_idx + 4], &[239, 68, 68, 255]);
         assert_ne!(idle[center_idx..center_idx + 4], active[center_idx..center_idx + 4]);
+    }
+
+    #[test]
+    fn media_tools_bar_aligns_pills_and_buttons() {
+        let ctx = egui::Context::default();
+        let theme = ThemeConfig::obsidian();
+        apply_theme(&ctx, &theme);
+        let mut captured = [egui::Rect::NOTHING; 4];
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 200.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw_input, |ui| {
+            captured = render_media_tools_bar(ui, true, true, &theme, || {}, || {});
+        });
+        out.textures_delta.clear();
+        let base_h = captured[1].height();
+        let base_cy = captured[1].center().y;
+        for rect in captured {
+            assert!((rect.height() - base_h).abs() <= 0.5, "height mismatch: {captured:?}");
+            assert!((rect.center().y - base_cy).abs() <= 0.5, "center.y mismatch: {captured:?}");
+        }
     }
 }
 

@@ -2259,7 +2259,7 @@ impl VortexApp {
         ScrollArea::vertical().show(ui, |ui| {
             let mut toggles: Vec<(Uuid, bool)> = Vec::new();
             let mut domain_toggles: Vec<(String, bool)> = Vec::new();
-            let mut single_resolve_url: Option<String> = None;
+            let mut resolve_urls_to_launch: Option<Vec<String>> = None;
             let domain_groups = group_grabbed_links_by_domain(&snap.grabbed_links, ignore_non_part);
 
             for (group_idx, group) in domain_groups.iter().enumerate() {
@@ -2284,6 +2284,9 @@ impl VortexApp {
                     .filter(|l| l.selected)
                     .filter_map(|l| l.size_bytes)
                     .sum();
+                let (group_resolvable_urls, group_any_waiting) =
+                    group_browser_resolvable_urls(&group.links);
+                let group_resolvable_count = group_resolvable_urls.len();
                 let mut all_parts_selected = part_total > 0 && part_selected == part_total;
                 let partial_parts_selected = part_selected > 0 && part_selected < part_total;
                 let (tag, color) = site_badge_style(&group.domain, theme);
@@ -2324,6 +2327,29 @@ impl VortexApp {
                                     .small()
                                     .color(to_c32(theme.text_muted)),
                             );
+                            if group_resolvable_count > 0 {
+                                let label = if group_any_waiting {
+                                    format!("Reabrir Todos ({group_resolvable_count})")
+                                } else {
+                                    format!("Resolver Todos ({group_resolvable_count})")
+                                };
+                                let hover = if use_embedded_webview {
+                                    "Abre sequencialmente no VortexDL (WebView2) todos os links desta seção que precisam de verificação"
+                                } else {
+                                    "Abre sequencialmente no navegador todos os links desta seção que precisam de verificação"
+                                };
+                                if ui
+                                    .small_button(
+                                        RichText::new(label)
+                                            .color(to_c32(theme.warning))
+                                            .strong(),
+                                    )
+                                    .on_hover_text(hover)
+                                    .clicked()
+                                {
+                                    resolve_urls_to_launch = Some(group_resolvable_urls.clone());
+                                }
+                            }
                         });
                     });
                 ui.add_space(4.0);
@@ -2402,7 +2428,7 @@ impl VortexApp {
                                                 .on_hover_text("Abrir no navegador para resolver Turnstile/Cloudflare")
                                                 .clicked()
                                         {
-                                            single_resolve_url = Some(link.url.clone());
+                                            resolve_urls_to_launch = Some(vec![link.url.clone()]);
                                         }
                                         ui.label(
                                             RichText::new(&size_text).color(to_c32(theme.text_muted)),
@@ -2455,7 +2481,7 @@ impl VortexApp {
                                             .on_hover_text("Abrir no navegador para resolver Turnstile/Cloudflare")
                                             .clicked()
                                     {
-                                        single_resolve_url = Some(link.url.clone());
+                                        resolve_urls_to_launch = Some(vec![link.url.clone()]);
                                     }
                                     ui.label(
                                         RichText::new(&size_text).color(to_c32(theme.text_muted)),
@@ -2488,8 +2514,8 @@ impl VortexApp {
                     }
                 }
             }
-            if let Some(url) = single_resolve_url {
-                self.launch_browser_resolver(vec![url]);
+            if let Some(urls) = resolve_urls_to_launch {
+                self.launch_browser_resolver(urls);
             }
         });
     }
@@ -4364,11 +4390,95 @@ mod tests {
         assert!(!links[1].selected);
         assert!(!links[3].selected);
     }
+
+    #[test]
+    fn group_browser_resolvable_urls_filters_only_needing_resolution() {
+        use vortex_core::model::{FileCategory, GrabbedLink};
+
+        let mk = |url: &str, site: &str, online: Option<bool>, probing: bool, err: Option<&str>| GrabbedLink {
+            id: Uuid::new_v4(),
+            url: url.into(),
+            filename: "game.part1.rar".into(),
+            size_bytes: None,
+            online,
+            probing,
+            supports_ranges: false,
+            category: FileCategory::Archive,
+            package_key: Some("game.rar".into()),
+            part_number: Some(1),
+            part_total: None,
+            source_site: Some(site.into()),
+            selected: false,
+            headers: Default::default(),
+            error: err.map(str::to_string),
+        };
+
+        let fd_pow = mk(
+            "https://itsfileditchfiles.st/f/abc?fdg=1",
+            "FileDitch",
+            Some(false),
+            false,
+            Some("FileDitch exige verificação automática no navegador — clique em 'Resolver no Vortex' ou 'Resolver no Navegador'"),
+        );
+        let fd_waiting = mk(
+            "https://itsfileditchfiles.st/f/def?fdg=1",
+            "FileDitch",
+            Some(false),
+            true,
+            Some("Aguardando captura no navegador — resolva a verificação na aba aberta"),
+        );
+        let fd_ok = mk(
+            "https://cdn.lumiskipssugardaily.xyz/dl/ok",
+            "FileDitch",
+            Some(true),
+            false,
+            None,
+        );
+        let fd_dead = mk(
+            "https://itsfileditchfiles.st/f/dead",
+            "FileDitch",
+            Some(false),
+            false,
+            Some("404 Not Found"),
+        );
+
+        let refs = [&fd_pow, &fd_waiting, &fd_ok, &fd_dead];
+        let (urls, any_waiting) = group_browser_resolvable_urls(&refs);
+        assert_eq!(
+            urls,
+            vec![
+                "https://itsfileditchfiles.st/f/abc?fdg=1".to_string(),
+                "https://itsfileditchfiles.st/f/def?fdg=1".to_string(),
+            ]
+        );
+        assert!(any_waiting);
+
+        let ok_only = [&fd_ok, &fd_dead];
+        let (ok_urls, ok_waiting) = group_browser_resolvable_urls(&ok_only);
+        assert!(ok_urls.is_empty());
+        assert!(!ok_waiting);
+    }
 }
 
 struct DomainGrabbedGroup<'a> {
     domain: String,
     links: Vec<&'a vortex_core::model::GrabbedLink>,
+}
+
+fn group_browser_resolvable_urls(
+    links: &[&vortex_core::model::GrabbedLink],
+) -> (Vec<String>, bool) {
+    let mut urls = Vec::new();
+    let mut any_waiting = false;
+    for link in links {
+        if vortex_core::manager::is_browser_resolvable_link(link) {
+            urls.push(link.url.clone());
+            if link.probing {
+                any_waiting = true;
+            }
+        }
+    }
+    (urls, any_waiting)
 }
 
 fn grabbed_link_domain(link: &vortex_core::model::GrabbedLink) -> String {

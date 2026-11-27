@@ -6,7 +6,7 @@ mod theme;
 #[cfg(windows)]
 mod webview_resolver;
 
-use app::{NavTab, TrayControls, VortexApp};
+pub use app::{NavTab, TrayBadgeStatus, TrayControls, VortexApp};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -19,7 +19,7 @@ use vortex_core::manager::{DownloadManager, is_torrent_request};
 use vortex_core::model::NewDownloadRequest;
 use vortex_core::state::load_settings;
 
-fn build_tray_icon() -> Option<TrayControls> {
+pub fn render_tray_icon_rgba(badge: TrayBadgeStatus) -> Vec<u8> {
     let size = 32u32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     for y in 0..size {
@@ -29,7 +29,6 @@ fn build_tray_icon() -> Option<TrayControls> {
             let dist = (dx * dx + dy * dy).sqrt();
             let idx = ((y * size + x) * 4) as usize;
             if dist <= 14.5 {
-                // Violet-to-cyan download arrow emblem
                 let in_arrow = (dx.abs() < 3.0 && y >= 7 && y <= 20)
                     || (y >= 16 && y <= 23 && dx.abs() <= (24 - y) as f32);
                 if in_arrow {
@@ -47,7 +46,50 @@ fn build_tray_icon() -> Option<TrayControls> {
         }
     }
 
-    let icon = Icon::from_rgba(rgba, size, size).ok()?;
+    let badge_rgb = match badge {
+        TrayBadgeStatus::Idle => None,
+        TrayBadgeStatus::Active => Some([250u8, 204, 21]),
+        TrayBadgeStatus::Completed => Some([34u8, 197, 94]),
+        TrayBadgeStatus::Error => Some([239u8, 68, 68]),
+    };
+
+    if let Some([br, bg, bb]) = badge_rgb {
+        let cx = 24.5f32;
+        let cy = 24.5f32;
+        let outer_r = 6.6f32;
+        let inner_r = 4.7f32;
+        for y in 16..size {
+            for x in 16..size {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist <= outer_r {
+                    let idx = ((y * size + x) * 4) as usize;
+                    if dist <= inner_r {
+                        rgba[idx] = br;
+                        rgba[idx + 1] = bg;
+                        rgba[idx + 2] = bb;
+                        rgba[idx + 3] = 255;
+                    } else {
+                        rgba[idx] = 18;
+                        rgba[idx + 1] = 18;
+                        rgba[idx + 2] = 28;
+                        rgba[idx + 3] = 255;
+                    }
+                }
+            }
+        }
+    }
+
+    rgba
+}
+
+pub fn make_tray_icon(badge: TrayBadgeStatus) -> Option<Icon> {
+    Icon::from_rgba(render_tray_icon_rgba(badge), 32, 32).ok()
+}
+
+fn build_tray_icon() -> Option<TrayControls> {
+    let icon = make_tray_icon(TrayBadgeStatus::Idle)?;
     let menu = Menu::new();
     let show_item = MenuItem::new("Abrir VortexDL", true, None);
     let pause_item = MenuItem::new("Pausar Tudo", true, None);
@@ -68,7 +110,7 @@ fn build_tray_icon() -> Option<TrayControls> {
         .ok()?;
 
     Some(TrayControls {
-        _tray: tray,
+        tray,
         show_id,
         pause_all_id,
         resume_all_id,

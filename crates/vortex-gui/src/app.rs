@@ -38,8 +38,16 @@ pub enum NavTab {
     Settings,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayBadgeStatus {
+    Idle,
+    Active,
+    Completed,
+    Error,
+}
+
 pub struct TrayControls {
-    pub _tray: TrayIcon,
+    pub tray: TrayIcon,
     pub show_id: MenuId,
     pub pause_all_id: MenuId,
     pub resume_all_id: MenuId,
@@ -162,6 +170,8 @@ pub struct VortexApp {
     quit_requested: bool,
     tray_menu_events: Arc<Mutex<Vec<MenuEvent>>>,
     tray_icon_events: Arc<Mutex<Vec<TrayIconEvent>>>,
+    last_tray_badge: TrayBadgeStatus,
+    last_tray_counts: Option<(usize, usize, usize)>,
 }
 
 impl VortexApp {
@@ -173,6 +183,11 @@ impl VortexApp {
     ) -> Self {
         let settings = manager.settings.read().clone();
         apply_theme(&cc.egui_ctx, &settings.theme);
+
+        let repaint_ctx = cc.egui_ctx.clone();
+        manager.set_repaint_callback(move || {
+            repaint_ctx.request_repaint();
+        });
 
         let tray_menu_events = Arc::new(Mutex::new(Vec::new()));
         let tray_icon_events = Arc::new(Mutex::new(Vec::new()));
@@ -257,6 +272,8 @@ impl VortexApp {
             quit_requested: false,
             tray_menu_events,
             tray_icon_events,
+            last_tray_badge: TrayBadgeStatus::Idle,
+            last_tray_counts: None,
         }
     }
 
@@ -296,11 +313,51 @@ impl VortexApp {
     }
 
     fn restore_main_window(ctx: &egui::Context) {
+        tracing::debug!("restore_main_window triggered");
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
         #[cfg(windows)]
         bring_main_window_to_front();
+    }
+
+    fn tray_counts(&self) -> (usize, usize, usize) {
+        let dls = self.manager.downloads.read();
+        let active = dls
+            .iter()
+            .filter(|d| d.status.is_active() || d.status == DownloadStatus::Queued)
+            .count();
+        let completed = dls
+            .iter()
+            .filter(|d| matches!(d.status, DownloadStatus::Completed | DownloadStatus::Seeding))
+            .count();
+        let failed = dls
+            .iter()
+            .filter(|d| matches!(d.status, DownloadStatus::Failed(_)))
+            .count();
+        (active, completed, failed)
+    }
+
+    fn sync_tray_badge(&mut self) {
+        let counts = self.tray_counts();
+        if self.last_tray_counts == Some(counts) {
+            return;
+        }
+        self.last_tray_counts = Some(counts);
+        let (active, completed, failed) = counts;
+        let badge = tray_badge_status_from_counts(active, completed, failed);
+        let Some(ref tray) = self.tray else {
+            return;
+        };
+        if badge != self.last_tray_badge {
+            if let Some(icon) = crate::make_tray_icon(badge) {
+                let _ = tray.tray.set_icon(Some(icon));
+            }
+            self.last_tray_badge = badge;
+        }
+        let tooltip = tray_tooltip_from_counts(active, completed, failed);
+        let _ = tray.tray.set_tooltip(Some(tooltip));
     }
 
     fn handle_tray_events(&mut self, ctx: &egui::Context) {
@@ -310,6 +367,7 @@ impl VortexApp {
         let menu_events: Vec<MenuEvent> = self.tray_menu_events.lock().drain(..).collect();
         for event in menu_events {
             if event.id == tray.show_id {
+                tracing::debug!("Tray menu Abrir VortexDL clicked");
                 Self::restore_main_window(ctx);
             } else if event.id == tray.pause_all_id {
                 self.manager.pause_all();
@@ -329,6 +387,7 @@ impl VortexApp {
                     ..
                 }
             ) {
+                tracing::debug!("Tray icon double-clicked");
                 Self::restore_main_window(ctx);
             }
         }
@@ -406,34 +465,38 @@ impl Drop for VortexApp {
 }
 
 impl eframe::App for VortexApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.sync_theme(&ctx);
-        self.handle_tray_events(&ctx);
-        self.check_clipboard();
-        self.handle_dropped_files(&ctx);
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_tray_events(ctx);
+        self.sync_tray_badge();
 
         if self.manager.take_focus_grabber_request() {
             self.active_tab = NavTab::LinkGrabber;
-            Self::restore_main_window(&ctx);
+            Self::restore_main_window(ctx);
         }
 
-        let snap = self.manager.snapshot();
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_requested && self.tray.is_some()
         {
             let close_mode = self.manager.settings.read().close_to_tray;
-            let has_active_downloads = snap
-                .downloads
-                .iter()
-                .any(|d| d.status.is_active() || d.status == DownloadStatus::Queued);
-            if should_minimize_to_tray(close_mode, has_active_downloads) {
+            let (active_count, _, _) = self.tray_counts();
+            if should_minimize_to_tray(close_mode, active_count > 0) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
         }
-        let theme = self.manager.settings.read().theme.clone();
-        let repaint_ms = if snap.active_count > 0 { 150 } else { 500 };
+
+        let (active_count, _, _) = self.tray_counts();
+        let repaint_ms = if active_count > 0 { 150 } else { 500 };
         ctx.request_repaint_after(Duration::from_millis(repaint_ms));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.sync_theme(&ctx);
+        self.check_clipboard();
+        self.handle_dropped_files(&ctx);
+
+        let snap = self.manager.snapshot();
+        let theme = self.manager.settings.read().theme.clone();
 
         let top_bar_h = self.render_top_bar(ui, &snap, &theme);
         self.render_sidebar(ui, &snap, &theme, top_bar_h);
@@ -3903,6 +3966,40 @@ fn bring_main_window_to_front() {
     }
 }
 
+fn tray_badge_status_from_counts(
+    active: usize,
+    completed: usize,
+    failed: usize,
+) -> TrayBadgeStatus {
+    if active > 0 {
+        TrayBadgeStatus::Active
+    } else if failed > 0 {
+        TrayBadgeStatus::Error
+    } else if completed > 0 {
+        TrayBadgeStatus::Completed
+    } else {
+        TrayBadgeStatus::Idle
+    }
+}
+
+fn tray_tooltip_from_counts(active: usize, completed: usize, failed: usize) -> String {
+    let mut parts = Vec::new();
+    if active > 0 {
+        parts.push(format!("{active} ativo(s)"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} com erro"));
+    }
+    if completed > 0 {
+        parts.push(format!("{completed} concluído(s)"));
+    }
+    if parts.is_empty() {
+        "VortexDL — Download Manager".to_string()
+    } else {
+        format!("VortexDL — {}", parts.join(" · "))
+    }
+}
+
 fn should_minimize_to_tray(mode: CloseToTrayMode, has_active_downloads: bool) -> bool {
     match mode {
         CloseToTrayMode::WhenDownloading => has_active_downloads,
@@ -3931,6 +4028,30 @@ mod tests {
         assert!(!should_minimize_to_tray(settings.close_to_tray, false));
         assert!(should_minimize_to_tray(CloseToTrayMode::Always, false));
         assert!(!should_minimize_to_tray(CloseToTrayMode::Never, true));
+    }
+
+    #[test]
+    fn tray_badge_status_selects_expected_priority() {
+        assert_eq!(tray_badge_status_from_counts(0, 0, 0), TrayBadgeStatus::Idle);
+        assert_eq!(
+            tray_badge_status_from_counts(0, 2, 0),
+            TrayBadgeStatus::Completed
+        );
+        assert_eq!(tray_badge_status_from_counts(0, 2, 1), TrayBadgeStatus::Error);
+        assert_eq!(tray_badge_status_from_counts(1, 2, 1), TrayBadgeStatus::Active);
+    }
+
+    #[test]
+    fn tray_icon_renders_distinct_badge_pixels() {
+        let idle = crate::render_tray_icon_rgba(TrayBadgeStatus::Idle);
+        let active = crate::render_tray_icon_rgba(TrayBadgeStatus::Active);
+        let completed = crate::render_tray_icon_rgba(TrayBadgeStatus::Completed);
+        let error = crate::render_tray_icon_rgba(TrayBadgeStatus::Error);
+        let center_idx = ((24 * 32 + 24) * 4) as usize;
+        assert_eq!(&active[center_idx..center_idx + 4], &[250, 204, 21, 255]);
+        assert_eq!(&completed[center_idx..center_idx + 4], &[34, 197, 94, 255]);
+        assert_eq!(&error[center_idx..center_idx + 4], &[239, 68, 68, 255]);
+        assert_ne!(idle[center_idx..center_idx + 4], active[center_idx..center_idx + 4]);
     }
 }
 

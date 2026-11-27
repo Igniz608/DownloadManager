@@ -75,6 +75,7 @@ pub struct DownloadManager {
     active_browser_resolve_url: Arc<RwLock<Option<String>>>,
     grabber_probe_count: Arc<AtomicUsize>,
     focus_grabber_requested: Arc<AtomicBool>,
+    repaint_cb: Arc<RwLock<Option<Arc<dyn Fn() + Send + Sync>>>>,
     pub speed_history: Arc<RwLock<VecDeque<SpeedSample>>>,
     pub notifications: Arc<RwLock<VecDeque<NoticeEntry>>>,
     pub pending_password_prompts: Arc<RwLock<Vec<PasswordPromptRequest>>>,
@@ -127,6 +128,7 @@ impl DownloadManager {
             active_browser_resolve_url: Arc::new(RwLock::new(None)),
             grabber_probe_count: Arc::new(AtomicUsize::new(0)),
             focus_grabber_requested: Arc::new(AtomicBool::new(false)),
+            repaint_cb: Arc::new(RwLock::new(None)),
             speed_history: Arc::new(RwLock::new(hist)),
             notifications: Arc::new(RwLock::new(VecDeque::with_capacity(20))),
             pending_password_prompts: Arc::new(RwLock::new(Vec::new())),
@@ -231,6 +233,7 @@ impl DownloadManager {
         let mgr = self.clone();
         self.runtime.spawn(async move {
             let mut tick_count = 0u64;
+            let mut last_status_sig: Option<(usize, usize, usize, usize)> = None;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 tick_count += 1;
@@ -300,6 +303,27 @@ impl DownloadManager {
 
                 // Queue pump
                 mgr.pump_queue();
+
+                let status_sig = {
+                    let dls = mgr.downloads.read();
+                    let active = dls
+                        .iter()
+                        .filter(|d| d.status.is_active() || d.status == DownloadStatus::Queued)
+                        .count();
+                    let completed = dls
+                        .iter()
+                        .filter(|d| matches!(d.status, DownloadStatus::Completed | DownloadStatus::Seeding))
+                        .count();
+                    let failed = dls
+                        .iter()
+                        .filter(|d| matches!(d.status, DownloadStatus::Failed(_)))
+                        .count();
+                    (active, completed, failed, dls.len())
+                };
+                if last_status_sig != Some(status_sig) {
+                    last_status_sig = Some(status_sig);
+                    mgr.request_ui_repaint();
+                }
 
                 // Periodic state save every 5 seconds
                 if tick_count % 10 == 0 {
@@ -822,8 +846,19 @@ impl DownloadManager {
         self.probe_urls_into_grabber(urls, headers);
     }
 
+    pub fn set_repaint_callback(&self, cb: impl Fn() + Send + Sync + 'static) {
+        *self.repaint_cb.write() = Some(Arc::new(cb));
+    }
+
+    pub fn request_ui_repaint(&self) {
+        if let Some(cb) = self.repaint_cb.read().as_ref().cloned() {
+            cb();
+        }
+    }
+
     pub fn request_focus_grabber(&self) {
         self.focus_grabber_requested.store(true, Ordering::SeqCst);
+        self.request_ui_repaint();
     }
 
     pub fn take_focus_grabber_request(&self) -> bool {

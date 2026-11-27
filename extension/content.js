@@ -1296,14 +1296,30 @@
     true
   );
 
+  function isVikingFileHost(hostname) {
+    return /(?:^|\.)v[i1]k[i1]ngf[i1]le\.[a-z0-9-]+$/i.test(String(hostname || ""));
+  }
+
+  function isVikingFilePage() {
+    if (isVikingFileHost(window.location.hostname)) return true;
+    const meta = document.querySelector('meta[name="application-name"]');
+    if (meta && /viking/i.test(meta.getAttribute("content") || "")) return true;
+    return Boolean(
+      document.getElementById("captcha-download") && document.getElementById("download-link")
+    );
+  }
+
   function initBrowserHosterResolver() {
     if (window.top !== window) return;
-    if (!/(?:^|\.)(?:vikingfile\.com|vik1ngfile\.site)$/i.test(window.location.hostname)) {
+    const isAutoResolve = window.location.hash.includes("vortex_resolve");
+    if (!isAutoResolve && !isVikingFilePage()) {
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", initBrowserHosterResolver, { once: true });
+      }
       return;
     }
 
     const cleanPageUrl = window.location.href.split("#")[0];
-    const isAutoResolve = window.location.hash.includes("vortex_resolve");
 
     const startWatching = () => {
       let resolved = false;

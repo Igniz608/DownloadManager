@@ -1936,10 +1936,14 @@ impl VortexApp {
         let browser_resolvable_urls: Vec<String> = snap
             .grabbed_links
             .iter()
-            .filter(|l| vortex_core::manager::is_browser_resolvable_link(l) && !l.probing)
+            .filter(|l| vortex_core::manager::is_browser_resolvable_link(l))
             .map(|l| l.url.clone())
             .collect();
         let browser_resolvable_count = browser_resolvable_urls.len();
+        let browser_any_waiting = snap
+            .grabbed_links
+            .iter()
+            .any(|l| vortex_core::manager::is_browser_resolvable_link(l) && l.probing);
         let total_size: u64 = snap
             .grabbed_links
             .iter()
@@ -2008,9 +2012,11 @@ impl VortexApp {
                 if browser_resolvable_count > 0
                     && ui
                         .button(
-                            RichText::new(format!(
-                                "Resolver no Navegador ({browser_resolvable_count})"
-                            ))
+                            RichText::new(if browser_any_waiting {
+                                format!("Reabrir no Navegador ({browser_resolvable_count})")
+                            } else {
+                                format!("Resolver no Navegador ({browser_resolvable_count})")
+                            })
                             .color(to_c32(theme.warning))
                             .strong(),
                         )
@@ -2079,8 +2085,7 @@ impl VortexApp {
             let mut toggles: Vec<(Uuid, bool)> = Vec::new();
             let mut single_resolve_url: Option<String> = None;
             for link in &snap.grabbed_links {
-                let can_browser_resolve =
-                    vortex_core::manager::is_browser_resolvable_link(link) && !link.probing;
+                let can_browser_resolve = vortex_core::manager::is_browser_resolvable_link(link);
                 Frame::new()
                     .fill(to_c32(theme.bg_card))
                     .stroke(Stroke::new(1.0, to_c32(theme.border)))

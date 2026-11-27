@@ -207,6 +207,26 @@ function normalizeBrowserPageUrl(raw) {
   }
 }
 
+function isVikingFileHost(hostname) {
+  return /(?:^|\.)v[i1]k[i1]ngf[i1]le\.[a-z0-9-]+$/i.test(String(hostname || ""));
+}
+
+function browserPageUrlMatches(linkUrl, reportedPageUrl) {
+  const a = normalizeBrowserPageUrl(linkUrl);
+  const b = normalizeBrowserPageUrl(reportedPageUrl);
+  if (a === b) return true;
+  try {
+    const ua = new URL(a);
+    const ub = new URL(b);
+    if (isVikingFileHost(ua.hostname) && isVikingFileHost(ub.hostname)) {
+      const pa = ua.pathname.replace(/\/+$/, "");
+      const pb = ub.pathname.replace(/\/+$/, "");
+      return Boolean(pa) && pa === pb && ua.search === ub.search;
+    }
+  } catch (_) {}
+  return false;
+}
+
 function isMediaUrlOrContentType(url, contentType) {
   const lowerUrl = url.toLowerCase().split("?")[0];
   const ct = (contentType || "").toLowerCase();
@@ -741,11 +761,11 @@ function collectLinksFromFrame(selectionOnly) {
   let hasDownloadButtons = false;
 
   const HOSTER_RE =
-    /(?:^|\.)(?:fileditch|fileditchfiles|fileditchvids|itsfileditchfiles|fileditchhot|theditch|embedditch|filekeeper|pixeldrain|gofile|vikingfile|vik1ngfile|mediafire|buzzheavier|bzzhr|1fichier|mega\.nz|mega\.co\.nz|qiwi\.gg|krakenfiles|akirabox|datanodes|uploadhaven|send\.cm|rapidgator|ddownload|katfile|nitroflare|turbobit|workupload|bowfile|ranoz|rootz|fuckingfast|anonfiles|bayfiles|dropbox\.com|drive\.google\.com|1drv\.ms|onedrive\.live\.com|huggingface\.co|archive\.org)(?:\/|$|\.)/i;
+    /(?:^|\.)(?:fileditch|fileditchfiles|fileditchvids|itsfileditchfiles|fileditchhot|theditch|embedditch|filekeeper|pixeldrain|gofile|v[i1]k[i1]ngf[i1]le|mediafire|buzzheavier|bzzhr|1fichier|mega\.nz|mega\.co\.nz|qiwi\.gg|krakenfiles|akirabox|datanodes|uploadhaven|send\.cm|rapidgator|ddownload|katfile|nitroflare|turbobit|workupload|bowfile|ranoz|rootz|fuckingfast|anonfiles|bayfiles|dropbox\.com|drive\.google\.com|1drv\.ms|onedrive\.live\.com|huggingface\.co|archive\.org)(?:\/|$|\.)/i;
   const BARE_HOSTER_RE =
-    /(?:^|[^a-zA-Z0-9._:/@])((?:fileditchfiles\.(?:me|st)|itsfileditchfiles\.st|fileditchvids\.st|fileditchhot\.st|theditch\.st|embedditch\.st|filekeeper\.net|pixeldrain\.com|gofile\.io|vikingfile\.com|vik1ngfile\.site|buzzheavier\.com|bzzhr\.co|mediafire\.com|1fichier\.com|mega\.nz|akirabox\.com|datanodes\.to)\/[A-Za-z0-9_/?=&.%#+-]+)/gi;
+    /(?:^|[^a-zA-Z0-9._:/@])((?:fileditchfiles\.(?:me|st)|itsfileditchfiles\.st|fileditchvids\.st|fileditchhot\.st|theditch\.st|embedditch\.st|filekeeper\.net|pixeldrain\.com|gofile\.io|v[i1]k[i1]ngf[i1]le\.[a-z0-9-]+|buzzheavier\.com|bzzhr\.co|mediafire\.com|1fichier\.com|mega\.nz|akirabox\.com|datanodes\.to)\/[A-Za-z0-9_/?=&.%#+-]+)/gi;
   const HOST_ATTR_HINT_RE =
-    /https?:|magnet:|\\\/|\\u002f|aHR0c|fileditch|theditch|filekeeper|pixeldrain|gofile|vikingfile|vik1ngfile|buzzheavier|bzzhr|mediafire|1fichier|mega\.nz|akirabox|datanodes/i;
+    /https?:|magnet:|\\\/|\\u002f|aHR0c|fileditch|theditch|filekeeper|pixeldrain|gofile|vikingfile|vik1ngfile|vik1ngf1le|buzzheavier|bzzhr|mediafire|1fichier|mega\.nz|akirabox|datanodes/i;
   const FILE_EXT_RE =
     /\.(?:rar|zip|7z|tar|gz|bz2|xz|part\d+|r\d{2}|z\d{2}|\d{3}|iso|img|exe|msi|apk|dmg|pkg|deb|rpm|torrent|mp4|mkv|avi|mov|webm|m3u8|mpd|mp3|flac|wav|m4a|pdf|epub)(?:[?#]|$)/i;
   const STATIC_ASSET_RE =
@@ -1046,11 +1066,11 @@ function collectMainWorldStateUrls() {
 function extractDownloadUrlsFromBlobText(text) {
   if (!text || typeof text !== "string") return [];
   const HOSTER_RE =
-    /(?:^|\.)(?:fileditch|fileditchfiles|fileditchvids|itsfileditchfiles|fileditchhot|theditch|embedditch|filekeeper|pixeldrain|gofile|vikingfile|vik1ngfile|mediafire|buzzheavier|bzzhr|1fichier|mega\.nz|mega\.co\.nz|qiwi\.gg|krakenfiles|akirabox|datanodes|uploadhaven|send\.cm|rapidgator|ddownload|katfile|nitroflare|turbobit|workupload|bowfile|ranoz|rootz|fuckingfast|anonfiles|bayfiles|dropbox\.com|drive\.google\.com|1drv\.ms|onedrive\.live\.com|huggingface\.co|archive\.org)(?:\/|$|\.)/i;
+    /(?:^|\.)(?:fileditch|fileditchfiles|fileditchvids|itsfileditchfiles|fileditchhot|theditch|embedditch|filekeeper|pixeldrain|gofile|v[i1]k[i1]ngf[i1]le|mediafire|buzzheavier|bzzhr|1fichier|mega\.nz|mega\.co\.nz|qiwi\.gg|krakenfiles|akirabox|datanodes|uploadhaven|send\.cm|rapidgator|ddownload|katfile|nitroflare|turbobit|workupload|bowfile|ranoz|rootz|fuckingfast|anonfiles|bayfiles|dropbox\.com|drive\.google\.com|1drv\.ms|onedrive\.live\.com|huggingface\.co|archive\.org)(?:\/|$|\.)/i;
   const FILE_EXT_RE =
     /\.(?:rar|zip|7z|tar|gz|bz2|xz|part\d+|r\d{2}|z\d{2}|\d{3}|iso|img|exe|msi|apk|dmg|pkg|deb|rpm|torrent|mp4|mkv|avi|mov|webm|m3u8|mpd|mp3|flac|wav|m4a|pdf|epub)(?:[?#]|$)/i;
   const BARE_HOSTER_RE =
-    /(?:^|[^a-zA-Z0-9._:/@])((?:fileditchfiles\.(?:me|st)|itsfileditchfiles\.st|fileditchvids\.st|fileditchhot\.st|theditch\.st|embedditch\.st|filekeeper\.net|pixeldrain\.com|gofile\.io|vikingfile\.com|vik1ngfile\.site|buzzheavier\.com|bzzhr\.co|mediafire\.com|1fichier\.com|mega\.nz|akirabox\.com|datanodes\.to)\/[A-Za-z0-9_/?=&.%#+-]+)/gi;
+    /(?:^|[^a-zA-Z0-9._:/@])((?:fileditchfiles\.(?:me|st)|itsfileditchfiles\.st|fileditchvids\.st|fileditchhot\.st|theditch\.st|embedditch\.st|filekeeper\.net|pixeldrain\.com|gofile\.io|v[i1]k[i1]ngf[i1]le\.[a-z0-9-]+|buzzheavier\.com|bzzhr\.co|mediafire\.com|1fichier\.com|mega\.nz|akirabox\.com|datanodes\.to)\/[A-Za-z0-9_/?=&.%#+-]+)/gi;
 
   const found = new Set();
   const normalized = text
@@ -1408,9 +1428,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         const data = await resp.json();
-        const norm = normalizeBrowserPageUrl(msg.pageUrl || "");
         const list = Array.isArray(data?.pending_urls) ? data.pending_urls : [];
-        const matched = list.some((u) => normalizeBrowserPageUrl(u) === norm);
+        const matched = list.some((u) => browserPageUrlMatches(u, msg.pageUrl || ""));
         sendResponse({ pending: matched });
       } catch (_) {
         sendResponse({ pending: false });

@@ -188,6 +188,17 @@ fn host_matches(host: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 
+pub fn is_vikingfile_host(host: &str) -> bool {
+    let low = host.trim().to_ascii_lowercase();
+    let stripped = low.trim_end_matches('.');
+    stripped.split('.').any(|label| {
+        matches!(
+            label,
+            "vikingfile" | "vik1ngfile" | "vikingf1le" | "vik1ngf1le"
+        )
+    })
+}
+
 pub fn classify_source_site(url_str: &str) -> Option<String> {
     if url_str.starts_with("magnet:?") {
         return Some("Magnet".to_string());
@@ -211,7 +222,7 @@ pub fn classify_source_site(url_str: &str) -> Option<String> {
         (&["filekeeper.net"], "FileKeeper"),
         (&["pixeldrain.com"], "Pixeldrain"),
         (&["gofile.io"], "Gofile"),
-        (&["vikingfile.com", "vik1ngfile.site"], "VikingFile"),
+        (&["vikingfile.com", "vik1ngfile.site", "vik1ngf1le.online"], "VikingFile"),
         (&["mediafire.com"], "MediaFire"),
         (&["1fichier.com"], "1fichier"),
         (&["buzzheavier.com", "bzzhr.co"], "Buzzheavier"),
@@ -233,6 +244,9 @@ pub fn classify_source_site(url_str: &str) -> Option<String> {
         (&["huggingface.co"], "HuggingFace"),
         (&["archive.org"], "Archive.org"),
     ];
+    if is_vikingfile_host(&host) {
+        return Some("VikingFile".to_string());
+    }
     for (domains, label) in known {
         if domains.iter().any(|d| host_matches(&host, d)) {
             return Some((*label).to_string());
@@ -248,6 +262,9 @@ pub fn classify_source_site(url_str: &str) -> Option<String> {
 }
 
 fn is_known_file_hoster_host(host: &str) -> bool {
+    if is_vikingfile_host(host) {
+        return true;
+    }
     [
         "fileditch.com",
         "fileditchfiles.me",
@@ -1345,7 +1362,7 @@ async fn try_special_hoster_resolve(
     }
 
     // VikingFile metadata + Turnstile / direct link extraction
-    if host_matches(&host, "vikingfile.com") || host_matches(&host, "vik1ngfile.site") {
+    if is_vikingfile_host(&host) {
         let mut get_headers = headers.clone();
         get_headers
             .entry("User-Agent".to_string())

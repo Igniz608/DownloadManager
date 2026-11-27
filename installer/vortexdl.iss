@@ -59,7 +59,8 @@ Name: "{autodesktop}\VortexDL"; Filename: "{app}\vortex-gui.exe"; IconFilename: 
 
 [Run]
 Filename: "{app}\vortex-gui.exe"; Parameters: "{code:GetSilentSetupParams}"; Flags: runhidden waituntilterminated; Check: HasSilentSetupAction
-Filename: "{app}\vortex-gui.exe"; Parameters: "{code:GetFinishOpenExtParams}"; Description: "Abrir VortexDL e carregar a extensão nos navegadores selecionados (caminho copiado automaticamente)"; Flags: postinstall nowait skipifsilent; Check: HasSelectedBrowsers
+Filename: "{app}\vortex-gui.exe"; Parameters: "{code:GetFinishOpenExtParams}"; Description: "Abrir VortexDL e configurar a extensão nos outros navegadores selecionados"; Flags: postinstall nowait skipifsilent; Check: HasManualBrowsers
+Filename: "{app}\vortex-gui.exe"; Parameters: "--tab=extension"; Description: "Abrir VortexDL (extensão do Microsoft Edge configurada automaticamente)"; Flags: postinstall nowait skipifsilent; Check: OnlyEdgeSelected
 Filename: "{app}\vortex-gui.exe"; Description: "Abrir o VortexDL"; Flags: postinstall nowait skipifsilent; Check: NoSelectedBrowsers
 
 [UninstallRun]
@@ -120,7 +121,7 @@ begin
     wpSelectTasks,
     'Integração com Navegadores',
     'Escolha em quais navegadores deseja integrar o VortexDL.',
-    'O instalador registrará o Native Messaging Host automaticamente para os navegadores marcados e preparará a pasta extension/ para ativação rápida (sem loja).',
+    'Para o Microsoft Edge, a extensão oficial (Edge Add-ons Store) e o Native Messaging Host são configurados automaticamente — sem Modo do Desenvolvedor. Para os demais navegadores, o Native Host e a pasta extension/ ficam prontos.',
     False,
     False
   );
@@ -177,6 +178,26 @@ end;
 function NoSelectedBrowsers(): Boolean;
 begin
   Result := SelectedBrowsersCsv() = '';
+end;
+
+function HasManualBrowsers(): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 0 to 5 do
+  begin
+    if (I <> 1) and BrowserPage.Values[I] then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+function OnlyEdgeSelected(): Boolean;
+begin
+  Result := BrowserPage.Values[1] and (not HasManualBrowsers());
 end;
 
 function HasSilentSetupAction(): Boolean;

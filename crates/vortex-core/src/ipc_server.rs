@@ -359,6 +359,26 @@ async fn handle_ext_log(Json(payload): Json<serde_json::Value>) -> StatusCode {
 }
 
 pub const DEFAULT_CHROME_EXTENSION_ID: &str = "cpkkkcgchpbpjkdieckdkgdgadfbello";
+pub const EDGE_STORE_EXTENSION_ID: &str = "kgkaideidlhnmjneefpgilmifehcncni";
+pub const EDGE_STORE_UPDATE_URL: &str = "https://edge.microsoft.com/extensionwebstorebase/v1/crx";
+pub const EDGE_STORE_LISTING_URL: &str =
+    "https://microsoftedge.microsoft.com/addons/detail/kgkaideidlhnmjneefpgilmifehcncni";
+
+pub fn build_chromium_allowed_origins(chrome_extension_id: Option<&str>) -> Vec<String> {
+    let effective_id = chrome_extension_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_CHROME_EXTENSION_ID);
+
+    let mut origins = vec![format!("chrome-extension://{effective_id}/")];
+    for extra_id in [EDGE_STORE_EXTENSION_ID, DEFAULT_CHROME_EXTENSION_ID] {
+        let origin = format!("chrome-extension://{extra_id}/");
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    origins
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BrowserKind {
@@ -584,6 +604,55 @@ pub fn open_browser_extensions_page(kind: BrowserKind) -> Result<()> {
     anyhow::bail!("{} não encontrado no sistema", kind.display_name());
 }
 
+pub fn open_edge_store_listing() -> Result<()> {
+    let installed = detect_installed_browsers();
+    if let Some(edge) = installed.into_iter().find(|b| b.kind == BrowserKind::Edge) {
+        std::process::Command::new(&edge.exe_path)
+            .arg(EDGE_STORE_LISTING_URL)
+            .spawn()?;
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", EDGE_STORE_LISTING_URL])
+            .spawn()?;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::bail!("Microsoft Edge não encontrado no sistema")
+    }
+}
+
+pub fn register_edge_store_extension() -> Result<()> {
+    #[cfg(windows)]
+    {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let key_path = format!(r"Software\Microsoft\Edge\Extensions\{EDGE_STORE_EXTENSION_ID}");
+        let (key, _) = hkcu.create_subkey(&key_path)?;
+        key.set_value("update_url", &EDGE_STORE_UPDATE_URL)?;
+    }
+    Ok(())
+}
+
+pub fn is_edge_store_extension_registered() -> bool {
+    #[cfg(windows)]
+    {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let key_path = format!(r"Software\Microsoft\Edge\Extensions\{EDGE_STORE_EXTENSION_ID}");
+        let Ok(key) = hkcu.open_subkey(&key_path) else {
+            return false;
+        };
+        key.get_value::<String, _>("update_url")
+            .is_ok_and(|v| v.trim().eq_ignore_ascii_case(EDGE_STORE_UPDATE_URL))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Registers Chrome, Edge, Brave, Vivaldi, Opera, and Firefox Native Messaging manifests in Windows HKCU Registry.
 pub fn register_browser_native_host(
     native_host_exe: &Path,
@@ -604,15 +673,12 @@ pub fn register_browser_native_host_for(
     };
     let wants_chromium = selected.iter().any(|b| b.is_chromium());
     let wants_firefox = selected.contains(&BrowserKind::Firefox);
+    let wants_edge = selected.contains(&BrowserKind::Edge);
 
     let data_dir = app_data_dir().join("native-host");
     std::fs::create_dir_all(&data_dir)?;
 
-    let effective_id = chrome_extension_id
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_CHROME_EXTENSION_ID);
-    let ext_origin = format!("chrome-extension://{effective_id}/");
+    let allowed_origins = build_chromium_allowed_origins(chrome_extension_id);
 
     let chromium_manifest_path = data_dir.join("com.vortexdl.host.chromium.json");
     if wants_chromium {
@@ -621,7 +687,7 @@ pub fn register_browser_native_host_for(
             "description": "VortexDL Native Messaging Host",
             "path": native_host_exe.to_string_lossy(),
             "type": "stdio",
-            "allowed_origins": [ext_origin]
+            "allowed_origins": allowed_origins
         });
         std::fs::write(
             &chromium_manifest_path,
@@ -642,6 +708,10 @@ pub fn register_browser_native_host_for(
             &firefox_manifest_path,
             serde_json::to_string_pretty(&firefox_manifest)?,
         )?;
+    }
+
+    if wants_edge {
+        register_edge_store_extension()?;
     }
 
     let mut registered = Vec::new();
@@ -710,6 +780,9 @@ pub fn unregister_browser_integration() {
         ] {
             let _ = hkcu.delete_subkey_all(key_path);
         }
+        let _ = hkcu.delete_subkey_all(format!(
+            r"Software\Microsoft\Edge\Extensions\{EDGE_STORE_EXTENSION_ID}"
+        ));
         let _ = hkcu.delete_subkey_all(r"Software\Classes\magnet");
     }
 }
@@ -776,5 +849,34 @@ mod tests {
         assert!(DEFAULT_CHROME_EXTENSION_ID
             .bytes()
             .all(|b| (b'a'..=b'p').contains(&b)));
+    }
+
+    #[test]
+    fn edge_store_extension_id_is_valid_chromium_id() {
+        assert_eq!(EDGE_STORE_EXTENSION_ID.len(), 32);
+        assert!(EDGE_STORE_EXTENSION_ID
+            .bytes()
+            .all(|b| (b'a'..=b'p').contains(&b)));
+    }
+
+    #[test]
+    fn chromium_allowed_origins_includes_unpacked_and_edge_store_without_duplicates() {
+        let origins = build_chromium_allowed_origins(None);
+        assert_eq!(
+            origins,
+            vec![
+                format!("chrome-extension://{DEFAULT_CHROME_EXTENSION_ID}/"),
+                format!("chrome-extension://{EDGE_STORE_EXTENSION_ID}/"),
+            ]
+        );
+
+        let edge_only_first = build_chromium_allowed_origins(Some(EDGE_STORE_EXTENSION_ID));
+        assert_eq!(
+            edge_only_first,
+            vec![
+                format!("chrome-extension://{EDGE_STORE_EXTENSION_ID}/"),
+                format!("chrome-extension://{DEFAULT_CHROME_EXTENSION_ID}/"),
+            ]
+        );
     }
 }

@@ -13,9 +13,10 @@ use tray_icon::menu::{MenuEvent, MenuId};
 use tray_icon::{MouseButton, TrayIcon, TrayIconEvent};
 use uuid::Uuid;
 use vortex_core::ipc_server::{
-    BrowserKind, DEFAULT_CHROME_EXTENSION_ID, DetectedBrowser, detect_installed_browsers,
-    is_magnet_protocol_registered, open_browser_extensions_page,
-    register_browser_native_host_for, register_magnet_protocol_handler, resolve_extension_dir,
+    BrowserKind, DEFAULT_CHROME_EXTENSION_ID, DetectedBrowser, EDGE_STORE_EXTENSION_ID,
+    detect_installed_browsers, is_edge_store_extension_registered, is_magnet_protocol_registered,
+    open_browser_extensions_page, open_edge_store_listing, register_browser_native_host_for,
+    register_magnet_protocol_handler, resolve_extension_dir,
 };
 use vortex_core::state::is_portable_mode;
 use vortex_core::manager::{DownloadManager, ManagerSnapshot, default_torrent_dir_from_settings};
@@ -2996,6 +2997,38 @@ impl VortexApp {
                 });
 
                 ui.add_space(10.0);
+                let edge_auto_registered = is_edge_store_extension_registered();
+                ui.horizontal_wrapped(|ui| {
+                    if edge_auto_registered {
+                        pill(
+                            ui,
+                            &format!("Edge Store Auto-Install Ativo ({EDGE_STORE_EXTENSION_ID})"),
+                            to_c32(theme.success),
+                            theme,
+                        );
+                    } else {
+                        pill(
+                            ui,
+                            &format!("Edge Store ID: {EDGE_STORE_EXTENSION_ID}"),
+                            to_c32(theme.text_muted),
+                            theme,
+                        );
+                    }
+                    if ui.small_button("Abrir na Microsoft Edge Add-ons").clicked() {
+                        match open_edge_store_listing() {
+                            Ok(()) => {
+                                self.ext_reg_status = Some(
+                                    "Página da extensão aberta no Microsoft Edge Add-ons.".to_string(),
+                                );
+                            }
+                            Err(e) => {
+                                self.ext_reg_status = Some(format!("Erro ao abrir Edge Store: {e}"));
+                            }
+                        }
+                    }
+                });
+
+                ui.add_space(10.0);
                 ui.label(RichText::new("1. Selecione os navegadores para integrar:").strong());
                 ui.horizontal_wrapped(|ui| {
                     for kind in BrowserKind::ALL {
@@ -3023,7 +3056,7 @@ impl VortexApp {
 
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("ID Fixo da Extensão (Chromium):");
+                    ui.label("ID Fixo da Extensão (Chromium local):");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.chrome_ext_id_input)
                             .hint_text(DEFAULT_CHROME_EXTENSION_ID)
@@ -3039,7 +3072,7 @@ impl VortexApp {
                 ui.add_space(8.0);
                 if let Some(ref dir) = ext_dir {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Pasta da extensão:").strong());
+                        ui.label(RichText::new("Pasta da extensão (para outros navegadores):").strong());
                         ui.monospace(dir.display().to_string());
                         if ui.small_button("Copiar caminho").clicked() {
                             if let Ok(mut cb) = arboard::Clipboard::new() {
@@ -3062,7 +3095,7 @@ impl VortexApp {
                     .collect();
 
                 ui.horizontal_wrapped(|ui| {
-                    if accent_button(ui, "Integrar Selecionados e Abrir Extensões", theme).clicked() {
+                    if accent_button(ui, "Integrar Selecionados", theme).clicked() {
                         let host_exe = gui_exe
                             .parent()
                             .map(|d| d.join("vortex-native-host.exe"))
@@ -3083,26 +3116,42 @@ impl VortexApp {
                                 Some(&chosen_browsers),
                             ) {
                                 Ok(browsers) => {
-                                    if let Some(ref dir) = ext_dir {
-                                        if let Ok(mut cb) = arboard::Clipboard::new() {
-                                            let _ = cb.set_text(dir.to_string_lossy().to_string());
+                                    let manual_browsers: Vec<BrowserKind> = chosen_browsers
+                                        .iter()
+                                        .copied()
+                                        .filter(|k| *k != BrowserKind::Edge)
+                                        .collect();
+                                    let includes_edge = chosen_browsers.contains(&BrowserKind::Edge);
+
+                                    if !manual_browsers.is_empty() {
+                                        if let Some(ref dir) = ext_dir {
+                                            if let Ok(mut cb) = arboard::Clipboard::new() {
+                                                let _ = cb.set_text(dir.to_string_lossy().to_string());
+                                            }
                                         }
                                     }
                                     let mut opened = Vec::new();
-                                    for &kind in &chosen_browsers {
+                                    for kind in manual_browsers {
                                         if open_browser_extensions_page(kind).is_ok() {
                                             opened.push(kind.display_name());
                                         }
                                     }
-                                    self.ext_reg_status = Some(format!(
-                                        "Native Host registrado para: {}. Página de extensões aberta em: {}. Caminho da pasta extension/ copiado!",
-                                        browsers.join(", "),
-                                        if opened.is_empty() {
-                                            "nenhum navegador encontrado".to_string()
-                                        } else {
+                                    let mut parts = vec![format!(
+                                        "Native Host registrado para: {}",
+                                        browsers.join(", ")
+                                    )];
+                                    if includes_edge {
+                                        parts.push(
+                                            "Edge Store Auto-Install configurado (reinicie o Edge se estiver aberto)".to_string(),
+                                        );
+                                    }
+                                    if !opened.is_empty() {
+                                        parts.push(format!(
+                                            "Página de extensões aberta em: {} (caminho da pasta extension/ copiado)",
                                             opened.join(", ")
-                                        }
-                                    ));
+                                        ));
+                                    }
+                                    self.ext_reg_status = Some(parts.join(" • "));
                                 }
                                 Err(e) => {
                                     self.ext_reg_status = Some(format!("Erro ao registrar: {e}"));
@@ -3167,10 +3216,9 @@ impl VortexApp {
 
                 ui.add_space(12.0);
                 ui.separator();
-                ui.label(RichText::new("Como concluir a instalação no navegador (sem loja):").strong());
-                ui.label("1. Clique em 'Integrar Selecionados e Abrir Extensões' (ou conclua pelo Setup) — o caminho da pasta extension/ já vai copiado para a área de transferência.");
-                ui.label("2. No Chrome / Edge / Brave / Vivaldi / Opera: ative o 'Modo do desenvolvedor', clique em 'Carregar sem compactação' e pressione Ctrl+V para selecionar a pasta extension/.");
-                ui.label("3. Como o manifest possui chave fixa, o ID da extensão será sempre idêntico em qualquer PC e o Native Messaging conectará automaticamente.");
+                ui.label(RichText::new("Como funciona a instalação em cada navegador:").strong());
+                ui.label("• Microsoft Edge (Automático via Edge Add-ons Store): o Setup e o botão 'Integrar Selecionados' registram a extensão da loja automaticamente — sem Modo do Desenvolvedor. Basta reiniciar o Edge (ou clicar em 'Abrir na Microsoft Edge Add-ons').");
+                ui.label("• Chrome / Brave / Vivaldi / Opera / Firefox (sem loja): ao clicar em 'Integrar Selecionados', o caminho da pasta extension/ vai copiado para a área de transferência; ative o 'Modo do desenvolvedor', clique em 'Carregar sem compactação' e pressione Ctrl+V.");
             });
     }
 

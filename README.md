@@ -23,8 +23,13 @@ cargo build --release --workspace
 .\target\release\vortex-gui.exe
 ```
 
-## Installing the Browser Extension (Chrome / Edge / Brave)
+## Installing the Browser Extension
 
-1. Open `chrome://extensions` (or `edge://extensions`) and enable **Developer mode**.
+### Microsoft Edge (Automatic via Edge Add-ons Store)
+1. Install VortexDL with the Windows Setup (`VortexDL-Setup`) keeping **Microsoft Edge** checked (or click **Integrar Selecionados** inside **Extensão Navegador**).
+2. VortexDL registers `com.vortexdl.host` (`allowed_origins` includes Store ID `kgkaideidlhnmjneefpgilmifehcncni`) and configures `HKCU\Software\Microsoft\Edge\Extensions\kgkaideidlhnmjneefpgilmifehcncni` automatically — no Developer mode required.
+
+### Chrome / Brave / Vivaldi / Opera (Local Unpacked)
+1. Open `chrome://extensions` (or the browser's extensions page) and enable **Developer mode**.
 2. Click **Load unpacked** and select the `extension/` folder.
-3. In VortexDL, open **Extensão Navegador** and click **Registrar Native Messaging Host no Windows** (optionally paste your extension ID).
+3. In VortexDL, open **Extensão Navegador** and click **Integrar Selecionados**.

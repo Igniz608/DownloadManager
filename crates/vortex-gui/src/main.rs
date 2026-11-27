@@ -205,16 +205,30 @@ fn handle_setup_cli_flags(cli_args: &[String]) -> (bool, Option<NavTab>, Option<
             did_setup_action = true;
         } else if let Some(spec) = arg.strip_prefix("--open-extension-setup=") {
             let browsers = BrowserKind::parse_list(spec);
-            if let Some(ext_dir) = resolve_extension_dir(Some(&gui_exe)) {
-                if let Ok(mut cb) = arboard::Clipboard::new() {
-                    let _ = cb.set_text(ext_dir.to_string_lossy().to_string());
+            let manual_browsers: Vec<BrowserKind> = browsers
+                .iter()
+                .copied()
+                .filter(|k| *k != BrowserKind::Edge)
+                .collect();
+            let includes_edge = browsers.contains(&BrowserKind::Edge);
+
+            if !manual_browsers.is_empty() {
+                if let Some(ext_dir) = resolve_extension_dir(Some(&gui_exe)) {
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        let _ = cb.set_text(ext_dir.to_string_lossy().to_string());
+                    }
                 }
             }
             let mut opened = Vec::new();
-            for kind in browsers {
+            for kind in manual_browsers {
                 if open_browser_extensions_page(kind).is_ok() {
                     opened.push(kind.display_name());
                 }
+            }
+            if includes_edge {
+                messages.push(
+                    "Microsoft Edge configurado via Edge Add-ons Store (reinicie o Edge se estiver aberto)".to_string(),
+                );
             }
             if !opened.is_empty() {
                 messages.push(format!(

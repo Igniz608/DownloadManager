@@ -22,3 +22,8 @@ tray-icon.workspace = true
 arboard.workspace = true
 open.workspace = true
 parking_lot.workspace = true
+reqwest.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+wry.workspace = true
+tao.workspace = true

@@ -511,6 +511,10 @@ impl ThemeConfig {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub default_download_dir: PathBuf,
@@ -520,6 +524,8 @@ pub struct AppSettings {
     pub speed_limit_kbps: u64,
     pub clipboard_monitor: bool,
     pub auto_start_downloads: bool,
+    #[serde(default = "default_true")]
+    pub use_embedded_webview: bool,
     pub ipc_port: u16,
     pub ipc_token: String,
     pub yt_dlp_path: Option<String>,
@@ -548,6 +554,7 @@ impl Default for AppSettings {
             speed_limit_kbps: 0,
             clipboard_monitor: true,
             auto_start_downloads: true,
+            use_embedded_webview: true,
             ipc_port: 17654,
             ipc_token: Uuid::new_v4().to_string(),
             yt_dlp_path: None,

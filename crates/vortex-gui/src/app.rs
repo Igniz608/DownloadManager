@@ -156,6 +156,7 @@ pub struct VortexApp {
     last_applied_theme_hash: u64,
     last_api_card_height: f32,
     last_min_window_height: f32,
+    webview_child: Option<std::process::Child>,
 }
 
 impl VortexApp {
@@ -230,7 +231,39 @@ impl VortexApp {
             last_applied_theme_hash: 0,
             last_api_card_height: 96.0,
             last_min_window_height: 0.0,
+            webview_child: None,
         }
+    }
+
+    fn launch_browser_resolver(&mut self, urls: Vec<String>) {
+        let Some(first_url) = self.manager.queue_browser_resolutions(urls) else {
+            return;
+        };
+        #[cfg(windows)]
+        {
+            if self.manager.settings.read().use_embedded_webview {
+                if let Some(ref mut child) = self.webview_child {
+                    if let Ok(None) = child.try_wait() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    self.webview_child = None;
+                }
+                let port = self.manager.settings.read().ipc_port;
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Ok(child) = std::process::Command::new(exe)
+                        .arg("--webview-resolver")
+                        .arg(port.to_string())
+                        .arg(&first_url)
+                        .spawn()
+                    {
+                        self.webview_child = Some(child);
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = open::that(&first_url);
     }
 
     pub fn set_active_tab(&mut self, tab: NavTab) {
@@ -311,6 +344,17 @@ impl VortexApp {
         if h != self.last_applied_theme_hash {
             apply_theme(ctx, &theme);
             self.last_applied_theme_hash = h;
+        }
+    }
+}
+
+impl Drop for VortexApp {
+    fn drop(&mut self) {
+        if let Some(ref mut child) = self.webview_child {
+            if let Ok(None) = child.try_wait() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 }
@@ -1953,8 +1997,10 @@ impl VortexApp {
 
         let grabber_avail_w = ui.available_width();
         let grabber_scale = theme.font_scale.clamp(0.8, 1.4);
+        let use_embedded_webview = self.manager.settings.read().use_embedded_webview;
         let grabber_mgr = self.manager.clone();
-        let render_grabber_controls = |ui: &mut Ui| {
+        let mut batch_resolve_urls: Option<Vec<String>> = None;
+        let render_grabber_controls = |ui: &mut Ui, batch_out: &mut Option<Vec<String>>| {
             ui.label(
                 RichText::new(format!(
                     "{total_count} link(s) capturados ({selected_count} selecionados • {})",
@@ -2012,24 +2058,31 @@ impl VortexApp {
                 if browser_resolvable_count > 0
                     && ui
                         .button(
-                            RichText::new(if browser_any_waiting {
-                                format!("Reabrir no Navegador ({browser_resolvable_count})")
-                            } else {
-                                format!("Resolver no Navegador ({browser_resolvable_count})")
+                            RichText::new(match (use_embedded_webview, browser_any_waiting) {
+                                (true, true) => {
+                                    format!("Reabrir no Vortex ({browser_resolvable_count})")
+                                }
+                                (true, false) => {
+                                    format!("Resolver no Vortex ({browser_resolvable_count})")
+                                }
+                                (false, true) => {
+                                    format!("Reabrir no Navegador ({browser_resolvable_count})")
+                                }
+                                (false, false) => {
+                                    format!("Resolver no Navegador ({browser_resolvable_count})")
+                                }
                             })
                             .color(to_c32(theme.warning))
                             .strong(),
                         )
-                        .on_hover_text(
-                            "Abre os links com Turnstile/Cloudflare sequencialmente no navegador para a extensão VortexDL capturar os links diretos automaticamente",
-                        )
+                        .on_hover_text(if use_embedded_webview {
+                            "Abre uma janela WebView2 integrada no VortexDL para resolver Turnstile/captchas sequencialmente e capturar os links diretos"
+                        } else {
+                            "Abre os links com Turnstile/Cloudflare sequencialmente no navegador para a extensão VortexDL capturar os links diretos automaticamente"
+                        })
                         .clicked()
                 {
-                    if let Some(first_url) =
-                        grabber_mgr.queue_browser_resolutions(browser_resolvable_urls.clone())
-                    {
-                        let _ = open::that(&first_url);
-                    }
+                    *batch_out = Some(browser_resolvable_urls.clone());
                 }
             }
             if snap.grabber_probing {
@@ -2067,17 +2120,20 @@ impl VortexApp {
         if grabber_avail_w >= 860.0 * grabber_scale {
             egui::Sides::new().shrink_left().truncate().show(
                 ui,
-                |ui| render_grabber_controls(ui),
+                |ui| render_grabber_controls(ui, &mut batch_resolve_urls),
                 |ui| render_grabber_start_btn(self, ui),
             );
         } else {
             ui.vertical(|ui| {
-                ui.horizontal_wrapped(|ui| render_grabber_controls(ui));
+                ui.horizontal_wrapped(|ui| render_grabber_controls(ui, &mut batch_resolve_urls));
                 if selected_count > 0 {
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| render_grabber_start_btn(self, ui));
                 }
             });
+        }
+        if let Some(urls) = batch_resolve_urls {
+            self.launch_browser_resolver(urls);
         }
 
         ui.add_space(6.0);
@@ -2241,9 +2297,7 @@ impl VortexApp {
                 }
             }
             if let Some(url) = single_resolve_url {
-                if let Some(first_url) = self.manager.queue_browser_resolutions(vec![url]) {
-                    let _ = open::that(&first_url);
-                }
+                self.launch_browser_resolver(vec![url]);
             }
         });
     }
@@ -2903,6 +2957,7 @@ impl VortexApp {
                     changed |= ui.add(egui::Slider::new(&mut s.default_connections, 1..=32).text("Conexões por arquivo (segmentação)")).changed();
                     changed |= ui.checkbox(&mut s.clipboard_monitor, "Monitorar área de transferência para links").changed();
                     changed |= ui.checkbox(&mut s.auto_start_downloads, "Iniciar downloads automaticamente ao adicionar").changed();
+                    changed |= ui.checkbox(&mut s.use_embedded_webview, "Resolver captchas/Turnstile dentro do VortexDL (WebView2)").changed();
 
                     ui.add_space(8.0);
                     ui.separator();

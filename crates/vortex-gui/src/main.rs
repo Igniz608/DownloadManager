@@ -3,6 +3,8 @@
 mod app;
 mod format;
 mod theme;
+#[cfg(windows)]
+mod webview_resolver;
 
 use app::{NavTab, TrayControls, VortexApp};
 use std::collections::HashMap;
@@ -127,6 +129,17 @@ fn main() -> eframe::Result<()> {
         .map(|a| a.trim().to_string())
         .filter(|a| !a.is_empty())
         .collect();
+
+    #[cfg(windows)]
+    if cli_args.first().is_some_and(|a| a == "--webview-resolver") {
+        if let (Some(port_str), Some(initial_url)) = (cli_args.get(1), cli_args.get(2)) {
+            if let Ok(port) = port_str.parse::<u16>() {
+                webview_resolver::run_resolver_window(port, initial_url.clone());
+                return Ok(());
+            }
+        }
+        return Ok(());
+    }
 
     if !cli_args.is_empty() {
         let port = load_settings().ipc_port;

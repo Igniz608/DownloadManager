@@ -940,54 +940,68 @@ impl DownloadManager {
             .map(|s| s.trim().to_string())
             .filter(|s| s.starts_with("http://") || s.starts_with("https://"));
 
-        let mut matched_ids: Vec<(Uuid, String, HashMap<String, String>)> = Vec::new();
+        let mut matched_ids: Vec<(Uuid, String, HashMap<String, String>, bool)> = Vec::new();
         {
             let mut g = self.grabbed_links.write();
-            let mut match_against = |target: &str, out: &mut Vec<(Uuid, String, HashMap<String, String>)>| {
-                for link in g.iter_mut() {
-                    if !browser_page_url_matches(&link.url, target) {
-                        continue;
-                    }
-                    if let Some(ref direct) = clean_direct {
-                        link.url = direct.clone();
-                        for (k, v) in &headers {
-                            if !v.trim().is_empty() {
-                                link.headers.insert(k.clone(), v.clone());
-                            }
+            let mut match_against =
+                |target: &str, out: &mut Vec<(Uuid, String, HashMap<String, String>, bool)>| {
+                    for link in g.iter_mut() {
+                        if !browser_page_url_matches(&link.url, target) {
+                            continue;
                         }
-                        if let Some(ref fname) = filename {
-                            let clean_fname = sanitize_filename(fname.trim());
-                            let looks_generic = !link.filename.contains('.')
-                                || link.filename.len() <= 16 && link.part_number.is_none();
-                            if !clean_fname.is_empty() && (looks_generic || link.filename.is_empty())
-                            {
-                                let mp = detect_multipart(&clean_fname);
-                                link.category = FileCategory::from_filename(&clean_fname);
-                                link.package_key = mp.as_ref().map(|m| m.package_key.clone());
-                                link.part_number = mp.as_ref().map(|m| m.part_number);
-                                link.filename = clean_fname;
+                        if let Some(ref direct) = clean_direct {
+                            let same_page_retry = browser_page_url_matches(direct, &link.url);
+                            if !same_page_retry {
+                                link.url = direct.clone();
                             }
+                            for (k, v) in &headers {
+                                if !v.trim().is_empty() {
+                                    link.headers.insert(k.clone(), v.clone());
+                                }
+                            }
+                            if let Some(ref fname) = filename {
+                                let clean_fname = sanitize_filename(fname.trim());
+                                let looks_generic = !link.filename.contains('.')
+                                    || link.filename.len() <= 16 && link.part_number.is_none();
+                                if !clean_fname.is_empty()
+                                    && (looks_generic || link.filename.is_empty())
+                                {
+                                    let mp = detect_multipart(&clean_fname);
+                                    link.category = FileCategory::from_filename(&clean_fname);
+                                    link.package_key = mp.as_ref().map(|m| m.package_key.clone());
+                                    link.part_number = mp.as_ref().map(|m| m.part_number);
+                                    link.filename = clean_fname;
+                                }
+                            }
+                            link.online = if same_page_retry { None } else { Some(true) };
+                            link.error = None;
+                            link.selected = !same_page_retry;
+                            link.probing = true;
+                            out.push((
+                                link.id,
+                                if same_page_retry {
+                                    link.url.clone()
+                                } else {
+                                    direct.clone()
+                                },
+                                link.headers.clone(),
+                                same_page_retry,
+                            ));
+                        } else {
+                            link.probing = false;
+                            link.online = Some(false);
+                            link.error = Some(
+                                error
+                                    .clone()
+                                    .filter(|s| !s.trim().is_empty())
+                                    .unwrap_or_else(|| {
+                                        "Falha ao resolver Turnstile no navegador".to_string()
+                                    }),
+                            );
+                            out.push((link.id, String::new(), HashMap::new(), false));
                         }
-                        link.online = Some(true);
-                        link.error = None;
-                        link.selected = true;
-                        link.probing = true;
-                        out.push((link.id, direct.clone(), link.headers.clone()));
-                    } else {
-                        link.probing = false;
-                        link.online = Some(false);
-                        link.error = Some(
-                            error
-                                .clone()
-                                .filter(|s| !s.trim().is_empty())
-                                .unwrap_or_else(|| {
-                                    "Falha ao resolver Turnstile no navegador".to_string()
-                                }),
-                        );
-                        out.push((link.id, String::new(), HashMap::new()));
                     }
-                }
-            };
+                };
             match_against(&norm_page, &mut matched_ids);
             if matched_ids.is_empty() {
                 if let Some(ref active_url) = active_fallback {
@@ -1004,12 +1018,39 @@ impl DownloadManager {
         if clean_direct.is_some() && matched {
             let mgr = self.clone();
             let client = self.client.clone();
-            let probe_targets: Vec<(Uuid, String, HashMap<String, String>)> = matched_ids
+            let probe_targets: Vec<(Uuid, String, HashMap<String, String>, bool)> = matched_ids
                 .into_iter()
-                .filter(|(_, u, _)| !u.is_empty())
+                .filter(|(_, u, _, _)| !u.is_empty())
                 .collect();
             self.runtime.spawn(async move {
-                for (id, direct, hdrs) in probe_targets {
+                for (id, direct, hdrs, same_page_retry) in probe_targets {
+                    if same_page_retry {
+                        let resolved = probe_grabbed_links(&client, vec![direct], hdrs).await;
+                        let mut g = mgr.grabbed_links.write();
+                        if let Some(link) = g.iter_mut().find(|l| l.id == id) {
+                            link.probing = false;
+                            if let Some(first) = resolved.into_iter().next() {
+                                link.url = first.url;
+                                link.filename = first.filename;
+                                link.size_bytes = first.size_bytes;
+                                link.supports_ranges = first.supports_ranges;
+                                link.online = first.online;
+                                link.error = first.error;
+                                link.category = first.category;
+                                link.package_key = first.package_key;
+                                link.part_number = first.part_number;
+                                link.source_site = first.source_site;
+                                for (k, v) in first.headers {
+                                    link.headers.entry(k).or_insert(v);
+                                }
+                                link.selected = is_valid_grabbed_link(link);
+                            }
+                        }
+                        assign_package_totals(&mut g);
+                        sort_grabbed_links(&mut g);
+                        continue;
+                    }
+
                     let probe_res = probe_url(&client, &direct, &hdrs).await;
                     let mut g = mgr.grabbed_links.write();
                     if let Some(link) = g.iter_mut().find(|l| l.id == id) {
@@ -2422,7 +2463,7 @@ pub fn is_browser_resolvable_link(link: &GrabbedLink) -> bool {
     }
     link.error.as_deref().is_some_and(|e| {
         let low = e.to_ascii_lowercase();
-        low.contains("turnstile") || low.contains("cloudflare")
+        low.contains("turnstile") || low.contains("cloudflare") || low.contains("captcha")
     })
 }
 

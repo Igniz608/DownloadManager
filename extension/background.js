@@ -154,6 +154,12 @@ async function sendToVortex(endpoint, payload) {
       chrome.runtime.sendNativeMessage(NATIVE_HOST, { action, payload }, (res) => {
         if (chrome.runtime.lastError) {
           resolve({ ok: false, error: chrome.runtime.lastError.message });
+        } else if (res && res.ok === false && !res.error) {
+          const errMsg =
+            res.data?.error ||
+            res.data?.message ||
+            (res.status ? `HTTP ${res.status}` : "Falha no Native Host");
+          resolve({ ...res, error: errMsg });
         } else {
           resolve(res || { ok: true });
         }

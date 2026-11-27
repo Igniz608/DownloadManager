@@ -54,6 +54,10 @@ foreach ($f in $RequiredFiles) {
     Copy-Item (Join-Path $ReleaseDir $f) -Destination (Join-Path $StagingDir $f)
 }
 Copy-Item (Join-Path $RepoRoot "extension") -Destination (Join-Path $StagingDir "extension") -Recurse
+$FirefoxXpi = Join-Path $RepoRoot "installer\vortexdl-firefox.xpi"
+if (Test-Path $FirefoxXpi) {
+    Copy-Item $FirefoxXpi -Destination (Join-Path $StagingDir "vortexdl-firefox.xpi")
+}
 New-Item -ItemType File -Force -Path (Join-Path $StagingDir "portable.flag") | Out-Null
 
 $ReadmeText = @"
@@ -63,8 +67,10 @@ VortexDL Portable v$Version
 - Todos os dados (configurações, fila, yt-dlp/FFmpeg e perfil WebView2) são salvos na pasta .\data ao lado do executável enquanto o arquivo portable.flag existir.
 - Para integrar com seu navegador:
   1. Abra o vortex-gui.exe e vá na aba "Extensão".
-  2. Marque os navegadores instalados e clique em "Integrar Selecionados e Abrir Extensões".
-  3. O caminho da pasta .\extension já vai copiado para a área de transferência; ative o Modo do desenvolvedor e clique em "Carregar sem compactação" (Ctrl+V).
+  2. Marque os navegadores instalados e clique em "Integrar Selecionados".
+  3. Edge: instala automaticamente pela Microsoft Edge Add-ons Store (reinicie o Edge se estiver aberto).
+  4. Firefox: abre o pacote assinado vortexdl-firefox.xpi direto no Firefox (clique em "Adicionar", sem about:debugging).
+  5. Chrome / Brave / Vivaldi / Opera: o caminho da pasta .\extension já vai copiado; ative o Modo do desenvolvedor e clique em "Carregar sem compactação" (Ctrl+V).
 "@
 Set-Content -Path (Join-Path $StagingDir "LEIA-ME-PORTABLE.txt") -Value $ReadmeText -Encoding UTF8
 

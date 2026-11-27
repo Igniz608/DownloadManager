@@ -363,6 +363,8 @@ pub const EDGE_STORE_EXTENSION_ID: &str = "kgkaideidlhnmjneefpgilmifehcncni";
 pub const EDGE_STORE_UPDATE_URL: &str = "https://edge.microsoft.com/extensionwebstorebase/v1/crx";
 pub const EDGE_STORE_LISTING_URL: &str =
     "https://microsoftedge.microsoft.com/addons/detail/kgkaideidlhnmjneefpgilmifehcncni";
+pub const FIREFOX_EXTENSION_ID: &str = "vortexdl@igniz608.dev";
+pub const FIREFOX_SIGNED_XPI_NAME: &str = "vortexdl-firefox.xpi";
 
 pub fn build_chromium_allowed_origins(chrome_extension_id: Option<&str>) -> Vec<String> {
     let effective_id = chrome_extension_id
@@ -593,6 +595,46 @@ pub fn resolve_extension_dir(anchor_exe: Option<&Path>) -> Option<PathBuf> {
         .find(|dir| dir.join("manifest.json").is_file())
 }
 
+pub fn resolve_firefox_xpi_path(anchor_exe: Option<&Path>) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(exe) = anchor_exe {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(FIREFOX_SIGNED_XPI_NAME));
+            candidates.push(dir.join("installer").join(FIREFOX_SIGNED_XPI_NAME));
+            if let Some(p1) = dir.parent() {
+                candidates.push(p1.join(FIREFOX_SIGNED_XPI_NAME));
+                candidates.push(p1.join("installer").join(FIREFOX_SIGNED_XPI_NAME));
+                if let Some(p2) = p1.parent() {
+                    candidates.push(p2.join(FIREFOX_SIGNED_XPI_NAME));
+                    candidates.push(p2.join("installer").join(FIREFOX_SIGNED_XPI_NAME));
+                }
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(FIREFOX_SIGNED_XPI_NAME));
+        candidates.push(cwd.join("installer").join(FIREFOX_SIGNED_XPI_NAME));
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+pub fn open_firefox_xpi_installer(anchor_exe: Option<&Path>) -> Result<PathBuf> {
+    let Some(xpi_path) = resolve_firefox_xpi_path(anchor_exe) else {
+        anyhow::bail!("Pacote assinado {FIREFOX_SIGNED_XPI_NAME} não encontrado");
+    };
+    let installed = detect_installed_browsers();
+    if let Some(firefox) = installed
+        .into_iter()
+        .find(|b| b.kind == BrowserKind::Firefox)
+    {
+        std::process::Command::new(&firefox.exe_path)
+            .arg(&xpi_path)
+            .spawn()?;
+        return Ok(xpi_path);
+    }
+    anyhow::bail!("Mozilla Firefox não encontrado no sistema");
+}
+
 pub fn open_browser_extensions_page(kind: BrowserKind) -> Result<()> {
     let installed = detect_installed_browsers();
     if let Some(browser) = installed.into_iter().find(|b| b.kind == kind) {
@@ -702,7 +744,7 @@ pub fn register_browser_native_host_for(
             "description": "VortexDL Native Messaging Host",
             "path": native_host_exe.to_string_lossy(),
             "type": "stdio",
-            "allowed_extensions": ["vortexdl@igniz608.dev"]
+            "allowed_extensions": [FIREFOX_EXTENSION_ID]
         });
         std::fs::write(
             &firefox_manifest_path,
@@ -878,5 +920,18 @@ mod tests {
                 format!("chrome-extension://{DEFAULT_CHROME_EXTENSION_ID}/"),
             ]
         );
+    }
+
+    #[test]
+    fn resolve_firefox_xpi_path_finds_installer_bundle() {
+        let dir = std::env::temp_dir().join(format!("vortex_xpi_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let fake_exe = dir.join("vortex-gui.exe");
+        let xpi = dir.join(FIREFOX_SIGNED_XPI_NAME);
+        std::fs::write(&fake_exe, b"").expect("write exe");
+        std::fs::write(&xpi, b"PK").expect("write xpi");
+        let found = resolve_firefox_xpi_path(Some(&fake_exe));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found, Some(xpi));
     }
 }

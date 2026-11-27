@@ -29,6 +29,10 @@ cargo build --release --workspace
 1. Install VortexDL with the Windows Setup (`VortexDL-Setup`) keeping **Microsoft Edge** checked (or click **Integrar Selecionados** inside **Extensão Navegador**).
 2. VortexDL registers `com.vortexdl.host` (`allowed_origins` includes Store ID `kgkaideidlhnmjneefpgilmifehcncni`) and configures `HKCU\Software\Microsoft\Edge\Extensions\kgkaideidlhnmjneefpgilmifehcncni` automatically — no Developer mode required.
 
+### Mozilla Firefox (1-Click Signed XPI)
+1. Install VortexDL with **Mozilla Firefox** checked (or click **Instalar no Firefox (.xpi)** / **Integrar Selecionados** inside **Extensão Navegador**).
+2. VortexDL registers `com.vortexdl.host` (`vortexdl@igniz608.dev`) and launches the Mozilla-signed `vortexdl-firefox.xpi` directly in Firefox so you can confirm in 1 click (**Add**) — no `about:debugging` required.
+
 ### Chrome / Brave / Vivaldi / Opera (Local Unpacked)
 1. Open `chrome://extensions` (or the browser's extensions page) and enable **Developer mode**.
 2. Click **Load unpacked** and select the `extension/` folder.

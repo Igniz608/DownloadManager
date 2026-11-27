@@ -51,6 +51,7 @@ Source: "{#ReleaseDir}\vortex-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#ReleaseDir}\vortex-native-host.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#ReleaseDir}\WebView2Loader.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\installer\vortexdl.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RepoRoot}\installer\vortexdl-firefox.xpi"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\extension\*"; DestDir: "{app}\extension"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
@@ -59,7 +60,7 @@ Name: "{autodesktop}\VortexDL"; Filename: "{app}\vortex-gui.exe"; IconFilename: 
 
 [Run]
 Filename: "{app}\vortex-gui.exe"; Parameters: "{code:GetSilentSetupParams}"; Flags: runhidden waituntilterminated; Check: HasSilentSetupAction
-Filename: "{app}\vortex-gui.exe"; Parameters: "{code:GetFinishOpenExtParams}"; Description: "Abrir VortexDL e configurar a extensão nos outros navegadores selecionados"; Flags: postinstall nowait skipifsilent; Check: HasManualBrowsers
+Filename: "{app}\vortex-gui.exe"; Parameters: "{code:GetFinishOpenExtParams}"; Description: "Abrir VortexDL e concluir a extensão nos navegadores selecionados"; Flags: postinstall nowait skipifsilent; Check: HasManualBrowsers
 Filename: "{app}\vortex-gui.exe"; Parameters: "--tab=extension"; Description: "Abrir VortexDL (extensão do Microsoft Edge configurada automaticamente)"; Flags: postinstall nowait skipifsilent; Check: OnlyEdgeSelected
 Filename: "{app}\vortex-gui.exe"; Description: "Abrir o VortexDL"; Flags: postinstall nowait skipifsilent; Check: NoSelectedBrowsers
 
@@ -121,7 +122,7 @@ begin
     wpSelectTasks,
     'Integração com Navegadores',
     'Escolha em quais navegadores deseja integrar o VortexDL.',
-    'Para o Microsoft Edge, a extensão oficial (Edge Add-ons Store) e o Native Messaging Host são configurados automaticamente — sem Modo do Desenvolvedor. Para os demais navegadores, o Native Host e a pasta extension/ ficam prontos.',
+    'Microsoft Edge (Edge Add-ons Store) é configurado automaticamente; no Firefox, o pacote assinado (.xpi) abre com 1 clique sem Modo do Desenvolvedor; nos demais navegadores Chromium, o Native Host e a pasta extension/ ficam prontos.',
     False,
     False
   );

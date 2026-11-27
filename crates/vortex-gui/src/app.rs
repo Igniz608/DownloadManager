@@ -14,9 +14,10 @@ use tray_icon::{MouseButton, TrayIcon, TrayIconEvent};
 use uuid::Uuid;
 use vortex_core::ipc_server::{
     BrowserKind, DEFAULT_CHROME_EXTENSION_ID, DetectedBrowser, EDGE_STORE_EXTENSION_ID,
-    detect_installed_browsers, is_edge_store_extension_registered, is_magnet_protocol_registered,
-    open_browser_extensions_page, open_edge_store_listing, register_browser_native_host_for,
-    register_magnet_protocol_handler, resolve_extension_dir,
+    FIREFOX_EXTENSION_ID, detect_installed_browsers, is_edge_store_extension_registered,
+    is_magnet_protocol_registered, open_browser_extensions_page, open_edge_store_listing,
+    open_firefox_xpi_installer, register_browser_native_host_for,
+    register_magnet_protocol_handler, resolve_extension_dir, resolve_firefox_xpi_path,
 };
 use vortex_core::state::is_portable_mode;
 use vortex_core::manager::{DownloadManager, ManagerSnapshot, default_torrent_dir_from_settings};
@@ -2998,6 +2999,7 @@ impl VortexApp {
 
                 ui.add_space(10.0);
                 let edge_auto_registered = is_edge_store_extension_registered();
+                let firefox_xpi_path = resolve_firefox_xpi_path(Some(&gui_exe));
                 ui.horizontal_wrapped(|ui| {
                     if edge_auto_registered {
                         pill(
@@ -3023,6 +3025,45 @@ impl VortexApp {
                             }
                             Err(e) => {
                                 self.ext_reg_status = Some(format!("Erro ao abrir Edge Store: {e}"));
+                            }
+                        }
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if firefox_xpi_path.is_some() {
+                        pill(
+                            ui,
+                            &format!("Firefox XPI Assinado Pronto ({FIREFOX_EXTENSION_ID})"),
+                            to_c32(theme.success),
+                            theme,
+                        );
+                    } else {
+                        pill(
+                            ui,
+                            &format!("Firefox ID: {FIREFOX_EXTENSION_ID}"),
+                            to_c32(theme.text_muted),
+                            theme,
+                        );
+                    }
+                    if ui
+                        .add_enabled(
+                            firefox_xpi_path.is_some(),
+                            egui::Button::new("Instalar no Firefox (.xpi)").small(),
+                        )
+                        .clicked()
+                    {
+                        match open_firefox_xpi_installer(Some(&gui_exe)) {
+                            Ok(path) => {
+                                self.ext_reg_status = Some(format!(
+                                    "Instalador 1-clique aberto no Firefox ({}). Clique em 'Adicionar' no popup.",
+                                    path.display()
+                                ));
+                            }
+                            Err(e) => {
+                                self.ext_reg_status =
+                                    Some(format!("Erro ao abrir .xpi no Firefox: {e}"));
                             }
                         }
                     }
@@ -3116,12 +3157,19 @@ impl VortexApp {
                                 Some(&chosen_browsers),
                             ) {
                                 Ok(browsers) => {
+                                    let includes_edge = chosen_browsers.contains(&BrowserKind::Edge);
+                                    let includes_firefox =
+                                        chosen_browsers.contains(&BrowserKind::Firefox);
+                                    let firefox_has_xpi =
+                                        includes_firefox && firefox_xpi_path.is_some();
                                     let manual_browsers: Vec<BrowserKind> = chosen_browsers
                                         .iter()
                                         .copied()
-                                        .filter(|k| *k != BrowserKind::Edge)
+                                        .filter(|k| {
+                                            *k != BrowserKind::Edge
+                                                && !(*k == BrowserKind::Firefox && firefox_has_xpi)
+                                        })
                                         .collect();
-                                    let includes_edge = chosen_browsers.contains(&BrowserKind::Edge);
 
                                     if !manual_browsers.is_empty() {
                                         if let Some(ref dir) = ext_dir {
@@ -3144,6 +3192,18 @@ impl VortexApp {
                                         parts.push(
                                             "Edge Store Auto-Install configurado (reinicie o Edge se estiver aberto)".to_string(),
                                         );
+                                    }
+                                    if firefox_has_xpi {
+                                        match open_firefox_xpi_installer(Some(&gui_exe)) {
+                                            Ok(_) => {
+                                                parts.push(
+                                                    "Firefox: instalador 1-clique (.xpi assinado) aberto — clique em 'Adicionar'".to_string(),
+                                                );
+                                            }
+                                            Err(e) => {
+                                                parts.push(format!("Firefox (.xpi): {e}"));
+                                            }
+                                        }
                                     }
                                     if !opened.is_empty() {
                                         parts.push(format!(
@@ -3218,7 +3278,8 @@ impl VortexApp {
                 ui.separator();
                 ui.label(RichText::new("Como funciona a instalação em cada navegador:").strong());
                 ui.label("• Microsoft Edge (Automático via Edge Add-ons Store): o Setup e o botão 'Integrar Selecionados' registram a extensão da loja automaticamente — sem Modo do Desenvolvedor. Basta reiniciar o Edge (ou clicar em 'Abrir na Microsoft Edge Add-ons').");
-                ui.label("• Chrome / Brave / Vivaldi / Opera / Firefox (sem loja): ao clicar em 'Integrar Selecionados', o caminho da pasta extension/ vai copiado para a área de transferência; ative o 'Modo do desenvolvedor', clique em 'Carregar sem compactação' e pressione Ctrl+V.");
+                ui.label("• Mozilla Firefox (1 clique via .xpi assinado pela Mozilla): o VortexDL abre o pacote assinado vortexdl-firefox.xpi direto no Firefox para aparecer o popup nativo 'Adicionar' — sem about:debugging.");
+                ui.label("• Chrome / Brave / Vivaldi / Opera (sem loja): ao clicar em 'Integrar Selecionados', o caminho da pasta extension/ vai copiado para a área de transferência; ative o 'Modo do desenvolvedor', clique em 'Carregar sem compactação' e pressione Ctrl+V.");
             });
     }
 

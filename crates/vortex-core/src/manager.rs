@@ -875,10 +875,17 @@ impl DownloadManager {
         self.grabber_probe_count.fetch_add(1, Ordering::Relaxed);
         self.runtime.spawn(async move {
             let links = probe_grabbed_links(&client, urls, headers).await;
-            let count = links.len();
+            let ignore_non_part = mgr.settings.read().grabber_ignore_non_part;
+            let mut kept_count = 0usize;
+            let mut ignored_non_part = 0usize;
             {
                 let mut g = mgr.grabbed_links.write();
                 for mut link in links {
+                    if !should_keep_grabbed_link(&link, ignore_non_part) {
+                        ignored_non_part += 1;
+                        continue;
+                    }
+                    kept_count += 1;
                     if !g.iter().any(|existing| existing.url == link.url) {
                         link.selected = is_valid_grabbed_link(&link);
                         g.push(link);
@@ -887,7 +894,13 @@ impl DownloadManager {
                 sort_grabbed_links(&mut g);
             }
             mgr.grabber_probe_count.fetch_sub(1, Ordering::Relaxed);
-            mgr.push_notice(format!("{count} link(s) analisados no LinkGrabber."));
+            if ignored_non_part > 0 {
+                mgr.push_notice(format!(
+                    "{kept_count} link(s) analisados no LinkGrabber ({ignored_non_part} sem Parte ignorado(s))."
+                ));
+            } else {
+                mgr.push_notice(format!("{kept_count} link(s) analisados no LinkGrabber."));
+            }
         });
     }
 
@@ -2446,6 +2459,10 @@ pub fn is_valid_grabbed_link(link: &GrabbedLink) -> bool {
         && link.size_bytes.is_some_and(|s| s > 0)
 }
 
+pub fn should_keep_grabbed_link(link: &GrabbedLink, ignore_non_part: bool) -> bool {
+    !ignore_non_part || link.part_number.is_some()
+}
+
 pub fn normalize_browser_page_url(raw: &str) -> String {
     let trimmed = raw.trim();
     if let Ok(mut parsed) = url::Url::parse(trimmed) {
@@ -3005,5 +3022,17 @@ mod tests {
         assert_eq!(updated.url, "https://cdn.vik1ngf1le.online/dl/xyz/fix.rar");
         assert_eq!(updated.online, Some(true));
         assert!(updated.selected);
+    }
+
+    #[test]
+    fn grabber_filter_ignores_non_part_links_when_enabled() {
+        let mut part_link = mk_link("game.part1.rar", Some(1024), Some(true));
+        part_link.part_number = Some(1);
+        let non_part_link = mk_link("Fix_Repair.rar", Some(1024), Some(true));
+
+        assert!(should_keep_grabbed_link(&part_link, true));
+        assert!(!should_keep_grabbed_link(&non_part_link, true));
+        assert!(should_keep_grabbed_link(&part_link, false));
+        assert!(should_keep_grabbed_link(&non_part_link, false));
     }
 }

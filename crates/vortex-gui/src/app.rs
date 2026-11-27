@@ -2051,39 +2051,58 @@ impl VortexApp {
                             .desired_width(150.0),
                     );
                     ui.checkbox(&mut self.grabber_delete_archives, "Apagar .part após extrair");
+                    let mut ignore_non_part = self.manager.settings.read().grabber_ignore_non_part;
+                    if ui
+                        .checkbox(&mut ignore_non_part, "Ignorar links sem Parte")
+                        .on_hover_text(
+                            "Descarta e oculta links que não foram detectados como Parte (#1, #2, ...)",
+                        )
+                        .changed()
+                    {
+                        self.manager.settings.write().grabber_ignore_non_part = ignore_non_part;
+                        let _ = self.manager.save_current_settings();
+                        if ignore_non_part {
+                            let mut g = self.manager.grabbed_links.write();
+                            for item in g.iter_mut() {
+                                if item.part_number.is_none() {
+                                    item.selected = false;
+                                }
+                            }
+                        }
+                    }
                 });
             });
 
         ui.add_space(8.0);
-        let total_count = snap.grabbed_links.len();
-        let selected_count = snap.grabbed_links.iter().filter(|l| l.selected).count();
-        let valid_count = snap
+        let ignore_non_part = self.manager.settings.read().grabber_ignore_non_part;
+        let visible_links: Vec<&vortex_core::model::GrabbedLink> = snap
             .grabbed_links
+            .iter()
+            .filter(|l| vortex_core::manager::should_keep_grabbed_link(l, ignore_non_part))
+            .collect();
+        let total_count = visible_links.len();
+        let selected_count = visible_links.iter().filter(|l| l.selected).count();
+        let valid_count = visible_links
             .iter()
             .filter(|l| vortex_core::manager::is_valid_grabbed_link(l))
             .count();
-        let matches_valid_only = snap
-            .grabbed_links
+        let matches_valid_only = visible_links
             .iter()
             .all(|l| l.selected == vortex_core::manager::is_valid_grabbed_link(l));
-        let offline_selected_count = snap
-            .grabbed_links
+        let offline_selected_count = visible_links
             .iter()
             .filter(|l| l.selected && l.online == Some(false))
             .count();
-        let browser_resolvable_urls: Vec<String> = snap
-            .grabbed_links
+        let browser_resolvable_urls: Vec<String> = visible_links
             .iter()
             .filter(|l| vortex_core::manager::is_browser_resolvable_link(l))
             .map(|l| l.url.clone())
             .collect();
         let browser_resolvable_count = browser_resolvable_urls.len();
-        let browser_any_waiting = snap
-            .grabbed_links
+        let browser_any_waiting = visible_links
             .iter()
             .any(|l| vortex_core::manager::is_browser_resolvable_link(l) && l.probing);
-        let total_size: u64 = snap
-            .grabbed_links
+        let total_size: u64 = visible_links
             .iter()
             .filter(|l| l.selected)
             .filter_map(|l| l.size_bytes)
@@ -2116,7 +2135,10 @@ impl VortexApp {
                 {
                     let mut g = grabber_mgr.grabbed_links.write();
                     for item in g.iter_mut() {
-                        item.selected = vortex_core::manager::is_valid_grabbed_link(item);
+                        item.selected = vortex_core::manager::should_keep_grabbed_link(
+                            item,
+                            ignore_non_part,
+                        ) && vortex_core::manager::is_valid_grabbed_link(item);
                     }
                 }
                 if ui
@@ -2125,7 +2147,10 @@ impl VortexApp {
                 {
                     let mut g = grabber_mgr.grabbed_links.write();
                     for item in g.iter_mut() {
-                        item.selected = true;
+                        item.selected = vortex_core::manager::should_keep_grabbed_link(
+                            item,
+                            ignore_non_part,
+                        );
                     }
                 }
                 if ui
@@ -2235,7 +2260,7 @@ impl VortexApp {
             let mut toggles: Vec<(Uuid, bool)> = Vec::new();
             let mut domain_toggles: Vec<(String, bool)> = Vec::new();
             let mut single_resolve_url: Option<String> = None;
-            let domain_groups = group_grabbed_links_by_domain(&snap.grabbed_links);
+            let domain_groups = group_grabbed_links_by_domain(&snap.grabbed_links, ignore_non_part);
 
             for (group_idx, group) in domain_groups.iter().enumerate() {
                 if group_idx > 0 {
@@ -4311,7 +4336,16 @@ mod tests {
             mk("Fix_Repair.rar", "https://gofile.io/d/fix", "Gofile", None, false),
         ];
 
-        let groups = group_grabbed_links_by_domain(&links);
+        let groups_filtered = group_grabbed_links_by_domain(&links, true);
+        assert_eq!(groups_filtered.len(), 2);
+        assert_eq!(groups_filtered[0].domain, "Pixeldrain");
+        assert_eq!(groups_filtered[0].links.len(), 2);
+        assert_eq!(groups_filtered[0].links[0].part_number, Some(1));
+        assert_eq!(groups_filtered[0].links[1].part_number, Some(2));
+        assert_eq!(groups_filtered[1].domain, "Gofile");
+        assert_eq!(groups_filtered[1].links.len(), 1);
+
+        let groups = group_grabbed_links_by_domain(&links, false);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].domain, "Pixeldrain");
         assert_eq!(groups[0].links[0].part_number, Some(1));
@@ -4347,9 +4381,13 @@ fn grabbed_link_domain(link: &vortex_core::model::GrabbedLink) -> String {
 
 fn group_grabbed_links_by_domain<'a>(
     links: &'a [vortex_core::model::GrabbedLink],
+    ignore_non_part: bool,
 ) -> Vec<DomainGrabbedGroup<'a>> {
     let mut groups: Vec<DomainGrabbedGroup<'a>> = Vec::new();
     for link in links {
+        if !vortex_core::manager::should_keep_grabbed_link(link, ignore_non_part) {
+            continue;
+        }
         let domain = grabbed_link_domain(link);
         if let Some(existing) = groups.iter_mut().find(|g| g.domain == domain) {
             existing.links.push(link);

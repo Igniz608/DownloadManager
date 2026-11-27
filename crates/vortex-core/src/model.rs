@@ -533,6 +533,8 @@ pub struct AppSettings {
     pub clipboard_monitor: bool,
     pub auto_start_downloads: bool,
     #[serde(default = "default_true")]
+    pub grabber_ignore_non_part: bool,
+    #[serde(default = "default_true")]
     pub use_embedded_webview: bool,
     #[serde(default)]
     pub close_to_tray: CloseToTrayMode,
@@ -564,6 +566,7 @@ impl Default for AppSettings {
             speed_limit_kbps: 0,
             clipboard_monitor: true,
             auto_start_downloads: true,
+            grabber_ignore_non_part: true,
             use_embedded_webview: true,
             close_to_tray: CloseToTrayMode::WhenDownloading,
             ipc_port: 17654,

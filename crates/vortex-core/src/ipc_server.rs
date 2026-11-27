@@ -679,9 +679,102 @@ pub fn open_edge_store_listing() -> Result<()> {
     }
 }
 
+fn edge_profile_preferences_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    #[cfg(windows)]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            let user_data = local.join("Microsoft").join("Edge").join("User Data");
+            if let Ok(entries) = std::fs::read_dir(&user_data) {
+                for entry in entries.flatten() {
+                    let pref = entry.path().join("Preferences");
+                    if pref.is_file() {
+                        paths.push(pref);
+                    }
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn preferences_has_external_uninstall(raw: &str, ext_id: &str) -> bool {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    val.get("extensions")
+        .and_then(|e| e.get("external_uninstalls"))
+        .and_then(|arr| arr.as_array())
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(|item| item.as_str() == Some(ext_id))
+        })
+}
+
+fn remove_external_uninstall_from_preferences(raw: &str, ext_id: &str) -> Option<String> {
+    let mut val = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let arr = val
+        .get_mut("extensions")?
+        .get_mut("external_uninstalls")?
+        .as_array_mut()?;
+    let before = arr.len();
+    arr.retain(|item| item.as_str() != Some(ext_id));
+    if arr.len() == before {
+        return None;
+    }
+    serde_json::to_string(&val).ok()
+}
+
+pub fn is_edge_process_running() -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let Ok(out) = std::process::Command::new("tasklist.exe")
+            .args(["/FI", "IMAGENAME eq msedge.exe", "/NH"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        else {
+            return false;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+        stdout.contains("msedge.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+pub fn is_edge_store_extension_suppressed() -> bool {
+    edge_profile_preferences_paths().into_iter().any(|pref| {
+        std::fs::read_to_string(&pref)
+            .is_ok_and(|raw| preferences_has_external_uninstall(&raw, EDGE_STORE_EXTENSION_ID))
+    })
+}
+
+pub fn clear_edge_store_external_uninstall_if_closed() -> bool {
+    if is_edge_process_running() {
+        return false;
+    }
+    let mut cleared = false;
+    for pref in edge_profile_preferences_paths() {
+        let Ok(raw) = std::fs::read_to_string(&pref) else {
+            continue;
+        };
+        if let Some(updated) = remove_external_uninstall_from_preferences(&raw, EDGE_STORE_EXTENSION_ID) {
+            if std::fs::write(&pref, updated).is_ok() {
+                cleared = true;
+            }
+        }
+    }
+    cleared
+}
+
 pub fn register_edge_store_extension() -> Result<()> {
     #[cfg(windows)]
     {
+        let _ = clear_edge_store_external_uninstall_if_closed();
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let key_path = format!(r"Software\Microsoft\Edge\Extensions\{EDGE_STORE_EXTENSION_ID}");
         let (key, _) = hkcu.create_subkey(&key_path)?;
@@ -950,5 +1043,16 @@ mod tests {
         let found = resolve_firefox_xpi_path(Some(&fake_exe));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(found, Some(xpi));
+    }
+
+    #[test]
+    fn edge_external_uninstall_cleanup_preserves_other_ids() {
+        let raw = r#"{"extensions":{"external_uninstalls":["otherid","kgkaideidlhnmjneefpgilmifehcncni"],"other":1}}"#;
+        assert!(preferences_has_external_uninstall(raw, EDGE_STORE_EXTENSION_ID));
+        let updated = remove_external_uninstall_from_preferences(raw, EDGE_STORE_EXTENSION_ID)
+            .expect("should update");
+        assert!(!preferences_has_external_uninstall(&updated, EDGE_STORE_EXTENSION_ID));
+        assert!(preferences_has_external_uninstall(&updated, "otherid"));
+        assert!(updated.contains("\"other\":1"));
     }
 }

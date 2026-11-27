@@ -15,9 +15,10 @@ use uuid::Uuid;
 use vortex_core::ipc_server::{
     BrowserKind, DEFAULT_CHROME_EXTENSION_ID, DetectedBrowser, EDGE_STORE_EXTENSION_ID,
     FIREFOX_EXTENSION_ID, detect_installed_browsers, is_edge_store_extension_registered,
-    is_magnet_protocol_registered, open_browser_extensions_page, open_edge_store_listing,
-    open_firefox_xpi_installer, register_browser_native_host_for,
-    register_magnet_protocol_handler, resolve_extension_dir, resolve_firefox_xpi_path,
+    is_edge_store_extension_suppressed, is_magnet_protocol_registered,
+    open_browser_extensions_page, open_edge_store_listing, open_firefox_xpi_installer,
+    register_browser_native_host_for, register_magnet_protocol_handler, resolve_extension_dir,
+    resolve_firefox_xpi_path,
 };
 use vortex_core::state::is_portable_mode;
 use vortex_core::manager::{DownloadManager, ManagerSnapshot, default_torrent_dir_from_settings};
@@ -2999,9 +3000,17 @@ impl VortexApp {
 
                 ui.add_space(10.0);
                 let edge_auto_registered = is_edge_store_extension_registered();
+                let edge_suppressed = is_edge_store_extension_suppressed();
                 let firefox_xpi_path = resolve_firefox_xpi_path(Some(&gui_exe));
                 ui.horizontal_wrapped(|ui| {
-                    if edge_auto_registered {
+                    if edge_auto_registered && edge_suppressed {
+                        pill(
+                            ui,
+                            "Edge: bloqueio de remoção anterior (clique em Abrir na Edge Add-ons -> Obter)",
+                            to_c32(theme.warning),
+                            theme,
+                        );
+                    } else if edge_auto_registered {
                         pill(
                             ui,
                             &format!("Edge Store Auto-Install Ativo ({EDGE_STORE_EXTENSION_ID})"),
@@ -3189,9 +3198,16 @@ impl VortexApp {
                                         browsers.join(", ")
                                     )];
                                     if includes_edge {
-                                        parts.push(
-                                            "Edge Store Auto-Install configurado (reinicie o Edge se estiver aberto)".to_string(),
-                                        );
+                                        if is_edge_store_extension_suppressed() {
+                                            let _ = open_edge_store_listing();
+                                            parts.push(
+                                                "Edge: extensão havia sido removida neste perfil; página da loja aberta para instalar em 1 clique ('Obter')".to_string(),
+                                            );
+                                        } else {
+                                            parts.push(
+                                                "Edge Store Auto-Install configurado (reinicie o Edge se estiver aberto)".to_string(),
+                                            );
+                                        }
                                     }
                                     if firefox_has_xpi {
                                         match open_firefox_xpi_installer(Some(&gui_exe)) {

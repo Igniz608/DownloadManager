@@ -15,9 +15,10 @@ use std::time::Duration;
 use tray_icon::menu::{Menu, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 use vortex_core::ipc_server::{
-    BrowserKind, open_browser_extensions_page, open_firefox_xpi_installer,
-    register_browser_native_host_for, register_magnet_protocol_handler, resolve_extension_dir,
-    resolve_firefox_xpi_path, spawn_ipc_server, unregister_browser_integration,
+    BrowserKind, is_edge_store_extension_suppressed, open_browser_extensions_page,
+    open_edge_store_listing, open_firefox_xpi_installer, register_browser_native_host_for,
+    register_magnet_protocol_handler, resolve_extension_dir, resolve_firefox_xpi_path,
+    spawn_ipc_server, unregister_browser_integration,
 };
 use vortex_core::manager::{DownloadManager, is_torrent_request};
 use vortex_core::model::NewDownloadRequest;
@@ -229,9 +230,16 @@ fn handle_setup_cli_flags(cli_args: &[String]) -> (bool, Option<NavTab>, Option<
                 }
             }
             if includes_edge {
-                messages.push(
-                    "Microsoft Edge configurado via Edge Add-ons Store (reinicie o Edge se estiver aberto)".to_string(),
-                );
+                if is_edge_store_extension_suppressed() {
+                    let _ = open_edge_store_listing();
+                    messages.push(
+                        "Microsoft Edge: extensão havia sido removida deste perfil; página da Edge Add-ons Store aberta para instalar em 1 clique ('Obter')".to_string(),
+                    );
+                } else {
+                    messages.push(
+                        "Microsoft Edge configurado via Edge Add-ons Store (reinicie o Edge se estiver aberto)".to_string(),
+                    );
+                }
             }
             if firefox_has_xpi && open_firefox_xpi_installer(Some(&gui_exe)).is_ok() {
                 messages.push(

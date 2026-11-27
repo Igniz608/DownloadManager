@@ -61,7 +61,7 @@ Name: "{autodesktop}\VortexDL"; Filename: "{app}\vortex-gui.exe"; IconFilename: 
 [Run]
 Filename: "{app}\vortex-gui.exe"; Parameters: "{code:GetSilentSetupParams}"; Flags: runhidden waituntilterminated; Check: HasSilentSetupAction
 Filename: "{app}\vortex-gui.exe"; Parameters: "{code:GetFinishOpenExtParams}"; Description: "Abrir VortexDL e concluir a extensão nos navegadores selecionados"; Flags: postinstall nowait skipifsilent; Check: HasManualBrowsers
-Filename: "{app}\vortex-gui.exe"; Parameters: "--tab=extension"; Description: "Abrir VortexDL (extensão do Microsoft Edge configurada automaticamente)"; Flags: postinstall nowait skipifsilent; Check: OnlyEdgeSelected
+Filename: "{app}\vortex-gui.exe"; Parameters: "{code:GetFinishOpenExtParams}"; Description: "Abrir VortexDL (extensão do Microsoft Edge configurada automaticamente)"; Flags: postinstall nowait skipifsilent; Check: OnlyEdgeSelected
 Filename: "{app}\vortex-gui.exe"; Description: "Abrir o VortexDL"; Flags: postinstall nowait skipifsilent; Check: NoSelectedBrowsers
 
 [UninstallRun]

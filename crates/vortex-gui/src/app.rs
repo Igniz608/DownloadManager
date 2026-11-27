@@ -4,20 +4,22 @@ use egui::{
     Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, ScrollArea, Sense, Stroke,
     Ui, Vec2,
 };
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tray_icon::TrayIcon;
 use tray_icon::menu::{MenuEvent, MenuId};
+use tray_icon::{MouseButton, TrayIcon, TrayIconEvent};
 use uuid::Uuid;
 use vortex_core::ipc_server::{
     is_magnet_protocol_registered, register_browser_native_host, register_magnet_protocol_handler,
 };
 use vortex_core::manager::{DownloadManager, ManagerSnapshot, default_torrent_dir_from_settings};
 use vortex_core::model::{
-    DownloadId, DownloadItem, DownloadKind, DownloadStatus, ExtractorKind, ExtractorProfile,
-    FileCategory, MediaProbeResult, NewDownloadRequest, NewMediaRequest, PackageId, ThemeConfig,
+    CloseToTrayMode, DownloadId, DownloadItem, DownloadKind, DownloadStatus, ExtractorKind,
+    ExtractorProfile, FileCategory, MediaProbeResult, NewDownloadRequest, NewMediaRequest,
+    PackageId, ThemeConfig,
 };
 use vortex_core::package_grabber::extract_urls_from_text;
 
@@ -157,6 +159,9 @@ pub struct VortexApp {
     last_api_card_height: f32,
     last_min_window_height: f32,
     webview_child: Option<std::process::Child>,
+    quit_requested: bool,
+    tray_menu_events: Arc<Mutex<Vec<MenuEvent>>>,
+    tray_icon_events: Arc<Mutex<Vec<TrayIconEvent>>>,
 }
 
 impl VortexApp {
@@ -168,6 +173,23 @@ impl VortexApp {
     ) -> Self {
         let settings = manager.settings.read().clone();
         apply_theme(&cc.egui_ctx, &settings.theme);
+
+        let tray_menu_events = Arc::new(Mutex::new(Vec::new()));
+        let tray_icon_events = Arc::new(Mutex::new(Vec::new()));
+        if tray.is_some() {
+            let menu_q = Arc::clone(&tray_menu_events);
+            let menu_ctx = cc.egui_ctx.clone();
+            MenuEvent::set_event_handler(Some(Arc::new(move |ev| {
+                menu_q.lock().push(ev);
+                menu_ctx.request_repaint();
+            })));
+            let icon_q = Arc::clone(&tray_icon_events);
+            let icon_ctx = cc.egui_ctx.clone();
+            TrayIconEvent::set_event_handler(Some(move |ev| {
+                icon_q.lock().push(ev);
+                icon_ctx.request_repaint();
+            }));
+        }
 
         Self {
             manager,
@@ -232,6 +254,9 @@ impl VortexApp {
             last_api_card_height: 96.0,
             last_min_window_height: 0.0,
             webview_child: None,
+            quit_requested: false,
+            tray_menu_events,
+            tray_icon_events,
         }
     }
 
@@ -270,20 +295,41 @@ impl VortexApp {
         self.active_tab = tab;
     }
 
-    fn handle_tray_events(&self, ctx: &egui::Context) {
+    fn restore_main_window(ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        #[cfg(windows)]
+        bring_main_window_to_front();
+    }
+
+    fn handle_tray_events(&mut self, ctx: &egui::Context) {
         let Some(ref tray) = self.tray else {
             return;
         };
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
+        let menu_events: Vec<MenuEvent> = self.tray_menu_events.lock().drain(..).collect();
+        for event in menu_events {
             if event.id == tray.show_id {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                Self::restore_main_window(ctx);
             } else if event.id == tray.pause_all_id {
                 self.manager.pause_all();
             } else if event.id == tray.resume_all_id {
                 self.manager.resume_all();
             } else if event.id == tray.quit_id {
+                self.quit_requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        let icon_events: Vec<TrayIconEvent> = self.tray_icon_events.lock().drain(..).collect();
+        for event in icon_events {
+            if matches!(
+                event,
+                TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                }
+            ) {
+                Self::restore_main_window(ctx);
             }
         }
     }
@@ -369,14 +415,22 @@ impl eframe::App for VortexApp {
 
         if self.manager.take_focus_grabber_request() {
             self.active_tab = NavTab::LinkGrabber;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            #[cfg(windows)]
-            bring_main_window_to_front();
+            Self::restore_main_window(&ctx);
         }
 
         let snap = self.manager.snapshot();
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_requested && self.tray.is_some()
+        {
+            let close_mode = self.manager.settings.read().close_to_tray;
+            let has_active_downloads = snap
+                .downloads
+                .iter()
+                .any(|d| d.status.is_active() || d.status == DownloadStatus::Queued);
+            if should_minimize_to_tray(close_mode, has_active_downloads) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
         let theme = self.manager.settings.read().theme.clone();
         let repaint_ms = if snap.active_count > 0 { 150 } else { 500 };
         ctx.request_repaint_after(Duration::from_millis(repaint_ms));
@@ -2958,6 +3012,30 @@ impl VortexApp {
                     changed |= ui.checkbox(&mut s.clipboard_monitor, "Monitorar área de transferência para links").changed();
                     changed |= ui.checkbox(&mut s.auto_start_downloads, "Iniciar downloads automaticamente ao adicionar").changed();
                     changed |= ui.checkbox(&mut s.use_embedded_webview, "Resolver captchas/Turnstile dentro do VortexDL (WebView2)").changed();
+                    ui.horizontal(|ui| {
+                        ui.label("Ao clicar no X (fechar janela):");
+                        let current_label = close_to_tray_label(s.close_to_tray);
+                        egui::ComboBox::from_id_salt("close_to_tray_mode")
+                            .selected_text(current_label)
+                            .show_ui(ui, |ui| {
+                                for mode in [
+                                    CloseToTrayMode::WhenDownloading,
+                                    CloseToTrayMode::Always,
+                                    CloseToTrayMode::Never,
+                                ] {
+                                    if ui
+                                        .selectable_value(
+                                            &mut s.close_to_tray,
+                                            mode,
+                                            close_to_tray_label(mode),
+                                        )
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                }
+                            });
+                    });
 
                     ui.add_space(8.0);
                     ui.separator();
@@ -3787,6 +3865,10 @@ fn bring_main_window_to_front() {
         fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> isize;
         fn ShowWindow(hWnd: isize, nCmdShow: i32) -> i32;
         fn IsIconic(hWnd: isize) -> i32;
+        fn GetForegroundWindow() -> isize;
+        fn GetWindowThreadProcessId(hWnd: isize, lpdwProcessId: *mut u32) -> u32;
+        fn GetCurrentThreadId() -> u32;
+        fn AttachThreadInput(idAttach: u32, idAttachTo: u32, fAttach: i32) -> i32;
         fn SetForegroundWindow(hWnd: isize) -> i32;
         fn BringWindowToTop(hWnd: isize) -> i32;
     }
@@ -3804,9 +3886,51 @@ fn bring_main_window_to_front() {
             } else {
                 let _ = ShowWindow(hwnd, SW_SHOW);
             }
+            let fg_hwnd = GetForegroundWindow();
+            let fg_tid = if fg_hwnd != 0 {
+                GetWindowThreadProcessId(fg_hwnd, std::ptr::null_mut())
+            } else {
+                0
+            };
+            let cur_tid = GetCurrentThreadId();
+            let attached = fg_tid != 0 && fg_tid != cur_tid && AttachThreadInput(fg_tid, cur_tid, 1) != 0;
             let _ = BringWindowToTop(hwnd);
             let _ = SetForegroundWindow(hwnd);
+            if attached {
+                let _ = AttachThreadInput(fg_tid, cur_tid, 0);
+            }
         }
+    }
+}
+
+fn should_minimize_to_tray(mode: CloseToTrayMode, has_active_downloads: bool) -> bool {
+    match mode {
+        CloseToTrayMode::WhenDownloading => has_active_downloads,
+        CloseToTrayMode::Always => true,
+        CloseToTrayMode::Never => false,
+    }
+}
+
+fn close_to_tray_label(mode: CloseToTrayMode) -> &'static str {
+    match mode {
+        CloseToTrayMode::WhenDownloading => "Minimizar para a bandeja se houver download ativo",
+        CloseToTrayMode::Always => "Sempre minimizar para a bandeja",
+        CloseToTrayMode::Never => "Sempre fechar o aplicativo",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_to_tray_defaults_to_when_downloading() {
+        let settings = vortex_core::model::AppSettings::default();
+        assert_eq!(settings.close_to_tray, CloseToTrayMode::WhenDownloading);
+        assert!(should_minimize_to_tray(settings.close_to_tray, true));
+        assert!(!should_minimize_to_tray(settings.close_to_tray, false));
+        assert!(should_minimize_to_tray(CloseToTrayMode::Always, false));
+        assert!(!should_minimize_to_tray(CloseToTrayMode::Never, true));
     }
 }
 

@@ -515,6 +515,14 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CloseToTrayMode {
+    #[default]
+    WhenDownloading,
+    Always,
+    Never,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub default_download_dir: PathBuf,
@@ -526,6 +534,8 @@ pub struct AppSettings {
     pub auto_start_downloads: bool,
     #[serde(default = "default_true")]
     pub use_embedded_webview: bool,
+    #[serde(default)]
+    pub close_to_tray: CloseToTrayMode,
     pub ipc_port: u16,
     pub ipc_token: String,
     pub yt_dlp_path: Option<String>,
@@ -555,6 +565,7 @@ impl Default for AppSettings {
             clipboard_monitor: true,
             auto_start_downloads: true,
             use_embedded_webview: true,
+            close_to_tray: CloseToTrayMode::WhenDownloading,
             ipc_port: 17654,
             ipc_token: Uuid::new_v4().to_string(),
             yt_dlp_path: None,

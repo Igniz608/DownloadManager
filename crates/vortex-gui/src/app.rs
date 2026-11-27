@@ -2233,32 +2233,159 @@ impl VortexApp {
         ui.add_space(6.0);
         ScrollArea::vertical().show(ui, |ui| {
             let mut toggles: Vec<(Uuid, bool)> = Vec::new();
+            let mut domain_toggles: Vec<(String, bool)> = Vec::new();
             let mut single_resolve_url: Option<String> = None;
-            for link in &snap.grabbed_links {
-                let can_browser_resolve = vortex_core::manager::is_browser_resolvable_link(link);
+            let domain_groups = group_grabbed_links_by_domain(&snap.grabbed_links);
+
+            for (group_idx, group) in domain_groups.iter().enumerate() {
+                if group_idx > 0 {
+                    ui.add_space(6.0);
+                }
+
+                let part_total = group
+                    .links
+                    .iter()
+                    .filter(|l| l.part_number.is_some())
+                    .count();
+                let part_selected = group
+                    .links
+                    .iter()
+                    .filter(|l| l.part_number.is_some() && l.selected)
+                    .count();
+                let non_part_count = group.links.len().saturating_sub(part_total);
+                let domain_selected_bytes: u64 = group
+                    .links
+                    .iter()
+                    .filter(|l| l.selected)
+                    .filter_map(|l| l.size_bytes)
+                    .sum();
+                let mut all_parts_selected = part_total > 0 && part_selected == part_total;
+                let partial_parts_selected = part_selected > 0 && part_selected < part_total;
+                let (tag, color) = site_badge_style(&group.domain, theme);
+
                 Frame::new()
-                    .fill(to_c32(theme.bg_card))
+                    .fill(to_c32(theme.bg_secondary))
                     .stroke(Stroke::new(1.0, to_c32(theme.border)))
                     .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin::symmetric(12, 8))
+                    .inner_margin(Margin::symmetric(12, 6))
                     .show(ui, |ui| {
-                        let row_avail = ui.available_width();
-                        let size_text = link
-                            .size_bytes
-                            .map(format_bytes)
-                            .unwrap_or_else(|| "Tamanho ?".into());
-                        let site_label = link
-                            .source_site
-                            .as_deref()
-                            .map(str::to_string)
-                            .or_else(|| {
-                                vortex_core::package_grabber::classify_source_site(&link.url)
-                            });
+                        ui.horizontal_wrapped(|ui| {
+                            let checkbox = egui::Checkbox::new(&mut all_parts_selected, "")
+                                .indeterminate(partial_parts_selected);
+                            let resp = ui
+                                .add_enabled(part_total > 0, checkbox)
+                                .on_hover_text(if part_total > 0 {
+                                    "Marcar/desmarcar todas as partes deste domínio (ignora links sem Parte)"
+                                } else {
+                                    "Nenhum link detectado como Parte neste domínio"
+                                });
+                            if resp.changed() {
+                                domain_toggles.push((group.domain.clone(), all_parts_selected));
+                            }
+                            pill(ui, &format!("{tag} • {}", group.domain), color, theme);
+                            let mut meta = if part_total > 0 {
+                                format!("{part_selected}/{part_total} parte(s)")
+                            } else {
+                                "0 parte(s)".to_string()
+                            };
+                            if non_part_count > 0 {
+                                meta.push_str(&format!(" • {non_part_count} sem Parte (ignorado)"));
+                            }
+                            if domain_selected_bytes > 0 {
+                                meta.push_str(&format!(" • {}", format_bytes(domain_selected_bytes)));
+                            }
+                            ui.label(
+                                RichText::new(meta)
+                                    .small()
+                                    .color(to_c32(theme.text_muted)),
+                            );
+                        });
+                    });
+                ui.add_space(4.0);
 
-                        if row_avail >= 680.0 * grabber_scale {
-                            egui::Sides::new().shrink_left().truncate().show(
-                                ui,
-                                |ui| {
+                for link in &group.links {
+                    let can_browser_resolve = vortex_core::manager::is_browser_resolvable_link(link);
+                    Frame::new()
+                        .fill(to_c32(theme.bg_card))
+                        .stroke(Stroke::new(1.0, to_c32(theme.border)))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            let row_avail = ui.available_width();
+                            let size_text = link
+                                .size_bytes
+                                .map(format_bytes)
+                                .unwrap_or_else(|| "Tamanho ?".into());
+                            let site_label = link
+                                .source_site
+                                .as_deref()
+                                .map(str::to_string)
+                                .or_else(|| {
+                                    vortex_core::package_grabber::classify_source_site(&link.url)
+                                });
+
+                            if row_avail >= 680.0 * grabber_scale {
+                                egui::Sides::new().shrink_left().truncate().show(
+                                    ui,
+                                    |ui| {
+                                        let mut sel = link.selected;
+                                        if ui.checkbox(&mut sel, "").changed() {
+                                            toggles.push((link.id, sel));
+                                        }
+                                        if let Some(ref site) = site_label {
+                                            let (tag, color) = site_badge_style(site, theme);
+                                            pill(ui, &format!("{tag} • {site}"), color, theme);
+                                        }
+                                        if link.probing {
+                                            ui.spinner();
+                                            pill(ui, "Resolvendo...", to_c32(theme.accent), theme);
+                                        } else {
+                                            match link.online {
+                                                Some(true) => pill(ui, "Online", to_c32(theme.success), theme),
+                                                Some(false) => {
+                                                    pill(ui, "Offline/Erro", to_c32(theme.error), theme)
+                                                }
+                                                None => {}
+                                            }
+                                        }
+                                        if let Some(ref pkg) = link.package_key {
+                                            pill(
+                                                ui,
+                                                &format!("Pacote: {pkg}"),
+                                                to_c32(theme.accent),
+                                                theme,
+                                            );
+                                        }
+                                        if let Some(pn) = link.part_number {
+                                            pill(
+                                                ui,
+                                                &format!("Parte #{pn}"),
+                                                to_c32(theme.warning),
+                                                theme,
+                                            );
+                                        }
+                                        ui.add(
+                                            egui::Label::new(RichText::new(&link.filename).strong())
+                                                .truncate(),
+                                        )
+                                        .on_hover_text(&link.url);
+                                    },
+                                    |ui| {
+                                        if can_browser_resolve
+                                            && ui
+                                                .small_button("Resolver")
+                                                .on_hover_text("Abrir no navegador para resolver Turnstile/Cloudflare")
+                                                .clicked()
+                                        {
+                                            single_resolve_url = Some(link.url.clone());
+                                        }
+                                        ui.label(
+                                            RichText::new(&size_text).color(to_c32(theme.text_muted)),
+                                        );
+                                    },
+                                );
+                            } else {
+                                ui.horizontal_wrapped(|ui| {
                                     let mut sel = link.selected;
                                     if ui.checkbox(&mut sel, "").changed() {
                                         toggles.push((link.id, sel));
@@ -2267,18 +2394,8 @@ impl VortexApp {
                                         let (tag, color) = site_badge_style(site, theme);
                                         pill(ui, &format!("{tag} • {site}"), color, theme);
                                     }
-                                    if link.probing {
-                                        ui.spinner();
-                                        pill(ui, "Resolvendo...", to_c32(theme.accent), theme);
-                                    } else {
-                                        match link.online {
-                                            Some(true) => pill(ui, "Online", to_c32(theme.success), theme),
-                                            Some(false) => {
-                                                pill(ui, "Offline/Erro", to_c32(theme.error), theme)
-                                            }
-                                            None => {}
-                                        }
-                                    }
+                                    ui.label(RichText::new(&link.filename).strong())
+                                        .on_hover_text(&link.url);
                                     if let Some(ref pkg) = link.package_key {
                                         pill(
                                             ui,
@@ -2295,13 +2412,18 @@ impl VortexApp {
                                             theme,
                                         );
                                     }
-                                    ui.add(
-                                        egui::Label::new(RichText::new(&link.filename).strong())
-                                            .truncate(),
-                                    )
-                                    .on_hover_text(&link.url);
-                                },
-                                |ui| {
+                                    if link.probing {
+                                        ui.spinner();
+                                        pill(ui, "Resolvendo...", to_c32(theme.accent), theme);
+                                    } else {
+                                        match link.online {
+                                            Some(true) => pill(ui, "Online", to_c32(theme.success), theme),
+                                            Some(false) => {
+                                                pill(ui, "Offline/Erro", to_c32(theme.error), theme)
+                                            }
+                                            None => {}
+                                        }
+                                    }
                                     if can_browser_resolve
                                         && ui
                                             .small_button("Resolver")
@@ -2313,77 +2435,28 @@ impl VortexApp {
                                     ui.label(
                                         RichText::new(&size_text).color(to_c32(theme.text_muted)),
                                     );
-                                },
-                            );
-                        } else {
-                            ui.horizontal_wrapped(|ui| {
-                                let mut sel = link.selected;
-                                if ui.checkbox(&mut sel, "").changed() {
-                                    toggles.push((link.id, sel));
-                                }
-                                if let Some(ref site) = site_label {
-                                    let (tag, color) = site_badge_style(site, theme);
-                                    pill(ui, &format!("{tag} • {site}"), color, theme);
-                                }
-                                ui.label(RichText::new(&link.filename).strong())
-                                    .on_hover_text(&link.url);
-                                if let Some(ref pkg) = link.package_key {
-                                    pill(
-                                        ui,
-                                        &format!("Pacote: {pkg}"),
-                                        to_c32(theme.accent),
-                                        theme,
-                                    );
-                                }
-                                if let Some(pn) = link.part_number {
-                                    pill(
-                                        ui,
-                                        &format!("Parte #{pn}"),
-                                        to_c32(theme.warning),
-                                        theme,
-                                    );
-                                }
-                                if link.probing {
-                                    ui.spinner();
-                                    pill(ui, "Resolvendo...", to_c32(theme.accent), theme);
-                                } else {
-                                    match link.online {
-                                        Some(true) => pill(ui, "Online", to_c32(theme.success), theme),
-                                        Some(false) => {
-                                            pill(ui, "Offline/Erro", to_c32(theme.error), theme)
-                                        }
-                                        None => {}
-                                    }
-                                }
-                                if can_browser_resolve
-                                    && ui
-                                        .small_button("Resolver")
-                                        .on_hover_text("Abrir no navegador para resolver Turnstile/Cloudflare")
-                                        .clicked()
-                                {
-                                    single_resolve_url = Some(link.url.clone());
-                                }
+                                });
+                            }
+                            if let Some(ref err) = link.error {
                                 ui.label(
-                                    RichText::new(&size_text).color(to_c32(theme.text_muted)),
+                                    RichText::new(err)
+                                        .small()
+                                        .color(if link.probing {
+                                            to_c32(theme.accent)
+                                        } else {
+                                            to_c32(theme.error)
+                                        }),
                                 );
-                            });
-                        }
-                        if let Some(ref err) = link.error {
-                            ui.label(
-                                RichText::new(err)
-                                    .small()
-                                    .color(if link.probing {
-                                        to_c32(theme.accent)
-                                    } else {
-                                        to_c32(theme.error)
-                                    }),
-                            );
-                        }
-                    });
-                ui.add_space(4.0);
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
             }
-            if !toggles.is_empty() {
+            if !domain_toggles.is_empty() || !toggles.is_empty() {
                 let mut g = self.manager.grabbed_links.write();
+                for (domain, sel) in domain_toggles {
+                    toggle_domain_part_links(&mut g, &domain, sel);
+                }
                 for (id, sel) in toggles {
                     if let Some(item) = g.iter_mut().find(|l| l.id == id) {
                         item.selected = sel;
@@ -4206,6 +4279,105 @@ mod tests {
             (pill_rect.center().y - combo_rect.center().y).abs() <= 0.5,
             "center.y mismatch: pill={pill_rect:?} combo={combo_rect:?}"
         );
+    }
+
+    #[test]
+    fn domain_grouping_orders_parts_first_and_bulk_toggle_ignores_non_parts() {
+        use vortex_core::model::{FileCategory, GrabbedLink};
+
+        let mk = |name: &str, url: &str, site: &str, part: Option<u32>, selected: bool| GrabbedLink {
+            id: Uuid::new_v4(),
+            url: url.into(),
+            filename: name.into(),
+            size_bytes: Some(1024),
+            online: Some(true),
+            probing: false,
+            supports_ranges: true,
+            category: FileCategory::Archive,
+            package_key: part.map(|_| "Game.rar".into()),
+            part_number: part,
+            part_total: None,
+            source_site: Some(site.into()),
+            selected,
+            headers: Default::default(),
+            error: None,
+        };
+
+        let mut links = vec![
+            mk("Fix_Repair.rar", "https://pixeldrain.com/u/fix", "Pixeldrain", None, false),
+            mk("Game.part2.rar", "https://pixeldrain.com/u/p2", "Pixeldrain", Some(2), false),
+            mk("Game.part1.rar", "https://gofile.io/d/p1", "Gofile", Some(1), false),
+            mk("Game.part1.rar", "https://pixeldrain.com/u/p1", "Pixeldrain", Some(1), false),
+            mk("Fix_Repair.rar", "https://gofile.io/d/fix", "Gofile", None, false),
+        ];
+
+        let groups = group_grabbed_links_by_domain(&links);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].domain, "Pixeldrain");
+        assert_eq!(groups[0].links[0].part_number, Some(1));
+        assert_eq!(groups[0].links[1].part_number, Some(2));
+        assert_eq!(groups[0].links[2].part_number, None);
+        assert_eq!(groups[1].domain, "Gofile");
+
+        toggle_domain_part_links(&mut links, "Pixeldrain", true);
+        assert!(!links[0].selected, "non-part Pixeldrain link must stay ignored");
+        assert!(links[1].selected, "Pixeldrain part2 must be selected");
+        assert!(!links[2].selected, "Gofile part1 must remain untouched");
+        assert!(links[3].selected, "Pixeldrain part1 must be selected");
+        assert!(!links[4].selected, "Gofile non-part must remain untouched");
+
+        toggle_domain_part_links(&mut links, "Pixeldrain", false);
+        assert!(!links[1].selected);
+        assert!(!links[3].selected);
+    }
+}
+
+struct DomainGrabbedGroup<'a> {
+    domain: String,
+    links: Vec<&'a vortex_core::model::GrabbedLink>,
+}
+
+fn grabbed_link_domain(link: &vortex_core::model::GrabbedLink) -> String {
+    link.source_site
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| vortex_core::package_grabber::classify_source_site(&link.url))
+        .unwrap_or_else(|| "Outros".to_string())
+}
+
+fn group_grabbed_links_by_domain<'a>(
+    links: &'a [vortex_core::model::GrabbedLink],
+) -> Vec<DomainGrabbedGroup<'a>> {
+    let mut groups: Vec<DomainGrabbedGroup<'a>> = Vec::new();
+    for link in links {
+        let domain = grabbed_link_domain(link);
+        if let Some(existing) = groups.iter_mut().find(|g| g.domain == domain) {
+            existing.links.push(link);
+        } else {
+            groups.push(DomainGrabbedGroup {
+                domain,
+                links: vec![link],
+            });
+        }
+    }
+    for group in &mut groups {
+        group.links.sort_by_key(|l| match l.part_number {
+            Some(pn) => (0u8, pn),
+            None => (1u8, u32::MAX),
+        });
+    }
+    groups
+}
+
+fn toggle_domain_part_links(
+    links: &mut [vortex_core::model::GrabbedLink],
+    domain: &str,
+    selected: bool,
+) {
+    for link in links.iter_mut() {
+        if link.part_number.is_some() && grabbed_link_domain(link) == domain {
+            link.selected = selected;
+        }
     }
 }
 

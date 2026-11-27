@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "VortexDL — Smart Download & Media Capture",
   "version": "1.0.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnIkYKjAI4NEd4arseJTuXcv2GAhk6tlJL8Rz/+D39hxTQ7GpAOZLS7/V6NiQVIegvahAg5hmh+30mBIqD8fgDQx99GwldbaXmxKHyCVeG2PTNAFO4GoOWNYcTddLHRt92mbdVVZ0WekYDiGk82mPt/9xbsWbKskQGrVZI4k+CePOvW3eQESSpJ4YOzD6FrfnbHwjJR2GE41O5tA/P4a7SJ21fLe71yDDRnFRgGHJC8X+gld4INfT6anJHGvQsvnuHYlyyWxwv+QiXqVeNbzRuqqlA2thZB7UAXKGzAo2fQaz6s3Z+IztUazf7rABp/zqkIGsVB36Mu2Ewp3Ia5IY2QIDAQAB",
   "description": "Captura downloads do navegador, detecta vídeos/streams (.m3u8, .mpd, .mp4) de qualquer site e envia links em lote/multi-parte para o VortexDL.",
   "permissions": [
     "downloads",

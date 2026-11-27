@@ -13,8 +13,11 @@ use tray_icon::menu::{MenuEvent, MenuId};
 use tray_icon::{MouseButton, TrayIcon, TrayIconEvent};
 use uuid::Uuid;
 use vortex_core::ipc_server::{
-    is_magnet_protocol_registered, register_browser_native_host, register_magnet_protocol_handler,
+    BrowserKind, DEFAULT_CHROME_EXTENSION_ID, DetectedBrowser, detect_installed_browsers,
+    is_magnet_protocol_registered, open_browser_extensions_page,
+    register_browser_native_host_for, register_magnet_protocol_handler, resolve_extension_dir,
 };
+use vortex_core::state::is_portable_mode;
 use vortex_core::manager::{DownloadManager, ManagerSnapshot, default_torrent_dir_from_settings};
 use vortex_core::model::{
     CloseToTrayMode, DownloadId, DownloadItem, DownloadKind, DownloadStatus, ExtractorKind,
@@ -147,6 +150,8 @@ pub struct VortexApp {
     // Native Messaging registration
     chrome_ext_id_input: String,
     ext_reg_status: Option<String>,
+    detected_browsers: Vec<DetectedBrowser>,
+    selected_browsers: HashSet<BrowserKind>,
 
     // Custom Theme save
     custom_theme_name: String,
@@ -206,6 +211,10 @@ impl VortexApp {
             }));
         }
 
+        let detected_browsers = detect_installed_browsers();
+        let selected_browsers: HashSet<BrowserKind> =
+            detected_browsers.iter().map(|b| b.kind).collect();
+
         Self {
             manager,
             runtime,
@@ -252,8 +261,10 @@ impl VortexApp {
             new_ext_args: "x -y -o\"{dest}\" \"{archive}\"".into(),
             new_ext_pw_arg: "-p{password}".into(),
             new_password_entry: String::new(),
-            chrome_ext_id_input: String::new(),
+            chrome_ext_id_input: DEFAULT_CHROME_EXTENSION_ID.to_string(),
             ext_reg_status: None,
+            detected_browsers,
+            selected_browsers,
             custom_theme_name: "Meu Tema".into(),
             pw_modal_id: None,
             pw_modal_input: String::new(),
@@ -310,6 +321,10 @@ impl VortexApp {
 
     pub fn set_active_tab(&mut self, tab: NavTab) {
         self.active_tab = tab;
+    }
+
+    pub fn set_ext_reg_status(&mut self, status: String) {
+        self.ext_reg_status = Some(status);
     }
 
     fn restore_main_window(ctx: &egui::Context) {
@@ -2956,34 +2971,98 @@ impl VortexApp {
         ui.add_space(10.0);
 
         let port = self.manager.settings.read().ipc_port;
+        let gui_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("vortex-gui.exe"));
+        let ext_dir = resolve_extension_dir(Some(&gui_exe));
+        let portable = is_portable_mode();
+
         Frame::new()
             .fill(to_c32(theme.bg_card))
             .stroke(Stroke::new(1.0, to_c32(theme.border)))
             .corner_radius(CornerRadius::same(theme.corner_radius as u8))
             .inner_margin(Margin::same(14))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     pill(ui, &format!("API Local Ativa: http://127.0.0.1:{port}"), to_c32(theme.success), theme);
+                    if portable {
+                        pill(ui, "Modo Portable (dados em ./data)", to_c32(theme.accent), theme);
+                    } else {
+                        pill(ui, "Modo Instalado", to_c32(theme.text_muted), theme);
+                    }
                     ui.label(
-                        RichText::new("A extensão funciona imediatamente via API Local e também via Native Messaging Host (que abre o app automaticamente se estiver fechado).")
+                        RichText::new("A extensão funciona via API Local e Native Messaging Host (abre o VortexDL automaticamente se estiver fechado).")
                             .small()
                             .color(to_c32(theme.text_muted)),
                     );
                 });
+
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label("ID da Extensão (Chrome/Edge, opcional):");
+                ui.label(RichText::new("1. Selecione os navegadores para integrar:").strong());
+                ui.horizontal_wrapped(|ui| {
+                    for kind in BrowserKind::ALL {
+                        let installed = self.detected_browsers.iter().any(|b| b.kind == kind);
+                        let mut checked = self.selected_browsers.contains(&kind);
+                        let label = if installed {
+                            kind.display_name().to_string()
+                        } else {
+                            format!("{} (não detectado)", kind.display_name())
+                        };
+                        if ui.checkbox(&mut checked, label).changed() {
+                            if checked {
+                                self.selected_browsers.insert(kind);
+                            } else {
+                                self.selected_browsers.remove(&kind);
+                            }
+                        }
+                    }
+                    if ui.small_button("Redetectar").clicked() {
+                        self.detected_browsers = detect_installed_browsers();
+                        self.selected_browsers =
+                            self.detected_browsers.iter().map(|b| b.kind).collect();
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("ID Fixo da Extensão (Chromium):");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.chrome_ext_id_input)
-                            .hint_text("ex: abcdefghijklmnopqrstuvwxyz123456 (vazio = qualquer)")
-                            .desired_width(340.0),
+                            .hint_text(DEFAULT_CHROME_EXTENSION_ID)
+                            .desired_width(300.0),
                     );
+                    if self.chrome_ext_id_input != DEFAULT_CHROME_EXTENSION_ID
+                        && ui.small_button("Restaurar Padrão").clicked()
+                    {
+                        self.chrome_ext_id_input = DEFAULT_CHROME_EXTENSION_ID.to_string();
+                    }
                 });
+
                 ui.add_space(8.0);
-                let gui_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("vortex-gui.exe"));
+                if let Some(ref dir) = ext_dir {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Pasta da extensão:").strong());
+                        ui.monospace(dir.display().to_string());
+                        if ui.small_button("Copiar caminho").clicked() {
+                            if let Ok(mut cb) = arboard::Clipboard::new() {
+                                if cb.set_text(dir.to_string_lossy().to_string()).is_ok() {
+                                    self.ext_reg_status = Some(format!(
+                                        "Caminho copiado: {}",
+                                        dir.display()
+                                    ));
+                                }
+                            }
+                        }
+                    });
+                }
+
+                ui.add_space(8.0);
                 let magnet_registered = is_magnet_protocol_registered(&gui_exe);
+                let chosen_browsers: Vec<BrowserKind> = BrowserKind::ALL
+                    .into_iter()
+                    .filter(|k| self.selected_browsers.contains(k))
+                    .collect();
+
                 ui.horizontal_wrapped(|ui| {
-                    if accent_button(ui, "Registrar Native Messaging Host no Windows", theme).clicked() {
+                    if accent_button(ui, "Integrar Selecionados e Abrir Extensões", theme).clicked() {
                         let host_exe = gui_exe
                             .parent()
                             .map(|d| d.join("vortex-native-host.exe"))
@@ -2994,10 +3073,63 @@ impl VortexApp {
                         } else {
                             Some(self.chrome_ext_id_input.as_str())
                         };
-                        match register_browser_native_host(&host_exe, id_opt) {
+                        if chosen_browsers.is_empty() {
+                            self.ext_reg_status =
+                                Some("Selecione ao menos um navegador acima.".to_string());
+                        } else {
+                            match register_browser_native_host_for(
+                                &host_exe,
+                                id_opt,
+                                Some(&chosen_browsers),
+                            ) {
+                                Ok(browsers) => {
+                                    if let Some(ref dir) = ext_dir {
+                                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                                            let _ = cb.set_text(dir.to_string_lossy().to_string());
+                                        }
+                                    }
+                                    let mut opened = Vec::new();
+                                    for &kind in &chosen_browsers {
+                                        if open_browser_extensions_page(kind).is_ok() {
+                                            opened.push(kind.display_name());
+                                        }
+                                    }
+                                    self.ext_reg_status = Some(format!(
+                                        "Native Host registrado para: {}. Página de extensões aberta em: {}. Caminho da pasta extension/ copiado!",
+                                        browsers.join(", "),
+                                        if opened.is_empty() {
+                                            "nenhum navegador encontrado".to_string()
+                                        } else {
+                                            opened.join(", ")
+                                        }
+                                    ));
+                                }
+                                Err(e) => {
+                                    self.ext_reg_status = Some(format!("Erro ao registrar: {e}"));
+                                }
+                            }
+                        }
+                    }
+
+                    if ui.button("Registrar Native Host").clicked() {
+                        let host_exe = gui_exe
+                            .parent()
+                            .map(|d| d.join("vortex-native-host.exe"))
+                            .unwrap_or_else(|| PathBuf::from("vortex-native-host.exe"));
+                        let id_opt = if self.chrome_ext_id_input.trim().is_empty() {
+                            None
+                        } else {
+                            Some(self.chrome_ext_id_input.as_str())
+                        };
+                        let target = if chosen_browsers.is_empty() {
+                            None
+                        } else {
+                            Some(chosen_browsers.as_slice())
+                        };
+                        match register_browser_native_host_for(&host_exe, id_opt, target) {
                             Ok(browsers) => {
                                 self.ext_reg_status = Some(format!(
-                                    "Registrado com sucesso para: {} (Host: {})",
+                                    "Native Host registrado para: {} (Host: {})",
                                     browsers.join(", "),
                                     host_exe.display()
                                 ));
@@ -3035,10 +3167,10 @@ impl VortexApp {
 
                 ui.add_space(12.0);
                 ui.separator();
-                ui.label(RichText::new("Como instalar a extensão no Chrome / Edge / Brave:").strong());
-                ui.label("1. Abra chrome://extensions (ou edge://extensions) e ative o 'Modo do desenvolvedor'.");
-                ui.label("2. Clique em 'Carregar sem compactação' (Load unpacked) e selecione a pasta `extension/` deste repositório.");
-                ui.label("3. O ícone do VortexDL aparecerá no navegador capturando downloads e detectando mídias em qualquer aba.");
+                ui.label(RichText::new("Como concluir a instalação no navegador (sem loja):").strong());
+                ui.label("1. Clique em 'Integrar Selecionados e Abrir Extensões' (ou conclua pelo Setup) — o caminho da pasta extension/ já vai copiado para a área de transferência.");
+                ui.label("2. No Chrome / Edge / Brave / Vivaldi / Opera: ative o 'Modo do desenvolvedor', clique em 'Carregar sem compactação' e pressione Ctrl+V para selecionar a pasta extension/.");
+                ui.label("3. Como o manifest possui chave fixa, o ID da extensão será sempre idêntico em qualquer PC e o Native Messaging conectará automaticamente.");
             });
     }
 

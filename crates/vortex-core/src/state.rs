@@ -1,7 +1,7 @@
 use crate::model::{AppSettings, DownloadItem, DownloadPackage};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistedState {
@@ -9,7 +9,28 @@ pub struct PersistedState {
     pub packages: Vec<DownloadPackage>,
 }
 
+pub fn portable_root_from_exe(exe_path: &Path) -> Option<PathBuf> {
+    let dir = exe_path.parent()?;
+    if dir.join("portable.flag").is_file() || dir.join("data").join("settings.json").is_file() {
+        Some(dir.to_path_buf())
+    } else {
+        None
+    }
+}
+
+pub fn portable_root_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    portable_root_from_exe(&exe)
+}
+
+pub fn is_portable_mode() -> bool {
+    portable_root_dir().is_some()
+}
+
 pub fn app_data_dir() -> PathBuf {
+    if let Some(root) = portable_root_dir() {
+        return root.join("data");
+    }
     let base = dirs::data_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -17,6 +38,9 @@ pub fn app_data_dir() -> PathBuf {
 }
 
 pub fn bin_dir() -> PathBuf {
+    if let Some(root) = portable_root_dir() {
+        return root.join("data").join("bin");
+    }
     let base = dirs::data_local_dir()
         .or_else(dirs::data_dir)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -77,4 +101,30 @@ pub fn save_state(state: &PersistedState) -> Result<()> {
     std::fs::write(&tmp, serde_json::to_string_pretty(state)?)?;
     std::fs::rename(tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_root_detects_flag_or_existing_data_settings() {
+        let base = std::env::temp_dir().join(format!("vortex_portable_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let fake_exe = base.join("vortex-gui.exe");
+
+        assert!(portable_root_from_exe(&fake_exe).is_none());
+
+        std::fs::write(base.join("portable.flag"), b"").unwrap();
+        assert_eq!(portable_root_from_exe(&fake_exe), Some(base.clone()));
+
+        std::fs::remove_file(base.join("portable.flag")).unwrap();
+        assert!(portable_root_from_exe(&fake_exe).is_none());
+
+        std::fs::create_dir_all(base.join("data")).unwrap();
+        std::fs::write(base.join("data").join("settings.json"), b"{}").unwrap();
+        assert_eq!(portable_root_from_exe(&fake_exe), Some(base.clone()));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

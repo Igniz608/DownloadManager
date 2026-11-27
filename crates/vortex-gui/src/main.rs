@@ -14,7 +14,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tray_icon::menu::{Menu, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
-use vortex_core::ipc_server::spawn_ipc_server;
+use vortex_core::ipc_server::{
+    BrowserKind, open_browser_extensions_page, register_browser_native_host_for,
+    register_magnet_protocol_handler, resolve_extension_dir, spawn_ipc_server,
+    unregister_browser_integration,
+};
 use vortex_core::manager::{DownloadManager, is_torrent_request};
 use vortex_core::model::NewDownloadRequest;
 use vortex_core::state::load_settings;
@@ -158,6 +162,87 @@ fn forward_arg_to_running_instance(port: u16, arg: &str) -> bool {
         .is_some_and(|code| (200..300).contains(&code))
 }
 
+fn handle_setup_cli_flags(cli_args: &[String]) -> (bool, Option<NavTab>, Option<String>) {
+    let mut no_gui = false;
+    let mut initial_tab: Option<NavTab> = None;
+    let mut ext_status: Option<String> = None;
+
+    let gui_exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("vortex-gui.exe"));
+    let host_exe = gui_exe
+        .parent()
+        .map(|d| d.join("vortex-native-host.exe"))
+        .unwrap_or_else(|| std::path::PathBuf::from("vortex-native-host.exe"));
+
+    let mut did_setup_action = false;
+    let mut messages: Vec<String> = Vec::new();
+
+    for arg in cli_args {
+        if arg == "--no-gui" {
+            no_gui = true;
+        } else if arg == "--uninstall-integration" {
+            unregister_browser_integration();
+            did_setup_action = true;
+        } else if arg == "--setup-magnet" {
+            if let Err(e) = register_magnet_protocol_handler(&gui_exe) {
+                tracing::warn!("Falha ao registrar magnet:// via CLI: {e}");
+            } else {
+                messages.push("Links magnet:// associados".to_string());
+            }
+            did_setup_action = true;
+        } else if let Some(spec) = arg.strip_prefix("--setup-browsers=") {
+            let browsers = BrowserKind::parse_list(spec);
+            if !browsers.is_empty() {
+                match register_browser_native_host_for(&host_exe, None, Some(&browsers)) {
+                    Ok(names) if !names.is_empty() => {
+                        messages.push(format!("Native Host registrado para: {}", names.join(", ")));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Falha ao registrar navegadores via CLI: {e}");
+                    }
+                }
+            }
+            did_setup_action = true;
+        } else if let Some(spec) = arg.strip_prefix("--open-extension-setup=") {
+            let browsers = BrowserKind::parse_list(spec);
+            if let Some(ext_dir) = resolve_extension_dir(Some(&gui_exe)) {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(ext_dir.to_string_lossy().to_string());
+                }
+            }
+            let mut opened = Vec::new();
+            for kind in browsers {
+                if open_browser_extensions_page(kind).is_ok() {
+                    opened.push(kind.display_name());
+                }
+            }
+            if !opened.is_empty() {
+                messages.push(format!(
+                    "Página de extensões aberta em: {} (caminho da pasta extension/ copiado)",
+                    opened.join(", ")
+                ));
+            }
+            initial_tab = Some(NavTab::Extension);
+            did_setup_action = true;
+        } else if let Some(tab) = arg.strip_prefix("--tab=") {
+            match tab.trim().to_ascii_lowercase().as_str() {
+                "extension" | "extensao" => initial_tab = Some(NavTab::Extension),
+                "grabber" | "links" => initial_tab = Some(NavTab::LinkGrabber),
+                "settings" | "config" => initial_tab = Some(NavTab::Settings),
+                "torrents" => initial_tab = Some(NavTab::Torrents),
+                "media" => initial_tab = Some(NavTab::Media),
+                _ => {}
+            }
+        }
+    }
+
+    if !messages.is_empty() {
+        ext_status = Some(messages.join(" • "));
+    }
+    let exit_immediately = no_gui || (did_setup_action && no_gui);
+    (exit_immediately, initial_tab, ext_status)
+}
+
 fn main() -> eframe::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -180,6 +265,11 @@ fn main() -> eframe::Result<()> {
                 return Ok(());
             }
         }
+        return Ok(());
+    }
+
+    let (exit_immediately, initial_tab, initial_ext_status) = handle_setup_cli_flags(&cli_args);
+    if exit_immediately {
         return Ok(());
     }
 
@@ -244,8 +334,13 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(move |cc| {
             let mut app = VortexApp::new(cc, manager, rt_handle, tray);
-            if opened_torrent {
+            if let Some(tab) = initial_tab {
+                app.set_active_tab(tab);
+            } else if opened_torrent {
                 app.set_active_tab(NavTab::Torrents);
+            }
+            if let Some(status) = initial_ext_status {
+                app.set_ext_reg_status(status);
             }
             Ok(Box::new(app))
         }),

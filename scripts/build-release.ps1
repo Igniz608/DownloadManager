@@ -102,6 +102,11 @@ $IssPath = Join-Path $RepoRoot "installer\vortexdl.iss"
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
 
 $SetupExe = Join-Path $DistDir "VortexDL-Setup-v$Version-win64.exe"
+$ExtPkgScript = Join-Path $PSScriptRoot "build-extension-packages.ps1"
+if (Test-Path $ExtPkgScript) {
+    & $ExtPkgScript -OutputDir $DistDir
+}
+
 Write-Host ""
 Write-Host "Release artifacts ready:" -ForegroundColor Green
 Get-Item $ZipPath, $SetupExe | ForEach-Object {

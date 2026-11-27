@@ -691,30 +691,7 @@ impl VortexApp {
         };
 
         let draw_speed_pill = |ui: &mut egui::Ui| {
-            Frame::new()
-                .fill(to_c32(theme.bg_card))
-                .stroke(Stroke::new(1.0, to_c32(theme.border)))
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(10, 4))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "DL {}",
-                                format_speed(snap.total_download_bps)
-                            ))
-                            .strong()
-                            .color(to_c32(theme.success)),
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "UL {}",
-                                format_speed(snap.total_upload_bps)
-                            ))
-                            .color(to_c32(theme.accent)),
-                        );
-                    });
-                });
+            draw_speed_monitor_pill(ui, snap.total_download_bps, snap.total_upload_bps, theme);
         };
 
         if rtl {
@@ -3793,15 +3770,7 @@ fn pill(ui: &mut Ui, text: &str, color: Color32, _theme: &ThemeConfig) {
     pill_with_size(ui, text, color, egui::vec2(6.0, 2.0), 0.0, 6);
 }
 
-fn render_media_tools_bar(
-    ui: &mut Ui,
-    yt_ok: bool,
-    ff_ok: bool,
-    theme: &ThemeConfig,
-    on_yt_dlp: impl FnOnce(),
-    on_ffmpeg: impl FnOnce(),
-) -> [egui::Rect; 4] {
-    let mut rects = [egui::Rect::NOTHING; 4];
+fn ui_button_height(ui: &Ui) -> f32 {
     let btn_text_h = egui::WidgetText::from("Ag")
         .into_galley(
             ui,
@@ -3811,8 +3780,75 @@ fn render_media_tools_bar(
         )
         .size()
         .y;
-    let button_h = (btn_text_h + 2.0 * ui.spacing().button_padding.y)
-        .max(ui.spacing().interact_size.y);
+    (btn_text_h + 2.0 * ui.spacing().button_padding.y).max(ui.spacing().interact_size.y)
+}
+
+fn draw_speed_monitor_pill(
+    ui: &mut Ui,
+    total_download_bps: u64,
+    total_upload_bps: u64,
+    theme: &ThemeConfig,
+) -> egui::Response {
+    let button_h = ui_button_height(ui);
+    let radius = theme.corner_radius.round().clamp(0.0, 24.0) as u8;
+    let dl_color = to_c32(theme.success);
+    let ul_color = to_c32(theme.accent);
+    let dl_galley = egui::WidgetText::from(
+        RichText::new(format!("DL {}", format_speed(total_download_bps)))
+            .strong()
+            .color(dl_color),
+    )
+    .into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Body,
+    );
+    let ul_galley = egui::WidgetText::from(
+        RichText::new(format!("UL {}", format_speed(total_upload_bps))).color(ul_color),
+    )
+    .into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Body,
+    );
+    let pad_x = ui.spacing().button_padding.x;
+    let gap = ui.spacing().item_spacing.x;
+    let total_w = pad_x * 2.0 + dl_galley.size().x + gap + ul_galley.size().x;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(total_w, button_h), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(radius),
+            to_c32(theme.bg_card),
+            Stroke::new(1.0, to_c32(theme.border)),
+            egui::StrokeKind::Inside,
+        );
+        let dl_pos = egui::pos2(
+            rect.left() + pad_x,
+            rect.center().y - dl_galley.size().y * 0.5,
+        );
+        let ul_pos = egui::pos2(
+            dl_pos.x + dl_galley.size().x + gap,
+            rect.center().y - ul_galley.size().y * 0.5,
+        );
+        ui.painter().galley(dl_pos, dl_galley, dl_color);
+        ui.painter().galley(ul_pos, ul_galley, ul_color);
+    }
+    response
+}
+
+fn render_media_tools_bar(
+    ui: &mut Ui,
+    yt_ok: bool,
+    ff_ok: bool,
+    theme: &ThemeConfig,
+    on_yt_dlp: impl FnOnce(),
+    on_ffmpeg: impl FnOnce(),
+) -> [egui::Rect; 4] {
+    let mut rects = [egui::Rect::NOTHING; 4];
+    let button_h = ui_button_height(ui);
     let radius = theme.corner_radius.round().clamp(0.0, 24.0) as u8;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().interact_size.y = button_h;
@@ -4138,6 +4174,38 @@ mod tests {
             assert!((rect.height() - base_h).abs() <= 0.5, "height mismatch: {captured:?}");
             assert!((rect.center().y - base_cy).abs() <= 0.5, "center.y mismatch: {captured:?}");
         }
+    }
+
+    #[test]
+    fn speed_monitor_pill_matches_combo_and_button_height() {
+        let ctx = egui::Context::default();
+        let theme = ThemeConfig::catppuccin_mocha();
+        apply_theme(&ctx, &theme);
+        let mut pill_rect = egui::Rect::NOTHING;
+        let mut combo_rect = egui::Rect::NOTHING;
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 200.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw_input, |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                combo_rect = egui::ComboBox::from_id_salt("test_combo")
+                    .selected_text("Tema: Catppuccin Mocha")
+                    .show_ui(ui, |_| {})
+                    .response
+                    .rect;
+                pill_rect = draw_speed_monitor_pill(ui, 0, 0, &theme).rect;
+            });
+        });
+        out.textures_delta.clear();
+        assert!(
+            (pill_rect.height() - combo_rect.height()).abs() <= 0.5,
+            "height mismatch: pill={pill_rect:?} combo={combo_rect:?}"
+        );
+        assert!(
+            (pill_rect.center().y - combo_rect.center().y).abs() <= 0.5,
+            "center.y mismatch: pill={pill_rect:?} combo={combo_rect:?}"
+        );
     }
 }
 

@@ -215,6 +215,7 @@ pub struct VortexApp {
     tray_icon_events: Arc<Mutex<Vec<TrayIconEvent>>>,
     last_tray_badge: TrayBadgeStatus,
     last_tray_counts: Option<(usize, usize, usize)>,
+    taskbar_progress: crate::taskbar::TaskbarProgressController,
 }
 
 impl VortexApp {
@@ -335,6 +336,7 @@ impl VortexApp {
             tray_icon_events,
             last_tray_badge: TrayBadgeStatus::Idle,
             last_tray_counts: None,
+            taskbar_progress: crate::taskbar::TaskbarProgressController::new(),
         }
     }
 
@@ -423,6 +425,14 @@ impl VortexApp {
         }
         let tooltip = tray_tooltip_from_counts(active, completed, failed);
         let _ = tray.tray.set_tooltip(Some(tooltip));
+    }
+
+    fn sync_taskbar_progress(&mut self) {
+        let progress = {
+            let dls = self.manager.downloads.read();
+            crate::taskbar::compute_taskbar_progress(&dls)
+        };
+        self.taskbar_progress.update(progress);
     }
 
     fn handle_tray_events(&mut self, ctx: &egui::Context) {
@@ -533,6 +543,7 @@ impl eframe::App for VortexApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_tray_events(ctx);
         self.sync_tray_badge();
+        self.sync_taskbar_progress();
 
         if matches!(*self.update_status.lock(), AppUpdateStatus::ReadyToRestart) && !self.quit_requested {
             self.quit_requested = true;

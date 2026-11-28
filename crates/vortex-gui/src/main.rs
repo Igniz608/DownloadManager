@@ -2,6 +2,7 @@
 
 mod app;
 mod format;
+mod taskbar;
 mod theme;
 #[cfg(windows)]
 mod webview_resolver;

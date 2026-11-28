@@ -4,14 +4,15 @@ use crate::extractor::{
     select_best_extractor,
 };
 use crate::http_engine::{
-    BandwidthLimiter, DownloadCancelHandle, HtmlPageDetected, ProgressSnapshot,
-    apply_custom_headers, build_http_client, probe_url, run_http_download,
-    run_http_download_with_options,
+    BandwidthLimiter, DestinationResolver, DownloadCancelHandle, HtmlPageDetected,
+    ProgressSnapshot, apply_custom_headers, build_http_client, part_file_path, paths_conflict,
+    probe_url, run_http_download_with_options_and_resolver, unique_destination_path_with_reserved,
 };
 use crate::media_engine::{
     MediaToolsStatus, compress_video_file, detect_media_tools, detect_media_url,
     install_ffmpeg_essentials, install_yt_dlp, plan_video_compression, probe_media_url,
-    probe_single_media_url, probe_video_file, run_media_download, unique_compressed_output_path,
+    probe_single_media_url, probe_video_file, run_media_download_with_resolver,
+    unique_compressed_output_path,
 };
 use crate::model::{
     AppSettings, CompressionJobSnapshot, CompressionJobStatus, DownloadId, DownloadItem,
@@ -387,66 +388,74 @@ impl DownloadManager {
         }
 
         let settings = self.settings.read().clone();
-        let filename = req
+        let raw_filename = req
             .filename
             .map(|f| sanitize_filename(&f))
             .unwrap_or_else(|| fallback_filename_from_url(&url_trimmed));
-        let category = FileCategory::from_filename(&filename);
+        let category = FileCategory::from_filename(&raw_filename);
         let base_dir = req.save_dir.unwrap_or_else(|| settings.default_download_dir.clone());
         let save_dir = if settings.categorize_into_subfolders {
             base_dir.join(category.subfolder())
         } else {
             base_dir
         };
-        let file_path = save_dir.join(&filename);
         let auto_start = req.start_immediately.unwrap_or(settings.auto_start_downloads);
 
         let id = Uuid::new_v4();
-        let item = DownloadItem {
-            id,
-            package_id: None,
-            part_index: None,
-            part_total: None,
-            kind: DownloadKind::Http,
-            status: if auto_start {
-                DownloadStatus::Queued
-            } else {
-                DownloadStatus::Paused
-            },
-            url: url_trimmed,
-            filename,
-            save_dir,
-            file_path,
-            category,
-            total_bytes: None,
-            downloaded_bytes: 0,
-            uploaded_bytes: 0,
-            speed_bps: 0,
-            upload_speed_bps: 0,
-            eta_seconds: None,
-            connections: req.connections.unwrap_or(settings.default_connections).clamp(1, 32),
-            supports_ranges: false,
-            segments: Vec::new(),
-            etag: None,
-            last_modified: None,
-            headers: req.headers,
-            checksum_expected: req.checksum,
-            checksum_verified: None,
-            media_info: None,
-            torrent_info: None,
-            auto_extract: req.auto_extract.unwrap_or(settings.auto_extract_archives),
-            extractor_override: req.extractor_override,
-            extract_password: req.extract_password,
-            extracted_to: None,
-            extraction_status: None,
-            extraction_progress: None,
-            created_at: Utc::now(),
-            completed_at: None,
-            error: None,
-            priority: 0,
-        };
+        {
+            let mut dls = self.downloads.write();
+            let file_path = Self::reserve_unique_path_locked(&dls, None, &save_dir, &raw_filename);
+            let filename = file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+                .unwrap_or(raw_filename);
+            let item = DownloadItem {
+                id,
+                package_id: None,
+                part_index: None,
+                part_total: None,
+                kind: DownloadKind::Http,
+                status: if auto_start {
+                    DownloadStatus::Queued
+                } else {
+                    DownloadStatus::Paused
+                },
+                url: url_trimmed,
+                filename,
+                save_dir,
+                file_path,
+                category,
+                total_bytes: None,
+                downloaded_bytes: 0,
+                uploaded_bytes: 0,
+                speed_bps: 0,
+                upload_speed_bps: 0,
+                eta_seconds: None,
+                connections: req.connections.unwrap_or(settings.default_connections).clamp(1, 32),
+                supports_ranges: false,
+                segments: Vec::new(),
+                etag: None,
+                last_modified: None,
+                headers: req.headers,
+                checksum_expected: req.checksum,
+                checksum_verified: None,
+                media_info: None,
+                torrent_info: None,
+                auto_extract: req.auto_extract.unwrap_or(settings.auto_extract_archives),
+                extractor_override: req.extractor_override,
+                extract_password: req.extract_password,
+                extracted_to: None,
+                extraction_status: None,
+                extraction_progress: None,
+                created_at: Utc::now(),
+                completed_at: None,
+                error: None,
+                priority: 0,
+            };
 
-        self.downloads.write().insert(0, item);
+            dls.insert(0, item);
+        }
         self.persist_now();
         self.pump_queue();
         Ok(id)
@@ -482,65 +491,74 @@ impl DownloadManager {
         let auto_start = start_immediately.unwrap_or(settings.auto_start_downloads);
 
         let id = Uuid::new_v4();
-        let item = DownloadItem {
-            id,
-            package_id: None,
-            part_index: None,
-            part_total: None,
-            kind: DownloadKind::Media,
-            status: if auto_start {
-                DownloadStatus::Queued
-            } else {
-                DownloadStatus::Paused
-            },
-            url: req.url,
-            filename: title_clean.clone(),
-            save_dir: save_dir.clone(),
-            file_path: save_dir.join(&title_clean),
-            category: if req.audio_only {
-                FileCategory::Audio
-            } else {
-                FileCategory::Video
-            },
-            total_bytes: None,
-            downloaded_bytes: 0,
-            uploaded_bytes: 0,
-            speed_bps: 0,
-            upload_speed_bps: 0,
-            eta_seconds: None,
-            connections: settings.default_connections,
-            supports_ranges: false,
-            segments: Vec::new(),
-            etag: None,
-            last_modified: None,
-            headers: req.headers,
-            checksum_expected: None,
-            checksum_verified: None,
-            media_info: Some(MediaDownloadMeta {
-                format_id: req.format_id,
-                quality_label: req.quality_label,
-                title: req.title_hint,
-                duration_secs: None,
-                is_hls: req.is_hls,
-                is_dash: req.is_dash,
-                audio_only: req.audio_only,
-                embed_subtitles: req.embed_subtitles,
-                extractor_used: if req.is_hls { "native-hls" } else { "yt-dlp" }.into(),
-            }),
-            torrent_info: None,
-            auto_extract: false,
-            extractor_override: None,
-            extract_password: None,
-            extracted_to: None,
-            extraction_status: None,
-            extraction_progress: None,
-            created_at: Utc::now(),
-            completed_at: None,
-            error: None,
-            priority: 0,
-        };
+        {
+            let mut dls = self.downloads.write();
+            let file_path = Self::reserve_unique_path_locked(&dls, None, &save_dir, &title_clean);
+            let filename = file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+                .unwrap_or(title_clean);
+            let item = DownloadItem {
+                id,
+                package_id: None,
+                part_index: None,
+                part_total: None,
+                kind: DownloadKind::Media,
+                status: if auto_start {
+                    DownloadStatus::Queued
+                } else {
+                    DownloadStatus::Paused
+                },
+                url: req.url,
+                filename,
+                save_dir,
+                file_path,
+                category: if req.audio_only {
+                    FileCategory::Audio
+                } else {
+                    FileCategory::Video
+                },
+                total_bytes: None,
+                downloaded_bytes: 0,
+                uploaded_bytes: 0,
+                speed_bps: 0,
+                upload_speed_bps: 0,
+                eta_seconds: None,
+                connections: settings.default_connections,
+                supports_ranges: false,
+                segments: Vec::new(),
+                etag: None,
+                last_modified: None,
+                headers: req.headers,
+                checksum_expected: None,
+                checksum_verified: None,
+                media_info: Some(MediaDownloadMeta {
+                    format_id: req.format_id,
+                    quality_label: req.quality_label,
+                    title: req.title_hint,
+                    duration_secs: None,
+                    is_hls: req.is_hls,
+                    is_dash: req.is_dash,
+                    audio_only: req.audio_only,
+                    embed_subtitles: req.embed_subtitles,
+                    extractor_used: if req.is_hls { "native-hls" } else { "yt-dlp" }.into(),
+                }),
+                torrent_info: None,
+                auto_extract: false,
+                extractor_override: None,
+                extract_password: None,
+                extracted_to: None,
+                extraction_status: None,
+                extraction_progress: None,
+                created_at: Utc::now(),
+                completed_at: None,
+                error: None,
+                priority: 0,
+            };
 
-        self.downloads.write().insert(0, item);
+            dls.insert(0, item);
+        }
         self.persist_now();
         self.pump_queue();
         Ok(id)
@@ -1175,6 +1193,13 @@ impl DownloadManager {
             for link in parts {
                 let id = Uuid::new_v4();
                 item_ids.push(id);
+                let mut dls = self.downloads.write();
+                let file_path = Self::reserve_unique_path_locked(&dls, None, &pkg_dir, &link.filename);
+                let filename = file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| link.filename.clone());
                 let item = DownloadItem {
                     id,
                     package_id: Some(pkg_id),
@@ -1183,9 +1208,9 @@ impl DownloadManager {
                     kind: DownloadKind::Http,
                     status: DownloadStatus::Queued,
                     url: link.url,
-                    filename: link.filename.clone(),
+                    filename,
                     save_dir: pkg_dir.clone(),
-                    file_path: pkg_dir.join(&link.filename),
+                    file_path,
                     category: link.category,
                     total_bytes: link.size_bytes,
                     downloaded_bytes: 0,
@@ -1214,7 +1239,7 @@ impl DownloadManager {
                     error: None,
                     priority: 0,
                 };
-                self.downloads.write().insert(0, item);
+                dls.insert(0, item);
                 added_count += 1;
             }
 
@@ -1281,13 +1306,26 @@ impl DownloadManager {
                     let on_prog = Arc::new(move |snap: ProgressSnapshot| {
                         mgr_cb.apply_progress_snapshot(snap);
                     });
+                    let mgr_res = mgr.clone();
+                    let resolve_dest: DestinationResolver = Arc::new(
+                        move |dl_id, dir, desired_name, keep_own_part| {
+                            mgr_res.reserve_destination_for_item(
+                                dl_id,
+                                dir,
+                                desired_name,
+                                keep_own_part,
+                            )
+                        },
+                    );
 
-                    let res = run_http_download(
+                    let res = run_http_download_with_options_and_resolver(
                         client.clone(),
                         item.clone(),
                         cat_subfolders,
+                        false,
                         limiter.clone(),
                         cancel.clone(),
+                        resolve_dest.clone(),
                         on_prog.clone(),
                     )
                     .await;
@@ -1329,19 +1367,30 @@ impl DownloadManager {
                                                     }
                                                 }
                                             }
-                                            resolved_item.filename = clean;
-                                            resolved_item.file_path = resolved_item
-                                                .save_dir
-                                                .join(&resolved_item.filename);
+                                            let reserved_path = mgr.reserve_destination_for_item(
+                                                resolved_item.id,
+                                                &resolved_item.save_dir,
+                                                &clean,
+                                                false,
+                                            );
+                                            resolved_item.file_path = reserved_path;
+                                            resolved_item.filename = resolved_item
+                                                .file_path
+                                                .file_name()
+                                                .and_then(|n| n.to_str())
+                                                .map(str::to_string)
+                                                .unwrap_or(clean);
                                         }
                                     }
                                     mgr.replace_item(resolved_item.clone());
-                                    let direct_res = run_http_download(
+                                    let direct_res = run_http_download_with_options_and_resolver(
                                         client,
                                         resolved_item,
                                         cat_subfolders,
+                                        false,
                                         limiter,
                                         cancel.clone(),
+                                        resolve_dest.clone(),
                                         on_prog,
                                     )
                                     .await;
@@ -1403,7 +1452,15 @@ impl DownloadManager {
                                 if !clean_title.is_empty() {
                                     media_item.filename = clean_title;
                                 }
-                                media_item.file_path = media_item.save_dir.join(&media_item.filename);
+                                media_item.file_path = mgr.reserve_destination_for_item(
+                                    media_item.id,
+                                    &media_item.save_dir,
+                                    &media_item.filename,
+                                    false,
+                                );
+                                if let Some(name) = media_item.file_path.file_name().and_then(|n| n.to_str()) {
+                                    media_item.filename = name.to_string();
+                                }
                                 media_item.media_info = Some(MediaDownloadMeta {
                                     format_id: None,
                                     quality_label: Some("Melhor".to_string()),
@@ -1418,12 +1475,13 @@ impl DownloadManager {
                                 mgr.replace_item(media_item.clone());
 
                                 let mgr_cb = mgr.clone();
-                                let media_res = run_media_download(
+                                let media_res = run_media_download_with_resolver(
                                     client,
                                     media_item,
                                     tools.yt_dlp_path,
                                     tools.ffmpeg_path,
                                     cancel.clone(),
+                                    Some(resolve_dest),
                                     move |status, filename, file_path, downloaded, total, speed, eta| {
                                         mgr_cb.apply_progress_snapshot(ProgressSnapshot {
                                             id,
@@ -1453,13 +1511,14 @@ impl DownloadManager {
                                     Err(err) => mgr.mark_failed(id, err.to_string()),
                                 }
                             } else {
-                                let fallback_res = run_http_download_with_options(
+                                let fallback_res = run_http_download_with_options_and_resolver(
                                     client,
                                     item.clone(),
                                     cat_subfolders,
                                     true,
                                     limiter,
                                     cancel.clone(),
+                                    resolve_dest,
                                     on_prog,
                                 )
                                 .await;
@@ -1486,13 +1545,25 @@ impl DownloadManager {
                     let client = mgr.client.clone();
                     let tools = detect_media_tools(&mgr.settings.read());
                     let mgr_cb = mgr.clone();
+                    let mgr_res = mgr.clone();
+                    let resolve_dest: DestinationResolver = Arc::new(
+                        move |dl_id, dir, desired_name, keep_own_part| {
+                            mgr_res.reserve_destination_for_item(
+                                dl_id,
+                                dir,
+                                desired_name,
+                                keep_own_part,
+                            )
+                        },
+                    );
 
-                    let res = run_media_download(
+                    let res = run_media_download_with_resolver(
                         client,
                         item.clone(),
                         tools.yt_dlp_path,
                         tools.ffmpeg_path,
                         cancel.clone(),
+                        Some(resolve_dest),
                         move |status, filename, file_path, downloaded, total, speed, eta| {
                             mgr_cb.apply_progress_snapshot(ProgressSnapshot {
                                 id,
@@ -1580,6 +1651,66 @@ impl DownloadManager {
             return merged;
         }
         updated
+    }
+
+    fn reserved_paths_for_other_items(
+        downloads: &[DownloadItem],
+        exclude_id: Option<DownloadId>,
+    ) -> Vec<PathBuf> {
+        downloads
+            .iter()
+            .filter(|d| {
+                Some(d.id) != exclude_id
+                    && !matches!(
+                        d.status,
+                        DownloadStatus::Completed | DownloadStatus::Failed(_)
+                    )
+            })
+            .map(|d| d.file_path.clone())
+            .collect()
+    }
+
+    fn reserve_unique_path_locked(
+        downloads: &[DownloadItem],
+        exclude_id: Option<DownloadId>,
+        save_dir: &Path,
+        desired_filename: &str,
+    ) -> PathBuf {
+        let reserved = Self::reserved_paths_for_other_items(downloads, exclude_id);
+        unique_destination_path_with_reserved(save_dir, desired_filename, &reserved)
+    }
+
+    fn reserve_destination_for_item(
+        &self,
+        id: DownloadId,
+        save_dir: &Path,
+        desired_filename: &str,
+        keep_own_part: bool,
+    ) -> PathBuf {
+        let mut dls = self.downloads.write();
+        let reserved = Self::reserved_paths_for_other_items(&dls, Some(id));
+        if keep_own_part {
+            if let Some(existing) = dls.iter().find(|d| d.id == id) {
+                let own_part_ok = paths_conflict(&existing.save_dir, save_dir)
+                    && !existing.file_path.exists()
+                    && part_file_path(&existing.file_path).exists()
+                    && !reserved
+                        .iter()
+                        .any(|r| paths_conflict(r, &existing.file_path));
+                if own_part_ok {
+                    return existing.file_path.clone();
+                }
+            }
+        }
+        let chosen = unique_destination_path_with_reserved(save_dir, desired_filename, &reserved);
+        if let Some(item) = dls.iter_mut().find(|d| d.id == id) {
+            item.save_dir = save_dir.to_path_buf();
+            item.file_path = chosen.clone();
+            if let Some(name) = chosen.file_name().and_then(|n| n.to_str()) {
+                item.filename = name.to_string();
+            }
+        }
+        chosen
     }
 
     fn mark_failed(&self, id: DownloadId, err: String) {
@@ -2800,7 +2931,7 @@ fn try_remove_file_if_present(path: &Path) -> bool {
 fn delete_non_torrent_files_from_disk(item: &DownloadItem) -> bool {
     let mut all_ok = true;
     all_ok &= try_remove_file_if_present(&item.file_path);
-    let vortex_part = PathBuf::from(format!("{}.vortexpart", item.file_path.display()));
+    let vortex_part = part_file_path(&item.file_path);
     all_ok &= try_remove_file_if_present(&vortex_part);
     if item.kind == DownloadKind::Media {
         let yt_part = PathBuf::from(format!("{}.part", item.file_path.display()));
@@ -2847,7 +2978,7 @@ fn delete_torrent_files_from_disk(item: &DownloadItem) {
         } else if item.file_path.is_dir() {
             let _ = std::fs::remove_dir_all(&item.file_path);
         }
-        let vortex_part = PathBuf::from(format!("{}.vortexpart", item.file_path.display()));
+        let vortex_part = part_file_path(&item.file_path);
         let _ = try_remove_file_if_present(&vortex_part);
     }
 }
@@ -3353,5 +3484,113 @@ mod tests {
         assert_eq!(mgr.adjust_download_priority(normal.id, 5), Some(2));
         assert_eq!(mgr.adjust_download_priority(normal.id, -10), Some(-2));
         assert_eq!(mgr.downloads.read()[0].priority, -2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_downloads_reserve_unique_destinations_and_part_files() {
+        let dir = std::env::temp_dir().join(format!("vortex_mgr_dedup_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mgr = DownloadManager::new(tokio::runtime::Handle::current());
+        {
+            let mut s = mgr.settings.write();
+            s.default_download_dir = dir.clone();
+            s.categorize_into_subfolders = false;
+            s.auto_start_downloads = false;
+        }
+        mgr.downloads.write().clear();
+
+        let name = "Super Smash Bros. Ultimate [01006A800016E000][v0](axekin.com).zip";
+        let id1 = mgr
+            .add_http_download(NewDownloadRequest {
+                url: "https://example.com/a/ssbu.zip".into(),
+                filename: Some(name.into()),
+                save_dir: Some(dir.clone()),
+                connections: Some(4),
+                headers: HashMap::new(),
+                checksum: None,
+                auto_extract: Some(false),
+                extractor_override: None,
+                extract_password: None,
+                start_immediately: Some(false),
+            })
+            .unwrap();
+        let id2 = mgr
+            .add_http_download(NewDownloadRequest {
+                url: "https://example.com/b/ssbu.zip".into(),
+                filename: Some(name.into()),
+                save_dir: Some(dir.clone()),
+                connections: Some(4),
+                headers: HashMap::new(),
+                checksum: None,
+                auto_extract: Some(false),
+                extractor_override: None,
+                extract_password: None,
+                start_immediately: Some(false),
+            })
+            .unwrap();
+
+        let dls = mgr.downloads.read();
+        let item1 = dls.iter().find(|d| d.id == id1).unwrap().clone();
+        let item2 = dls.iter().find(|d| d.id == id2).unwrap().clone();
+        drop(dls);
+
+        assert_eq!(item1.filename, name);
+        assert_eq!(
+            item2.filename,
+            "Super Smash Bros. Ultimate [01006A800016E000][v0](axekin.com) (1).zip"
+        );
+        assert_ne!(item1.file_path, item2.file_path);
+        assert_ne!(
+            part_file_path(&item1.file_path),
+            part_file_path(&item2.file_path)
+        );
+
+        // Resuming item1 with its own .vortexpart keeps item1's path instead of renaming itself.
+        std::fs::write(part_file_path(&item1.file_path), b"partial").unwrap();
+        let kept = mgr.reserve_destination_for_item(item1.id, &dir, name, true);
+        assert_eq!(kept, item1.file_path);
+
+        // Late Content-Disposition resolution on two items with generic fallback names still deduplicates.
+        let id3 = mgr
+            .add_http_download(NewDownloadRequest {
+                url: "https://example.com/dl/1".into(),
+                filename: Some("download.bin".into()),
+                save_dir: Some(dir.clone()),
+                connections: Some(4),
+                headers: HashMap::new(),
+                checksum: None,
+                auto_extract: Some(false),
+                extractor_override: None,
+                extract_password: None,
+                start_immediately: Some(false),
+            })
+            .unwrap();
+        let id4 = mgr
+            .add_http_download(NewDownloadRequest {
+                url: "https://example.com/dl/2".into(),
+                filename: Some("download.bin".into()),
+                save_dir: Some(dir.clone()),
+                connections: Some(4),
+                headers: HashMap::new(),
+                checksum: None,
+                auto_extract: Some(false),
+                extractor_override: None,
+                extract_password: None,
+                start_immediately: Some(false),
+            })
+            .unwrap();
+        let p3 = mgr.reserve_destination_for_item(id3, &dir, "late-file.zip", false);
+        let p4 = mgr.reserve_destination_for_item(id4, &dir, "late-file.zip", false);
+        assert_eq!(
+            p3.file_name().and_then(|n| n.to_str()),
+            Some("late-file.zip")
+        );
+        assert_eq!(
+            p4.file_name().and_then(|n| n.to_str()),
+            Some("late-file (1).zip")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

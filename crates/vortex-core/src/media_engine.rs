@@ -1,5 +1,7 @@
 use crate::extractor::find_in_path;
-use crate::http_engine::{DownloadCancelHandle, apply_custom_headers};
+use crate::http_engine::{
+    DestinationResolver, DownloadCancelHandle, apply_custom_headers, unique_destination_path,
+};
 use crate::model::{
     AppSettings, CompressionJobStatus, DownloadItem, DownloadStatus, FileCategory,
     MediaFormatOption, MediaPlaylistEntry, MediaProbeResult, VideoCompressionCodec,
@@ -619,10 +621,37 @@ async fn probe_media_url_impl(
 
 pub async fn run_media_download<F>(
     client: Client,
+    item: DownloadItem,
+    yt_dlp_path: Option<String>,
+    ffmpeg_path: Option<String>,
+    cancel: Arc<DownloadCancelHandle>,
+    on_progress: F,
+) -> Result<DownloadItem>
+where
+    F: Fn(Option<DownloadStatus>, Option<String>, Option<PathBuf>, u64, Option<u64>, u64, Option<u64>)
+        + Send
+        + Sync
+        + 'static,
+{
+    run_media_download_with_resolver(
+        client,
+        item,
+        yt_dlp_path,
+        ffmpeg_path,
+        cancel,
+        None,
+        on_progress,
+    )
+    .await
+}
+
+pub async fn run_media_download_with_resolver<F>(
+    client: Client,
     mut item: DownloadItem,
     yt_dlp_path: Option<String>,
     ffmpeg_path: Option<String>,
     cancel: Arc<DownloadCancelHandle>,
+    resolve_destination: Option<DestinationResolver>,
     on_progress: F,
 ) -> Result<DownloadItem>
 where
@@ -639,7 +668,15 @@ where
         .unwrap_or_else(|| item.url.to_lowercase().contains(".m3u8"));
 
     if is_hls && yt_dlp_path.is_none() {
-        return run_native_hls_download(client, item, ffmpeg_path, cancel, on_progress).await;
+        return run_native_hls_download(
+            client,
+            item,
+            ffmpeg_path,
+            cancel,
+            resolve_destination,
+            on_progress,
+        )
+        .await;
     }
 
     if let Some(yt_dlp) = yt_dlp_path {
@@ -664,13 +701,29 @@ where
             return Ok(item);
         }
         if is_hls {
-            return run_native_hls_download(client, item, ffmpeg_path, cancel, on_progress).await;
+            return run_native_hls_download(
+                client,
+                item,
+                ffmpeg_path,
+                cancel,
+                resolve_destination,
+                on_progress,
+            )
+            .await;
         }
         return Err(res.unwrap_err());
     }
 
     if is_hls {
-        return run_native_hls_download(client, item, ffmpeg_path, cancel, on_progress).await;
+        return run_native_hls_download(
+            client,
+            item,
+            ffmpeg_path,
+            cancel,
+            resolve_destination,
+            on_progress,
+        )
+        .await;
     }
 
     Err(anyhow!(
@@ -1202,6 +1255,7 @@ async fn run_native_hls_download<F>(
     mut item: DownloadItem,
     ffmpeg_path: Option<String>,
     cancel: Arc<DownloadCancelHandle>,
+    resolve_destination: Option<DestinationResolver>,
     on_progress: F,
 ) -> Result<DownloadItem>
 where
@@ -1252,12 +1306,27 @@ where
             .and_then(|m| m.title.as_deref())
             .unwrap_or("stream_video"),
     );
-    let ts_path = item.save_dir.join(format!("{base_name}.ts"));
-    let mp4_path = item.save_dir.join(format!("{base_name}.mp4"));
+    let desired_mp4_name = format!("{base_name}.mp4");
+    let mp4_path = match resolve_destination.as_ref() {
+        Some(resolver) => resolver(item.id, &item.save_dir, &desired_mp4_name, false),
+        None => unique_destination_path(&item.save_dir, &desired_mp4_name),
+    };
+    let final_mp4_name = mp4_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .unwrap_or(desired_mp4_name);
+    let ts_candidate_name = mp4_path
+        .with_extension("ts")
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{base_name}.ts"));
+    let ts_path = unique_destination_path(&item.save_dir, &ts_candidate_name);
 
     on_progress(
         Some(DownloadStatus::Downloading),
-        Some(format!("{base_name}.mp4")),
+        Some(final_mp4_name),
         Some(mp4_path.clone()),
         0,
         None,
@@ -1380,6 +1449,18 @@ where
     }
 
     let final_output = if let Some(ffmpeg) = ffmpeg_path {
+        let mp4_path = if mp4_path.exists() {
+            let desired = mp4_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("stream_video.mp4");
+            match resolve_destination.as_ref() {
+                Some(resolver) => resolver(item.id, &item.save_dir, desired, false),
+                None => unique_destination_path(&item.save_dir, desired),
+            }
+        } else {
+            mp4_path
+        };
         let mut ff_cmd = Command::new(&ffmpeg);
         crate::extractor::configure_silent_command(&mut ff_cmd);
         let out = ff_cmd

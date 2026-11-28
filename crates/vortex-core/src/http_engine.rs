@@ -242,29 +242,95 @@ pub async fn probe_url(
     })
 }
 
-pub fn unique_destination_path(dir: &Path, filename: &str) -> PathBuf {
-    let candidate = dir.join(filename);
-    if !candidate.exists() {
-        return candidate;
+pub type DestinationResolver =
+    Arc<dyn Fn(DownloadId, &Path, &str, bool) -> PathBuf + Send + Sync>;
+
+pub fn part_file_path(file_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.vortexpart", file_path.display()))
+}
+
+pub fn paths_conflict(a: &Path, b: &Path) -> bool {
+    path_collision_key(a) == path_collision_key(b)
+}
+
+fn path_collision_key(path: &Path) -> String {
+    let mut normalized = PathBuf::new();
+    for comp in path.components() {
+        normalized.push(comp);
     }
+    let s = normalized.to_string_lossy();
+    #[cfg(windows)]
+    {
+        s.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        s.into_owned()
+    }
+}
+
+fn split_filename_for_counter(filename: &str) -> (&str, Option<&str>) {
+    for compound_ext in ["tar.gz", "tar.bz2", "tar.xz", "tar.zst"] {
+        let suffix = format!(".{compound_ext}");
+        if filename.len() > suffix.len()
+            && filename[filename.len() - suffix.len()..].eq_ignore_ascii_case(&suffix)
+        {
+            let stem = &filename[..filename.len() - suffix.len()];
+            if !stem.is_empty() {
+                let ext = &filename[filename.len() - compound_ext.len()..];
+                return (stem, Some(ext));
+            }
+        }
+    }
+
     let path = Path::new(filename);
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(filename);
     let ext = path.extension().and_then(|e| e.to_str());
+    (stem, ext)
+}
 
+pub fn unique_destination_path_with_reserved(
+    dir: &Path,
+    filename: &str,
+    reserved_paths: &[PathBuf],
+) -> PathBuf {
+    let clean_name = if filename.trim().is_empty() {
+        "download.bin"
+    } else {
+        filename
+    };
+    let reserved_keys: std::collections::HashSet<String> =
+        reserved_paths.iter().map(|p| path_collision_key(p)).collect();
+    let is_taken = |candidate: &Path| -> bool {
+        candidate.exists()
+            || part_file_path(candidate).exists()
+            || reserved_keys.contains(&path_collision_key(candidate))
+    };
+
+    let candidate = dir.join(clean_name);
+    if !is_taken(&candidate) {
+        return candidate;
+    }
+
+    let (stem, ext) = split_filename_for_counter(clean_name);
     for i in 1..10_000 {
         let next_name = match ext {
             Some(e) => format!("{stem} ({i}).{e}"),
             None => format!("{stem} ({i})"),
         };
         let next = dir.join(next_name);
-        if !next.exists() {
+        if !is_taken(&next) {
             return next;
         }
     }
-    dir.join(format!("{filename}.{}", uuid::Uuid::new_v4()))
+    dir.join(format!("{clean_name}.{}", uuid::Uuid::new_v4()))
+}
+
+pub fn unique_destination_path(dir: &Path, filename: &str) -> PathBuf {
+    unique_destination_path_with_reserved(dir, filename, &[])
 }
 
 #[derive(Clone)]
@@ -389,6 +455,10 @@ pub fn build_initial_segments(total_bytes: u64, connections: usize) -> Vec<Segme
     segments
 }
 
+fn default_destination_resolver() -> DestinationResolver {
+    Arc::new(|_id, dir, filename, _keep_own_part| unique_destination_path(dir, filename))
+}
+
 pub async fn run_http_download(
     client: Client,
     item: DownloadItem,
@@ -416,6 +486,29 @@ pub async fn run_http_download_with_options(
     allow_html: bool,
     limiter: BandwidthLimiter,
     cancel: Arc<DownloadCancelHandle>,
+    on_progress: Arc<dyn Fn(ProgressSnapshot) + Send + Sync>,
+) -> Result<DownloadItem> {
+    run_http_download_with_options_and_resolver(
+        client,
+        item,
+        categorize_subfolders,
+        allow_html,
+        limiter,
+        cancel,
+        default_destination_resolver(),
+        on_progress,
+    )
+    .await
+}
+
+pub async fn run_http_download_with_options_and_resolver(
+    client: Client,
+    item: DownloadItem,
+    categorize_subfolders: bool,
+    allow_html: bool,
+    limiter: BandwidthLimiter,
+    cancel: Arc<DownloadCancelHandle>,
+    resolve_destination: DestinationResolver,
     on_progress: Arc<dyn Fn(ProgressSnapshot) + Send + Sync>,
 ) -> Result<DownloadItem> {
     let mut current = item;
@@ -484,9 +577,18 @@ pub async fn run_http_download_with_options(
             current.save_dir.clone()
         };
         tokio::fs::create_dir_all(&target_dir).await?;
-        if current.downloaded_bytes == 0 || !current.file_path.exists() {
+        let keep_own_part = (current.downloaded_bytes > 0
+            || !current.segments.is_empty()
+            || current.total_bytes.is_some())
+            && part_file_path(&current.file_path).exists();
+        if !keep_own_part || current.file_path.exists() {
             current.save_dir = target_dir.clone();
-            current.file_path = unique_destination_path(&target_dir, &current.filename);
+            current.file_path = resolve_destination(
+                current.id,
+                &target_dir,
+                &current.filename,
+                keep_own_part,
+            );
             if let Some(name) = current.file_path.file_name().and_then(|n| n.to_str()) {
                 current.filename = name.to_string();
             }
@@ -509,9 +611,20 @@ pub async fn run_http_download_with_options(
         }
     } else {
         tokio::fs::create_dir_all(&current.save_dir).await?;
+        if !part_file_path(&current.file_path).exists() || current.file_path.exists() {
+            current.file_path = resolve_destination(
+                current.id,
+                &current.save_dir,
+                &current.filename,
+                false,
+            );
+            if let Some(name) = current.file_path.file_name().and_then(|n| n.to_str()) {
+                current.filename = name.to_string();
+            }
+        }
     }
 
-    let part_path = PathBuf::from(format!("{}.vortexpart", current.file_path.display()));
+    let part_path = part_file_path(&current.file_path);
     {
         let file = OpenOptions::new()
             .create(true)
@@ -605,9 +718,13 @@ pub async fn run_http_download_with_options(
         return Ok(current);
     }
 
-    // Move .vortexpart -> final destination
+    // Move .vortexpart -> final destination without overwriting any file that appeared mid-download
     if current.file_path.exists() {
-        let _ = tokio::fs::remove_file(&current.file_path).await;
+        let resolved = resolve_destination(current.id, &current.save_dir, &current.filename, false);
+        current.file_path = resolved;
+        if let Some(name) = current.file_path.file_name().and_then(|n| n.to_str()) {
+            current.filename = name.to_string();
+        }
     }
     tokio::fs::rename(&part_path, &current.file_path).await?;
 
@@ -1165,5 +1282,64 @@ mod tests {
         assert_eq!(segs.len(), 4);
         assert_eq!(segs[0].start, 0);
         assert_eq!(segs[3].end, total - 1);
+    }
+
+    #[test]
+    fn unique_destination_avoids_disk_files_part_files_and_reserved_paths() {
+        let dir = std::env::temp_dir().join(format!("vortex_http_dedup_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let base_name = "Super Smash Bros. Ultimate [01006A800016E000][v0](axekin.com).zip";
+        let first = dir.join(base_name);
+        std::fs::write(&first, b"done").unwrap();
+
+        let second_part = part_file_path(&dir.join(
+            "Super Smash Bros. Ultimate [01006A800016E000][v0](axekin.com) (1).zip",
+        ));
+        std::fs::write(&second_part, b"partial").unwrap();
+
+        let reserved_third = dir.join(
+            "Super Smash Bros. Ultimate [01006A800016E000][v0](axekin.com) (2).zip",
+        );
+
+        let chosen = unique_destination_path_with_reserved(&dir, base_name, &[reserved_third]);
+        assert_eq!(
+            chosen.file_name().and_then(|n| n.to_str()),
+            Some("Super Smash Bros. Ultimate [01006A800016E000][v0](axekin.com) (3).zip")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_destination_handles_compound_extensions_and_no_extension() {
+        let dir = std::env::temp_dir().join(format!("vortex_http_ext_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("backup.tar.gz"), b"1").unwrap();
+        let next_tar = unique_destination_path_with_reserved(&dir, "backup.tar.gz", &[]);
+        assert_eq!(
+            next_tar.file_name().and_then(|n| n.to_str()),
+            Some("backup (1).tar.gz")
+        );
+
+        std::fs::write(dir.join("README"), b"1").unwrap();
+        let next_plain = unique_destination_path_with_reserved(&dir, "README", &[]);
+        assert_eq!(
+            next_plain.file_name().and_then(|n| n.to_str()),
+            Some("README (1)")
+        );
+
+        #[cfg(windows)]
+        {
+            let reserved_upper = dir.join("GAME.ZIP");
+            let next_case = unique_destination_path_with_reserved(&dir, "game.zip", &[reserved_upper]);
+            assert_eq!(
+                next_case.file_name().and_then(|n| n.to_str()),
+                Some("game (1).zip")
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

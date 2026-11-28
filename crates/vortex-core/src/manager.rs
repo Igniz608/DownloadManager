@@ -9,13 +9,15 @@ use crate::http_engine::{
     run_http_download_with_options,
 };
 use crate::media_engine::{
-    MediaToolsStatus, detect_media_tools, detect_media_url, install_ffmpeg_essentials,
-    install_yt_dlp, probe_media_url, probe_single_media_url, run_media_download,
+    MediaToolsStatus, compress_video_file, detect_media_tools, detect_media_url,
+    install_ffmpeg_essentials, install_yt_dlp, plan_video_compression, probe_media_url,
+    probe_single_media_url, probe_video_file, run_media_download, unique_compressed_output_path,
 };
 use crate::model::{
-    AppSettings, DownloadId, DownloadItem, DownloadKind, DownloadPackage, DownloadStatus,
-    FileCategory, GrabbedLink, MediaDownloadMeta, MediaProbeResult, NewDownloadRequest,
-    NewMediaRequest, NoticeEntry, PackageId, PasswordPromptRequest, TorrentDownloadMeta,
+    AppSettings, CompressionJobSnapshot, CompressionJobStatus, DownloadId, DownloadItem,
+    DownloadKind, DownloadPackage, DownloadStatus, FileCategory, GrabbedLink, MediaDownloadMeta,
+    MediaProbeResult, NewDownloadRequest, NewMediaRequest, NoticeEntry, PackageId,
+    PasswordPromptRequest, TorrentDownloadMeta, VideoCompressionCodec, VideoProbeInfo,
 };
 use crate::package_grabber::{
     assign_package_totals, detect_multipart, extract_urls_from_text, fallback_filename_from_url,
@@ -64,6 +66,7 @@ pub struct ManagerSnapshot {
     pub media_tools: MediaToolsStatus,
     pub notifications: Vec<NoticeEntry>,
     pub pending_password_prompts: Vec<PasswordPromptRequest>,
+    pub compression_jobs: Vec<CompressionJobSnapshot>,
 }
 
 pub struct DownloadManager {
@@ -79,6 +82,8 @@ pub struct DownloadManager {
     pub speed_history: Arc<RwLock<VecDeque<SpeedSample>>>,
     pub notifications: Arc<RwLock<VecDeque<NoticeEntry>>>,
     pub pending_password_prompts: Arc<RwLock<Vec<PasswordPromptRequest>>>,
+    pub compression_jobs: Arc<RwLock<Vec<CompressionJobSnapshot>>>,
+    compression_cancels: Arc<RwLock<HashMap<Uuid, Arc<AtomicBool>>>>,
     client: Client,
     limiter: BandwidthLimiter,
     cancel_handles: Arc<RwLock<HashMap<DownloadId, Arc<DownloadCancelHandle>>>>,
@@ -132,6 +137,8 @@ impl DownloadManager {
             speed_history: Arc::new(RwLock::new(hist)),
             notifications: Arc::new(RwLock::new(VecDeque::with_capacity(20))),
             pending_password_prompts: Arc::new(RwLock::new(Vec::new())),
+            compression_jobs: Arc::new(RwLock::new(Vec::new())),
+            compression_cancels: Arc::new(RwLock::new(HashMap::new())),
             client,
             limiter,
             cancel_handles: Arc::new(RwLock::new(HashMap::new())),
@@ -192,6 +199,7 @@ impl DownloadManager {
             g.iter().cloned().collect()
         };
         let pending_password_prompts = self.pending_password_prompts.read().clone();
+        let compression_jobs = self.compression_jobs.read().clone();
 
         ManagerSnapshot {
             downloads,
@@ -205,6 +213,7 @@ impl DownloadManager {
             media_tools,
             notifications,
             pending_password_prompts,
+            compression_jobs,
         }
     }
 
@@ -2409,6 +2418,184 @@ impl DownloadManager {
             .yt_dlp_path
             .ok_or_else(|| anyhow!("yt-dlp não encontrado. Instale com 1 clique na aba Mídia ou Configurações."))?;
         probe_media_url(&yt_dlp, url, &HashMap::new()).await
+    }
+
+    pub async fn probe_video_for_compression(&self, path: &Path) -> Result<VideoProbeInfo> {
+        let tools = detect_media_tools(&self.settings.read());
+        probe_video_file(path, tools.ffmpeg_path.as_deref()).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_video_compression(
+        self: &Arc<Self>,
+        probe: VideoProbeInfo,
+        target_ratio: f32,
+        codec: VideoCompressionCodec,
+        auto_downscale: bool,
+        replace_original: bool,
+        source_download_id: Option<DownloadId>,
+    ) -> Result<Uuid> {
+        let tools = detect_media_tools(&self.settings.read());
+        let ffmpeg_path = tools.ffmpeg_path.ok_or_else(|| {
+            anyhow!("FFmpeg não encontrado. Instale com 1 clique na barra de ferramentas antes de comprimir.")
+        })?;
+
+        let plan = plan_video_compression(&probe, target_ratio, codec, auto_downscale);
+        let output_path = if replace_original {
+            let parent = probe.path.parent().unwrap_or_else(|| Path::new("."));
+            let stem = probe
+                .path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("video");
+            parent.join(format!("{stem}.mp4"))
+        } else {
+            unique_compressed_output_path(&probe.path)
+        };
+
+        let job_id = Uuid::new_v4();
+        let snapshot = CompressionJobSnapshot {
+            id: job_id,
+            input_path: probe.path.clone(),
+            output_path: output_path.clone(),
+            input_filename: probe.filename.clone(),
+            original_size_bytes: probe.file_size_bytes,
+            target_size_bytes: plan.estimated_bytes,
+            final_size_bytes: None,
+            progress: 0.0,
+            speed_x: None,
+            eta_seconds: None,
+            status: CompressionJobStatus::Preparing,
+            plan_summary: plan.quality_note.clone(),
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.compression_cancels.write().insert(job_id, cancel.clone());
+        {
+            let mut jobs = self.compression_jobs.write();
+            jobs.insert(0, snapshot);
+            if jobs.len() > 24 {
+                jobs.retain(|j| j.status.is_active());
+            }
+        }
+        self.request_ui_repaint();
+
+        let mgr = self.clone();
+        self.runtime.spawn(async move {
+            let mgr_cb = mgr.clone();
+            let last_repaint = Arc::new(parking_lot::Mutex::new(std::time::Instant::now()));
+            let res = compress_video_file(
+                &ffmpeg_path,
+                job_id,
+                &probe.path,
+                &output_path,
+                &probe,
+                &plan,
+                replace_original,
+                cancel.clone(),
+                move |status, progress, speed_x, eta_secs| {
+                    {
+                        let mut jobs = mgr_cb.compression_jobs.write();
+                        if let Some(j) = jobs.iter_mut().find(|x| x.id == job_id) {
+                            j.status = status;
+                            j.progress = progress.clamp(0.0, 1.0);
+                            j.speed_x = speed_x;
+                            j.eta_seconds = eta_secs;
+                        }
+                    }
+                    let mut last = last_repaint.lock();
+                    if last.elapsed().as_millis() >= 120 {
+                        *last = std::time::Instant::now();
+                        mgr_cb.request_ui_repaint();
+                    }
+                },
+            )
+            .await;
+
+            mgr.compression_cancels.write().remove(&job_id);
+            match res {
+                Ok((final_path, final_size)) => {
+                    {
+                        let mut jobs = mgr.compression_jobs.write();
+                        if let Some(j) = jobs.iter_mut().find(|x| x.id == job_id) {
+                            j.output_path = final_path.clone();
+                            j.final_size_bytes = Some(final_size);
+                            j.status = CompressionJobStatus::Completed;
+                            j.progress = 1.0;
+                            j.speed_x = None;
+                            j.eta_seconds = Some(0);
+                        }
+                    }
+                    if replace_original {
+                        if let Some(dl_id) = source_download_id {
+                            let mut dls = mgr.downloads.write();
+                            if let Some(item) = dls.iter_mut().find(|d| d.id == dl_id) {
+                                item.file_path = final_path.clone();
+                                if let Some(name) = final_path.file_name().and_then(|n| n.to_str()) {
+                                    item.filename = name.to_string();
+                                }
+                                item.total_bytes = Some(final_size);
+                                item.downloaded_bytes = final_size;
+                            }
+                            drop(dls);
+                            mgr.persist_now();
+                        }
+                    }
+                    let saved_pct = if probe.file_size_bytes > 0 && final_size < probe.file_size_bytes {
+                        (((probe.file_size_bytes - final_size) as f64 / probe.file_size_bytes as f64) * 100.0).round() as u64
+                    } else {
+                        0
+                    };
+                    mgr.push_notice(format!(
+                        "Vídeo comprimido (-{}%): {}",
+                        saved_pct,
+                        final_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("video.mp4")
+                    ));
+                    mgr.request_ui_repaint();
+                }
+                Err(e) => {
+                    let cancelled = cancel.load(Ordering::Relaxed);
+                    {
+                        let mut jobs = mgr.compression_jobs.write();
+                        if let Some(j) = jobs.iter_mut().find(|x| x.id == job_id) {
+                            j.status = if cancelled {
+                                CompressionJobStatus::Cancelled
+                            } else {
+                                CompressionJobStatus::Failed(e.to_string())
+                            };
+                            j.speed_x = None;
+                            j.eta_seconds = None;
+                        }
+                    }
+                    if cancelled {
+                        mgr.push_notice(format!("Compressão cancelada: {}", probe.filename));
+                    } else {
+                        mgr.push_error_notice(format!("Falha ao comprimir {}: {e}", probe.filename));
+                    }
+                    mgr.request_ui_repaint();
+                }
+            }
+        });
+
+        Ok(job_id)
+    }
+
+    pub fn cancel_video_compression(&self, job_id: Uuid) {
+        if let Some(flag) = self.compression_cancels.read().get(&job_id) {
+            flag.store(true, Ordering::Relaxed);
+        }
+        self.request_ui_repaint();
+    }
+
+    pub fn dismiss_compression_job(&self, job_id: Uuid) {
+        self.compression_jobs
+            .write()
+            .retain(|j| j.id != job_id || j.status.is_active());
+        self.request_ui_repaint();
     }
 }
 

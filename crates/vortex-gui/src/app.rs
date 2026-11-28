@@ -22,12 +22,18 @@ use vortex_core::ipc_server::{
 };
 use vortex_core::state::is_portable_mode;
 use vortex_core::manager::{DownloadManager, ManagerSnapshot, default_torrent_dir_from_settings};
+use vortex_core::media_engine::plan_video_compression;
 use vortex_core::model::{
-    CloseToTrayMode, DownloadId, DownloadItem, DownloadKind, DownloadStatus, ExtractorKind,
-    ExtractorProfile, FileCategory, MediaProbeResult, NewDownloadRequest, NewMediaRequest,
-    PackageId, ThemeConfig,
+    CloseToTrayMode, CompressionJobSnapshot, DownloadId, DownloadItem, DownloadKind,
+    DownloadStatus, ExtractorKind, ExtractorProfile, FileCategory, MediaProbeResult,
+    NewDownloadRequest, NewMediaRequest, PackageId, ThemeConfig, VideoCompressionCodec,
+    VideoCompressionLevel, VideoProbeInfo,
 };
 use vortex_core::package_grabber::extract_urls_from_text;
+use vortex_core::updater::{
+    ReleaseUpdateInfo, UpdateLaunchOutcome, check_for_updates, current_app_version,
+    download_and_launch_update,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavTab {
@@ -93,6 +99,21 @@ enum DeleteConfirmTarget {
     },
 }
 
+#[derive(Debug, Clone)]
+enum AppUpdateStatus {
+    Idle,
+    Checking,
+    UpToDate(ReleaseUpdateInfo),
+    Available(ReleaseUpdateInfo),
+    Downloading {
+        info: ReleaseUpdateInfo,
+        downloaded_bytes: u64,
+        total_bytes: Option<u64>,
+    },
+    ReadyToRestart,
+    Error(String),
+}
+
 pub struct VortexApp {
     manager: Arc<DownloadManager>,
     runtime: tokio::runtime::Handle,
@@ -143,6 +164,18 @@ pub struct VortexApp {
     media_probing: Arc<parking_lot::Mutex<bool>>,
     media_probe_result: Arc<parking_lot::Mutex<Option<Result<MediaProbeResult, String>>>>,
 
+    // Video compression modal state
+    show_video_compress_modal: bool,
+    compress_source_path: String,
+    compress_source_download_id: Option<DownloadId>,
+    compress_probing: Arc<parking_lot::Mutex<bool>>,
+    compress_probe_result: Arc<parking_lot::Mutex<Option<Result<VideoProbeInfo, String>>>>,
+    compress_target_ratio: f32,
+    compress_codec: VideoCompressionCodec,
+    compress_auto_downscale: bool,
+    compress_replace_original: bool,
+    compress_error: Option<String>,
+
     // Custom Extractor plugin form
     new_ext_name: String,
     new_ext_exe: String,
@@ -170,6 +203,8 @@ pub struct VortexApp {
     pw_edit_focus: bool,
     pw_edit_show_chars: bool,
     delete_confirm_target: Option<DeleteConfirmTarget>,
+    update_status: Arc<Mutex<AppUpdateStatus>>,
+    show_update_modal: bool,
 
     last_applied_theme_hash: u64,
     last_api_card_height: f32,
@@ -259,6 +294,16 @@ impl VortexApp {
             media_embed_subs: false,
             media_probing: Arc::new(parking_lot::Mutex::new(false)),
             media_probe_result: Arc::new(parking_lot::Mutex::new(None)),
+            show_video_compress_modal: false,
+            compress_source_path: String::new(),
+            compress_source_download_id: None,
+            compress_probing: Arc::new(parking_lot::Mutex::new(false)),
+            compress_probe_result: Arc::new(parking_lot::Mutex::new(None)),
+            compress_target_ratio: VideoCompressionLevel::Level2Balanced.target_ratio(),
+            compress_codec: VideoCompressionCodec::Hevc,
+            compress_auto_downscale: true,
+            compress_replace_original: false,
+            compress_error: None,
             new_ext_name: String::new(),
             new_ext_exe: String::new(),
             new_ext_args: "x -y -o\"{dest}\" \"{archive}\"".into(),
@@ -279,6 +324,8 @@ impl VortexApp {
             pw_edit_focus: false,
             pw_edit_show_chars: false,
             delete_confirm_target: None,
+            update_status: Arc::new(Mutex::new(AppUpdateStatus::Idle)),
+            show_update_modal: false,
             last_applied_theme_hash: 0,
             last_api_card_height: 96.0,
             last_min_window_height: 0.0,
@@ -487,6 +534,11 @@ impl eframe::App for VortexApp {
         self.handle_tray_events(ctx);
         self.sync_tray_badge();
 
+        if matches!(*self.update_status.lock(), AppUpdateStatus::ReadyToRestart) && !self.quit_requested {
+            self.quit_requested = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
         if self.manager.take_focus_grabber_request() {
             self.active_tab = NavTab::LinkGrabber;
             Self::restore_main_window(ctx);
@@ -551,10 +603,49 @@ impl eframe::App for VortexApp {
         self.render_password_prompt_modal(&ctx, &snap, &theme);
         self.render_set_password_modal(&ctx, &theme);
         self.render_delete_confirm_modal(&ctx, &theme);
+        self.render_video_compress_modal(&ctx, &snap, &theme);
+        self.render_update_modal(&ctx, &theme);
     }
 }
 
 impl VortexApp {
+    fn open_video_compress_modal(
+        &mut self,
+        path: Option<PathBuf>,
+        download_id: Option<DownloadId>,
+    ) {
+        self.show_video_compress_modal = true;
+        self.compress_source_download_id = download_id;
+        self.compress_error = None;
+        self.compress_replace_original = false;
+        if let Some(p) = path {
+            self.compress_source_path = p.to_string_lossy().to_string();
+            self.trigger_video_probe(p);
+        } else {
+            self.compress_source_path.clear();
+            *self.compress_probe_result.lock() = None;
+            *self.compress_probing.lock() = false;
+        }
+    }
+
+    fn trigger_video_probe(&mut self, path: PathBuf) {
+        *self.compress_probing.lock() = true;
+        *self.compress_probe_result.lock() = None;
+        self.compress_error = None;
+        let mgr = self.manager.clone();
+        let probing = self.compress_probing.clone();
+        let res_slot = self.compress_probe_result.clone();
+        self.runtime.spawn(async move {
+            let res = mgr
+                .probe_video_for_compression(&path)
+                .await
+                .map_err(|e| e.to_string());
+            *res_slot.lock() = Some(res);
+            *probing.lock() = false;
+            mgr.request_ui_repaint();
+        });
+    }
+
     fn render_top_bar(&mut self, ui: &mut egui::Ui, snap: &ManagerSnapshot, theme: &ThemeConfig) -> f32 {
         let top_resp = egui::Panel::top("top_bar")
             .frame(
@@ -566,7 +657,7 @@ impl VortexApp {
             .show(ui, |ui| {
                 let avail_w = ui.available_width();
                 let scale = theme.font_scale.clamp(0.8, 1.4);
-                let single_row_needed = 1190.0 * scale;
+                let single_row_needed = 1320.0 * scale;
 
                 if avail_w >= single_row_needed {
                     ui.horizontal(|ui| {
@@ -615,6 +706,13 @@ impl VortexApp {
             .clicked()
         {
             self.active_tab = NavTab::Media;
+        }
+        if ui
+            .button("Comprimir Vídeo")
+            .on_hover_text("Comprimir vídeo preservando máxima qualidade (por nível ou tamanho alvo)")
+            .clicked()
+        {
+            self.open_video_compress_modal(None, None);
         }
         if ui
             .button("+ Torrent")
@@ -839,11 +937,48 @@ impl VortexApp {
                             .color(to_c32(theme.text_muted)),
                         );
                         ui.label(
-                            RichText::new("Motores prontos")
+                            RichText::new(format!("VortexDL v{}", current_app_version()))
                                 .small()
                                 .strong()
                                 .color(to_c32(theme.text_primary)),
                         );
+                        ui.add_space(4.0);
+                        let upd_snapshot = self.update_status.lock().clone();
+                        match &upd_snapshot {
+                            AppUpdateStatus::Checking => {
+                                ui.add_enabled(
+                                    false,
+                                    egui::Button::new(RichText::new("Verificando...").small()),
+                                );
+                            }
+                            AppUpdateStatus::Available(info) => {
+                                if accent_button(
+                                    ui,
+                                    format!("Atualizar -> v{}", info.latest_version),
+                                    theme,
+                                )
+                                .clicked()
+                                {
+                                    self.show_update_modal = true;
+                                }
+                            }
+                            AppUpdateStatus::Downloading { .. } | AppUpdateStatus::ReadyToRestart => {
+                                if ui
+                                    .button(RichText::new("Atualizando...").small())
+                                    .clicked()
+                                {
+                                    self.show_update_modal = true;
+                                }
+                            }
+                            _ => {
+                                if ui
+                                    .button(RichText::new("Verificar Atualização").small())
+                                    .clicked()
+                                {
+                                    self.trigger_update_check(true);
+                                }
+                            }
+                        }
                     });
 
                 let card_h = card_resp.response.rect.height();
@@ -1146,6 +1281,9 @@ impl VortexApp {
         let is_archive = (item.category == FileCategory::Archive
             || vortex_core::extractor::is_extractable_archive(&item.file_path))
             && (!item.status.is_finished() || item.file_path.exists());
+        let is_compressible_video = item.category == FileCategory::Video
+            && item.status.is_finished()
+            && item.file_path.exists();
         let status_color = match &item.status {
             DownloadStatus::Completed | DownloadStatus::Seeding => to_c32(theme.success),
             DownloadStatus::Failed(_) => to_c32(theme.error),
@@ -1161,7 +1299,13 @@ impl VortexApp {
             .show(ui, |ui| {
                 let avail_w = ui.available_width();
                 let scale = theme.font_scale.clamp(0.8, 1.4);
-                let single_row_needed = if is_archive { 830.0 } else { 630.0 } * scale;
+                let single_row_needed = if is_archive {
+                    830.0
+                } else if is_compressible_video {
+                    730.0
+                } else {
+                    630.0
+                } * scale;
 
                 let render_action = |app: &mut Self, ui: &mut Ui, action: u8| match action {
                     0 => {
@@ -1271,6 +1415,18 @@ impl VortexApp {
                             }
                         }
                     }
+                    7 if is_compressible_video => {
+                        if ui
+                            .button("Comprimir")
+                            .on_hover_text("Comprimir vídeo preservando máxima qualidade")
+                            .clicked()
+                        {
+                            app.open_video_compress_modal(
+                                Some(item.file_path.clone()),
+                                Some(item.id),
+                            );
+                        }
+                    }
                     4 => {
                         if ui.button("Pasta").clicked() {
                             let _ = open::that(&item.save_dir);
@@ -1357,7 +1513,7 @@ impl VortexApp {
                             }
                         },
                         |ui| {
-                            for action in [6, 5, 4, 3, 2, 1, 0] {
+                            for action in [6, 5, 4, 7, 3, 2, 1, 0] {
                                 render_action(self, ui, action);
                             }
                         },
@@ -1394,7 +1550,7 @@ impl VortexApp {
                         });
                         ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
-                            for action in [0, 1, 2, 3, 4, 5, 6] {
+                            for action in [0, 1, 2, 3, 7, 4, 5, 6] {
                                 render_action(self, ui, action);
                             }
                         });
@@ -2640,8 +2796,32 @@ impl VortexApp {
                             self.active_tab = NavTab::All;
                         }
                     }
+
+                    if ui
+                        .button("Comprimir Vídeo Local")
+                        .on_hover_text("Escolher um vídeo no PC e comprimir por nível ou tamanho alvo mantendo máxima qualidade")
+                        .clicked()
+                    {
+                        self.open_video_compress_modal(None, None);
+                    }
                 });
             });
+
+        if !snap.compression_jobs.is_empty() {
+            ui.add_space(10.0);
+            Frame::new()
+                .fill(to_c32(theme.bg_card))
+                .stroke(Stroke::new(1.0, to_c32(theme.border)))
+                .corner_radius(CornerRadius::same(theme.corner_radius as u8))
+                .inner_margin(Margin::same(12))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Compressões de Vídeo").strong());
+                    ui.add_space(6.0);
+                    for job in &snap.compression_jobs {
+                        self.render_compression_job_row(ui, job, theme);
+                    }
+                });
+        }
 
         ui.add_space(10.0);
 
@@ -3472,6 +3652,34 @@ impl VortexApp {
         if changed {
             let _ = self.manager.save_current_settings();
         }
+
+        ui.add_space(12.0);
+        Frame::new()
+            .fill(to_c32(theme.bg_card))
+            .stroke(Stroke::new(1.0, to_c32(theme.border)))
+            .corner_radius(CornerRadius::same(theme.corner_radius as u8))
+            .inner_margin(Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(RichText::new("Atualizações (GitHub Releases)").strong());
+                ui.add_space(4.0);
+                let mode_label = if is_portable_mode() {
+                    "Modo Portátil"
+                } else {
+                    "Modo Instalado"
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "Versão instalada: v{}  •  {}  •  Igniz608/DownloadManager",
+                        current_app_version(),
+                        mode_label
+                    ))
+                    .small()
+                    .color(to_c32(theme.text_muted)),
+                );
+                ui.add_space(8.0);
+                self.render_update_controls(ui, theme);
+            });
     }
 
     fn render_new_http_modal(&mut self, ctx: &egui::Context, theme: &ThemeConfig) {
@@ -3941,25 +4149,32 @@ impl VortexApp {
                         is_active,
                     } => {
                         ui.label(
-                            RichText::new("Deseja remover este download e apagar o(s) arquivo(s) do disco?")
+                            RichText::new("Deseja remover este download e apagar o arquivo do disco?")
                                 .color(to_c32(theme.text_primary)),
                         );
                         ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(filename)
-                                .strong()
-                                .color(to_c32(theme.text_primary)),
-                        );
-                        let path_note = if *is_torrent_dir && *torrent_file_count > 1 {
-                            format!("{} ({} arquivos do torrent)", save_dir.display(), torrent_file_count)
-                        } else {
-                            file_path.display().to_string()
-                        };
-                        ui.label(
-                            RichText::new(path_note)
+                        if *is_torrent_dir && *torrent_file_count > 1 {
+                            ui.label(
+                                RichText::new(filename)
+                                    .strong()
+                                    .color(to_c32(theme.text_primary)),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} ({} arquivos)",
+                                    save_dir.display(),
+                                    torrent_file_count
+                                ))
                                 .small()
                                 .color(to_c32(theme.text_muted)),
-                        );
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new(file_path.display().to_string())
+                                    .small()
+                                    .color(to_c32(theme.text_muted)),
+                            );
+                        }
                         if *is_active {
                             ui.add_space(6.0);
                             ui.label(
@@ -4033,6 +4248,756 @@ impl VortexApp {
                     }
                 }
             });
+    }
+
+    fn render_compression_job_row(
+        &self,
+        ui: &mut Ui,
+        job: &CompressionJobSnapshot,
+        theme: &ThemeConfig,
+    ) {
+        let status_color = match &job.status {
+            vortex_core::model::CompressionJobStatus::Completed => to_c32(theme.success),
+            vortex_core::model::CompressionJobStatus::Failed(_) => to_c32(theme.error),
+            vortex_core::model::CompressionJobStatus::Cancelled => to_c32(theme.warning),
+            _ => to_c32(theme.accent),
+        };
+        Frame::new()
+            .fill(to_c32(theme.bg_secondary))
+            .stroke(Stroke::new(1.0, to_c32(theme.border)))
+            .corner_radius(CornerRadius::same(theme.corner_radius.min(10.0) as u8))
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                egui::Sides::new().shrink_left().truncate().show(
+                    ui,
+                    |ui| {
+                        pill(ui, job.status.label(), status_color, theme);
+                        ui.label(
+                            RichText::new(&job.input_filename)
+                                .strong()
+                                .color(to_c32(theme.text_primary)),
+                        );
+                    },
+                    |ui| {
+                        if job.status.is_active() {
+                            if ui.small_button("Cancelar").clicked() {
+                                self.manager.cancel_video_compression(job.id);
+                            }
+                        } else {
+                            if ui.small_button("Dispensar").clicked() {
+                                self.manager.dismiss_compression_job(job.id);
+                            }
+                            if let Some(parent) = job.output_path.parent() {
+                                if ui.small_button("Pasta").clicked() {
+                                    let _ = open::that(parent);
+                                }
+                            }
+                            if matches!(
+                                job.status,
+                                vortex_core::model::CompressionJobStatus::Completed
+                            ) && job.output_path.exists()
+                            {
+                                if ui.small_button("Abrir").clicked() {
+                                    let _ = open::that(&job.output_path);
+                                }
+                            }
+                        }
+                    },
+                );
+
+                ui.add_space(4.0);
+                let bar = egui::ProgressBar::new(job.progress.clamp(0.0, 1.0))
+                    .desired_height(6.0)
+                    .fill(status_color);
+                ui.add(bar);
+                ui.add_space(3.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    let size_txt = if let Some(final_sz) = job.final_size_bytes {
+                        let pct = if job.original_size_bytes > 0 && final_sz < job.original_size_bytes
+                        {
+                            (((job.original_size_bytes - final_sz) as f64
+                                / job.original_size_bytes as f64)
+                                * 100.0)
+                                .round() as u64
+                        } else {
+                            0
+                        };
+                        format!(
+                            "{} -> {} (-{}%)",
+                            format_bytes(job.original_size_bytes),
+                            format_bytes(final_sz),
+                            pct
+                        )
+                    } else {
+                        format!(
+                            "{} -> alvo ~{} ({:.0}%)",
+                            format_bytes(job.original_size_bytes),
+                            format_bytes(job.target_size_bytes),
+                            job.progress * 100.0
+                        )
+                    };
+                    ui.label(RichText::new(size_txt).small().color(to_c32(theme.text_muted)));
+                    if let Some(spd) = job.speed_x {
+                        ui.label(RichText::new("•").small().color(to_c32(theme.text_muted)));
+                        ui.label(
+                            RichText::new(format!("{spd:.2}x"))
+                                .small()
+                                .strong()
+                                .color(to_c32(theme.accent)),
+                        );
+                    }
+                    if job.status.is_active() && job.eta_seconds.is_some() {
+                        ui.label(RichText::new("•").small().color(to_c32(theme.text_muted)));
+                        ui.label(
+                            RichText::new(format!("ETA {}", format_eta(job.eta_seconds)))
+                                .small()
+                                .color(to_c32(theme.text_muted)),
+                        );
+                    }
+                    if let vortex_core::model::CompressionJobStatus::Failed(ref err) = job.status {
+                        ui.label(RichText::new("•").small().color(to_c32(theme.text_muted)));
+                        ui.label(RichText::new(err).small().color(to_c32(theme.error)));
+                    }
+                });
+            });
+        ui.add_space(4.0);
+    }
+
+    fn render_video_compress_modal(
+        &mut self,
+        ctx: &egui::Context,
+        snap: &ManagerSnapshot,
+        theme: &ThemeConfig,
+    ) {
+        if !self.show_video_compress_modal {
+            return;
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_video_compress_modal = false;
+            return;
+        }
+
+        let mut open = self.show_video_compress_modal;
+        egui::Window::new("Comprimir Vídeo (Máxima Qualidade)")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(600.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(540.0);
+
+                if snap.media_tools.ffmpeg_path.is_none() {
+                    Frame::new()
+                        .fill(to_c32(theme.bg_secondary))
+                        .stroke(Stroke::new(1.0, to_c32(theme.warning)))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new("FFmpeg não detectado. Instale com 1 clique para habilitar a compressão:")
+                                        .small()
+                                        .color(to_c32(theme.warning)),
+                                );
+                                if accent_button(ui, "Instalar FFmpeg (1-clique)", theme).clicked() {
+                                    self.manager.install_ffmpeg_async();
+                                }
+                            });
+                        });
+                    ui.add_space(8.0);
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("Vídeo:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.compress_source_path)
+                            .desired_width(325.0)
+                            .hint_text("Selecione um arquivo .mp4, .mkv, .mov, .webm..."),
+                    );
+                    if ui.button("Procurar...").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter(
+                                "Vídeos",
+                                &["mp4", "mkv", "mov", "avi", "webm", "flv", "m4v", "ts", "wmv"],
+                            )
+                            .pick_file()
+                        {
+                            self.compress_source_download_id = None;
+                            self.compress_source_path = p.to_string_lossy().to_string();
+                            self.trigger_video_probe(p);
+                        }
+                    }
+                    let is_probing = *self.compress_probing.lock();
+                    if ui
+                        .add_enabled(
+                            !is_probing && !self.compress_source_path.trim().is_empty(),
+                            egui::Button::new("Analisar"),
+                        )
+                        .clicked()
+                    {
+                        let p = PathBuf::from(self.compress_source_path.trim());
+                        self.trigger_video_probe(p);
+                    }
+                });
+
+                ui.add_space(8.0);
+                let is_probing = *self.compress_probing.lock();
+                let probe_opt = self.compress_probe_result.lock().clone();
+
+                if is_probing {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Analisando vídeo com ffprobe (resolução, fps, bitrate e áudio)...");
+                    });
+                } else if let Some(probe_res) = probe_opt {
+                    match probe_res {
+                        Err(err) => {
+                            ui.label(
+                                RichText::new(format!("Erro ao analisar vídeo: {err}"))
+                                    .color(to_c32(theme.error)),
+                            );
+                        }
+                        Ok(probe) => {
+                            Frame::new()
+                                .fill(to_c32(theme.bg_secondary))
+                                .stroke(Stroke::new(1.0, to_c32(theme.border)))
+                                .corner_radius(CornerRadius::same(8))
+                                .inner_margin(Margin::same(10))
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(RichText::new(&probe.filename).strong());
+                                        pill(
+                                            ui,
+                                            &format_bytes(probe.file_size_bytes),
+                                            to_c32(theme.accent),
+                                            theme,
+                                        );
+                                        if probe.width > 0 && probe.height > 0 {
+                                            pill(
+                                                ui,
+                                                &format!("{}x{} · {:.0}fps", probe.width, probe.height, probe.fps),
+                                                to_c32(theme.text_muted),
+                                                theme,
+                                            );
+                                        }
+                                        if probe.duration_secs > 0.0 {
+                                            pill(
+                                                ui,
+                                                &format_duration(Some(probe.duration_secs)),
+                                                to_c32(theme.text_muted),
+                                                theme,
+                                            );
+                                        }
+                                        pill(
+                                            ui,
+                                            &probe.video_codec.to_uppercase(),
+                                            to_c32(theme.text_muted),
+                                            theme,
+                                        );
+                                    });
+                                });
+
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new("Nível de Compressão (do menor corte de tamanho ao máximo):")
+                                    .strong(),
+                            );
+                            ui.add_space(4.0);
+
+                            let matched_level =
+                                VideoCompressionLevel::from_ratio(self.compress_target_ratio);
+                            ui.horizontal_wrapped(|ui| {
+                                for lvl in VideoCompressionLevel::ALL {
+                                    let selected = matched_level == Some(lvl);
+                                    let btn = if selected {
+                                        egui::Button::new(
+                                            RichText::new(lvl.label())
+                                                .strong()
+                                                .color(Color32::WHITE),
+                                        )
+                                        .fill(to_c32(theme.accent))
+                                    } else {
+                                        egui::Button::new(lvl.label())
+                                    };
+                                    if ui
+                                        .add(btn)
+                                        .on_hover_text(lvl.description())
+                                        .clicked()
+                                    {
+                                        self.compress_target_ratio = lvl.target_ratio();
+                                    }
+                                }
+                            });
+
+                            let level_desc = matched_level
+                                .map(|lvl| lvl.description())
+                                .unwrap_or("Ajuste manual fino por tamanho alvo (arraste para escolher o MB final).");
+                            ui.add_sized(
+                                [ui.available_width(), 18.0],
+                                egui::Label::new(
+                                    RichText::new(level_desc)
+                                        .small()
+                                        .color(to_c32(theme.text_muted)),
+                                )
+                                .truncate(),
+                            );
+
+                            ui.add_space(10.0);
+                            let plan = plan_video_compression(
+                                &probe,
+                                self.compress_target_ratio,
+                                self.compress_codec,
+                                self.compress_auto_downscale,
+                            );
+
+                            ui.label(
+                                RichText::new("Ajuste fino por Tamanho Alvo (arraste para reduzir):")
+                                    .strong(),
+                            );
+                            ui.add_space(4.0);
+
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().slider_width = 240.0;
+                                let mut pct = (self.compress_target_ratio * 100.0).round();
+                                let slider = egui::Slider::new(&mut pct, 10.0..=95.0)
+                                    .step_by(1.0)
+                                    .show_value(false)
+                                    .trailing_fill(true);
+                                if ui.add(slider).changed() {
+                                    self.compress_target_ratio = (pct / 100.0).clamp(0.10, 0.95);
+                                }
+                                ui.add_space(8.0);
+                                let est_color = if plan.reduction_percent >= 65 {
+                                    to_c32(theme.warning)
+                                } else {
+                                    to_c32(theme.success)
+                                };
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Vai ficar: ~{}  (-{}%)",
+                                        format_bytes(plan.estimated_bytes),
+                                        plan.reduction_percent
+                                    ))
+                                    .strong()
+                                    .size(14.0)
+                                    .color(est_color),
+                                );
+                            });
+
+                            ui.add_space(8.0);
+                            Frame::new()
+                                .fill(to_c32(theme.bg_secondary))
+                                .stroke(Stroke::new(1.0, to_c32(theme.border)))
+                                .corner_radius(CornerRadius::same(8))
+                                .inner_margin(Margin::same(10))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&plan.quality_note)
+                                                .small()
+                                                .strong()
+                                                .color(to_c32(theme.accent)),
+                                        )
+                                        .truncate(),
+                                    );
+                                    ui.add_space(3.0);
+                                    let res_str = if plan.out_width > 0 && plan.out_height > 0 {
+                                        if plan.downscaled {
+                                            format!(
+                                                "{}x{} (de {}x{})",
+                                                plan.out_width,
+                                                plan.out_height,
+                                                probe.width,
+                                                probe.height
+                                            )
+                                        } else {
+                                            format!("{}x{} (nativa)", plan.out_width, plan.out_height)
+                                        }
+                                    } else {
+                                        "Original".to_string()
+                                    };
+                                    let audio_str = if !probe.has_audio {
+                                        "Sem áudio".to_string()
+                                    } else if plan.copy_audio {
+                                        format!(
+                                            "Original preservado ({} kbps)",
+                                            plan.audio_bitrate_bps / 1000
+                                        )
+                                    } else {
+                                        format!("AAC {} kbps", plan.audio_bitrate_bps / 1000)
+                                    };
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!(
+                                                "Resolução: {}  •  Vídeo: {} kbps  •  Áudio: {}",
+                                                res_str,
+                                                plan.video_bitrate_bps / 1000,
+                                                audio_str
+                                            ))
+                                            .small()
+                                            .color(to_c32(theme.text_muted)),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+
+                            ui.add_space(8.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Codec:");
+                                egui::ComboBox::from_id_salt("compress_codec_combo")
+                                    .selected_text(self.compress_codec.label())
+                                    .width(280.0)
+                                    .show_ui(ui, |ui| {
+                                        for c in [
+                                            VideoCompressionCodec::Hevc,
+                                            VideoCompressionCodec::H264,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut self.compress_codec,
+                                                c,
+                                                c.label(),
+                                            );
+                                        }
+                                    });
+                            });
+                            ui.checkbox(
+                                &mut self.compress_auto_downscale,
+                                "Proteger nitidez ajustando resolução se o tamanho escolhido for muito pequeno",
+                            );
+                            ui.checkbox(
+                                &mut self.compress_replace_original,
+                                "Substituir o arquivo original (desmarcado = cria cópia _comprimido.mp4)",
+                            );
+
+                            if let Some(ref err) = self.compress_error {
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(err).small().color(to_c32(theme.error)));
+                            }
+
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Fechar").clicked() {
+                                    self.show_video_compress_modal = false;
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let can_start = snap.media_tools.ffmpeg_path.is_some();
+                                    if ui
+                                        .add_enabled_ui(can_start, |ui| {
+                                            accent_button(ui, "Comprimir Agora", theme)
+                                        })
+                                        .inner
+                                        .clicked()
+                                    {
+                                        match self.manager.start_video_compression(
+                                            probe.clone(),
+                                            self.compress_target_ratio,
+                                            self.compress_codec,
+                                            self.compress_auto_downscale,
+                                            self.compress_replace_original,
+                                            self.compress_source_download_id,
+                                        ) {
+                                            Ok(_) => {
+                                                self.compress_error = None;
+                                            }
+                                            Err(e) => {
+                                                self.compress_error = Some(e.to_string());
+                                            }
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("Escolha um arquivo de vídeo no seu PC (ou clique em 'Comprimir' em qualquer vídeo baixado) para calcular a melhor qualidade possível no tamanho desejado.")
+                            .small()
+                            .color(to_c32(theme.text_muted)),
+                    );
+                }
+
+                if !snap.compression_jobs.is_empty() {
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Fila de Compressão:").strong());
+                    ui.add_space(4.0);
+                    ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
+                        for job in &snap.compression_jobs {
+                            self.render_compression_job_row(ui, job, theme);
+                        }
+                    });
+                }
+            });
+
+        if !open {
+            self.show_video_compress_modal = false;
+        }
+    }
+
+    fn trigger_update_check(&mut self, open_modal: bool) {
+        if matches!(
+            *self.update_status.lock(),
+            AppUpdateStatus::Checking | AppUpdateStatus::Downloading { .. } | AppUpdateStatus::ReadyToRestart
+        ) {
+            if open_modal {
+                self.show_update_modal = true;
+            }
+            return;
+        }
+        *self.update_status.lock() = AppUpdateStatus::Checking;
+        if open_modal {
+            self.show_update_modal = true;
+        }
+        let status_arc = Arc::clone(&self.update_status);
+        let mgr = Arc::clone(&self.manager);
+        self.runtime.spawn(async move {
+            let client = reqwest::Client::new();
+            let next = match check_for_updates(&client).await {
+                Ok(info) if info.update_available => AppUpdateStatus::Available(info),
+                Ok(info) => AppUpdateStatus::UpToDate(info),
+                Err(e) => AppUpdateStatus::Error(e.to_string()),
+            };
+            *status_arc.lock() = next;
+            mgr.request_ui_repaint();
+        });
+    }
+
+    fn trigger_update_install(&mut self, info: ReleaseUpdateInfo) {
+        if matches!(
+            *self.update_status.lock(),
+            AppUpdateStatus::Downloading { .. } | AppUpdateStatus::ReadyToRestart
+        ) {
+            return;
+        }
+        *self.update_status.lock() = AppUpdateStatus::Downloading {
+            info: info.clone(),
+            downloaded_bytes: 0,
+            total_bytes: None,
+        };
+        let status_arc = Arc::clone(&self.update_status);
+        let mgr = Arc::clone(&self.manager);
+        self.runtime.spawn(async move {
+            let client = reqwest::Client::new();
+            let info_cb = info.clone();
+            let status_cb = Arc::clone(&status_arc);
+            let mgr_cb = Arc::clone(&mgr);
+            let res = download_and_launch_update(&client, &info, move |downloaded, total| {
+                *status_cb.lock() = AppUpdateStatus::Downloading {
+                    info: info_cb.clone(),
+                    downloaded_bytes: downloaded,
+                    total_bytes: total,
+                };
+                mgr_cb.request_ui_repaint();
+            })
+            .await;
+
+            match res {
+                Ok(UpdateLaunchOutcome::RestartingNow) => {
+                    *status_arc.lock() = AppUpdateStatus::ReadyToRestart;
+                }
+                Ok(UpdateLaunchOutcome::OpenBrowser(url)) => {
+                    let _ = open::that(&url);
+                    *status_arc.lock() = AppUpdateStatus::Available(info);
+                }
+                Err(e) => {
+                    *status_arc.lock() = AppUpdateStatus::Error(e.to_string());
+                }
+            }
+            mgr.request_ui_repaint();
+        });
+    }
+
+    fn render_update_controls(&mut self, ui: &mut Ui, theme: &ThemeConfig) {
+        let state = self.update_status.lock().clone();
+        match state {
+            AppUpdateStatus::Idle => {
+                ui.horizontal(|ui| {
+                    if accent_button(ui, "Verificar Atualização", theme).clicked() {
+                        self.trigger_update_check(false);
+                    }
+                    ui.label(
+                        RichText::new("Consulta a última release publicada no GitHub.")
+                            .small()
+                            .color(to_c32(theme.text_muted)),
+                    );
+                });
+            }
+            AppUpdateStatus::Checking => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Verificando atualizações no GitHub...");
+                });
+            }
+            AppUpdateStatus::UpToDate(info) => {
+                ui.horizontal_wrapped(|ui| {
+                    pill(ui, "Atualizado", to_c32(theme.success), theme);
+                    ui.label(
+                        RichText::new(format!(
+                            "Você já está na versão mais recente (v{}).",
+                            info.latest_version
+                        ))
+                        .color(to_c32(theme.text_primary)),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Verificar Novamente").clicked() {
+                        self.trigger_update_check(false);
+                    }
+                    if ui.button("Abrir Release no GitHub").clicked() {
+                        let _ = open::that(&info.html_url);
+                    }
+                });
+            }
+            AppUpdateStatus::Available(info) => {
+                ui.horizontal_wrapped(|ui| {
+                    pill(ui, "Nova versão disponível", to_c32(theme.accent), theme);
+                    ui.label(
+                        RichText::new(format!(
+                            "v{} -> v{}",
+                            info.current_version, info.latest_version
+                        ))
+                        .strong()
+                        .color(to_c32(theme.text_primary)),
+                    );
+                });
+                if !info.release_notes.trim().is_empty() {
+                    ui.add_space(6.0);
+                    Frame::new()
+                        .fill(to_c32(theme.bg_secondary))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(info.release_notes.trim())
+                                        .small()
+                                        .color(to_c32(theme.text_muted)),
+                                );
+                            });
+                        });
+                }
+                ui.add_space(8.0);
+                let has_package = if is_portable_mode() {
+                    info.portable_asset.is_some() || info.installer_asset.is_some()
+                } else {
+                    info.installer_asset.is_some() || info.portable_asset.is_some()
+                };
+                ui.horizontal_wrapped(|ui| {
+                    let btn_label = if has_package {
+                        "Baixar e Atualizar Agora"
+                    } else {
+                        "Baixar no GitHub"
+                    };
+                    if accent_button(ui, btn_label, theme).clicked() {
+                        self.trigger_update_install(info.clone());
+                    }
+                    if ui.button("Ver no GitHub").clicked() {
+                        let _ = open::that(&info.html_url);
+                    }
+                    if ui.button("Verificar Novamente").clicked() {
+                        self.trigger_update_check(false);
+                    }
+                });
+            }
+            AppUpdateStatus::Downloading {
+                info,
+                downloaded_bytes,
+                total_bytes,
+            } => {
+                ui.label(
+                    RichText::new(format!(
+                        "Baixando VortexDL v{}...",
+                        info.latest_version
+                    ))
+                    .strong(),
+                );
+                let frac = match total_bytes {
+                    Some(t) if t > 0 => (downloaded_bytes as f32 / t as f32).clamp(0.0, 1.0),
+                    _ => 0.0,
+                };
+                let bar_text = match total_bytes {
+                    Some(t) if t > 0 => format!(
+                        "{} / {} ({:.0}%)",
+                        format_bytes(downloaded_bytes),
+                        format_bytes(t),
+                        frac * 100.0
+                    ),
+                    _ => format_bytes(downloaded_bytes),
+                };
+                ui.add(egui::ProgressBar::new(frac).text(bar_text).animate(true));
+                ui.label(
+                    RichText::new("Ao concluir, o VortexDL será fechado, atualizado e reaberto automaticamente.")
+                        .small()
+                        .color(to_c32(theme.text_muted)),
+                );
+            }
+            AppUpdateStatus::ReadyToRestart => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Aplicando atualização e reiniciando o VortexDL...");
+                });
+            }
+            AppUpdateStatus::Error(err) => {
+                ui.label(
+                    RichText::new(format!("Erro ao atualizar: {err}"))
+                        .small()
+                        .color(to_c32(theme.error)),
+                );
+                ui.add_space(6.0);
+                if ui.button("Tentar Novamente").clicked() {
+                    self.trigger_update_check(false);
+                }
+            }
+        }
+    }
+
+    fn render_update_modal(&mut self, ctx: &egui::Context, theme: &ThemeConfig) {
+        if !self.show_update_modal {
+            return;
+        }
+        let mut open = true;
+        let is_busy = matches!(
+            *self.update_status.lock(),
+            AppUpdateStatus::Downloading { .. } | AppUpdateStatus::ReadyToRestart
+        );
+        egui::Window::new("Atualização do VortexDL")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .fixed_size(Vec2::new(480.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Versão atual: v{}  •  Repositório: Igniz608/DownloadManager",
+                        current_app_version()
+                    ))
+                    .small()
+                    .color(to_c32(theme.text_muted)),
+                );
+                ui.add_space(8.0);
+                self.render_update_controls(ui, theme);
+                if !is_busy {
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Fechar").clicked() {
+                                self.show_update_modal = false;
+                            }
+                        });
+                    });
+                }
+            });
+        if !open && !is_busy {
+            self.show_update_modal = false;
+        }
     }
 }
 

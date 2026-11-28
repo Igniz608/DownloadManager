@@ -655,3 +655,162 @@ pub struct NewMediaRequest {
     #[serde(default)]
     pub is_dash: bool,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoCompressionLevel {
+    Level1Low,
+    Level2Balanced,
+    Level3Medium,
+    Level4High,
+    Level5Max,
+}
+
+impl VideoCompressionLevel {
+    pub const ALL: [Self; 5] = [
+        Self::Level1Low,
+        Self::Level2Balanced,
+        Self::Level3Medium,
+        Self::Level4High,
+        Self::Level5Max,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Level1Low => "1 · Leve",
+            Self::Level2Balanced => "2 · Equilibrado",
+            Self::Level3Medium => "3 · Médio",
+            Self::Level4High => "4 · Alto",
+            Self::Level5Max => "5 · Máximo",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Level1Low => "Menor redução (-25%) preservando qualidade quase idêntica ao original.",
+            Self::Level2Balanced => "Redução equilibrada (-45%) mantendo nitidez e fidelidade excelentes.",
+            Self::Level3Medium => "Redução forte (-60%) mantendo ótima qualidade visual geral.",
+            Self::Level4High => "Compressão alta (-75%) ideal para compartilhamento mantendo definição.",
+            Self::Level5Max => "Menor tamanho possível (-85%) extraindo a máxima qualidade naquele espaço.",
+        }
+    }
+
+    pub fn target_ratio(self) -> f32 {
+        match self {
+            Self::Level1Low => 0.75,
+            Self::Level2Balanced => 0.55,
+            Self::Level3Medium => 0.40,
+            Self::Level4High => 0.25,
+            Self::Level5Max => 0.15,
+        }
+    }
+
+    pub fn from_ratio(ratio: f32) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|lvl| (lvl.target_ratio() - ratio).abs() <= 0.012)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoCompressionCodec {
+    Hevc,
+    H264,
+}
+
+impl VideoCompressionCodec {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hevc => "HEVC (H.265 — Máxima qualidade por MB)",
+            Self::H264 => "H.264 (Compatibilidade universal)",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Hevc => "HEVC",
+            Self::H264 => "H.264",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoProbeInfo {
+    pub path: PathBuf,
+    pub filename: String,
+    pub file_size_bytes: u64,
+    pub duration_secs: f64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub video_codec: String,
+    pub total_bitrate_bps: u64,
+    pub has_audio: bool,
+    pub audio_codec: Option<String>,
+    pub audio_bitrate_bps: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoCompressionPlan {
+    pub target_bytes: u64,
+    pub estimated_bytes: u64,
+    pub reduction_percent: u8,
+    pub video_bitrate_bps: u64,
+    pub audio_bitrate_bps: u64,
+    pub copy_audio: bool,
+    pub out_width: u32,
+    pub out_height: u32,
+    pub downscaled: bool,
+    pub codec: VideoCompressionCodec,
+    pub two_pass: bool,
+    pub crf_fallback: u8,
+    pub quality_note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompressionJobStatus {
+    Preparing,
+    Pass1Analyzing,
+    Pass2Encoding,
+    Encoding,
+    Completed,
+    Cancelled,
+    Failed(String),
+}
+
+impl CompressionJobStatus {
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Preparing | Self::Pass1Analyzing | Self::Pass2Encoding | Self::Encoding
+        )
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Preparing => "Preparando...",
+            Self::Pass1Analyzing => "Passo 1/2: Analisando cenas",
+            Self::Pass2Encoding => "Passo 2/2: Comprimindo vídeo",
+            Self::Encoding => "Comprimindo vídeo",
+            Self::Completed => "Concluído",
+            Self::Cancelled => "Cancelado",
+            Self::Failed(_) => "Erro",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionJobSnapshot {
+    pub id: Uuid,
+    pub input_path: PathBuf,
+    pub output_path: PathBuf,
+    pub input_filename: String,
+    pub original_size_bytes: u64,
+    pub target_size_bytes: u64,
+    pub final_size_bytes: Option<u64>,
+    pub progress: f32,
+    pub speed_x: Option<f32>,
+    pub eta_seconds: Option<u64>,
+    pub status: CompressionJobStatus,
+    pub plan_summary: String,
+}
+

@@ -1,8 +1,9 @@
 use crate::extractor::find_in_path;
 use crate::http_engine::{DownloadCancelHandle, apply_custom_headers};
 use crate::model::{
-    AppSettings, DownloadItem, DownloadStatus, FileCategory, MediaFormatOption,
-    MediaPlaylistEntry, MediaProbeResult,
+    AppSettings, CompressionJobStatus, DownloadItem, DownloadStatus, FileCategory,
+    MediaFormatOption, MediaPlaylistEntry, MediaProbeResult, VideoCompressionCodec,
+    VideoCompressionPlan, VideoProbeInfo,
 };
 use crate::package_grabber::sanitize_filename;
 use crate::state::bin_dir;
@@ -44,12 +45,34 @@ pub fn detect_media_tools(settings: &AppSettings) -> MediaToolsStatus {
 }
 
 fn find_binary_everywhere(names: &[&str]) -> Option<String> {
-    let local_bin = bin_dir();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    find_binary_with_dirs(names, &bin_dir(), exe_dir.as_deref())
+}
+
+fn find_binary_with_dirs(
+    names: &[&str],
+    user_bin_dir: &Path,
+    exe_dir: Option<&Path>,
+) -> Option<String> {
     for name in names {
-        let p = local_bin.join(name);
+        let p = user_bin_dir.join(name);
         if p.exists() {
             return Some(p.to_string_lossy().to_string());
         }
+    }
+    if let Some(dir) = exe_dir {
+        for sub in [dir.join("bin"), dir.to_path_buf()] {
+            for name in names {
+                let p = sub.join(name);
+                if p.exists() {
+                    return Some(p.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    for name in names {
         if let Some(found) = find_in_path(name) {
             return Some(found);
         }
@@ -67,14 +90,60 @@ fn find_binary_everywhere(names: &[&str]) -> Option<String> {
     None
 }
 
+fn build_tool_download_client(fallback: &Client) -> Client {
+    Client::builder()
+        .user_agent(concat!("VortexDL/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(300))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .unwrap_or_else(|_| fallback.clone())
+}
+
+async fn download_bytes_with_retries(
+    client: &Client,
+    urls: &[&str],
+    min_bytes: usize,
+) -> Result<bytes::Bytes> {
+    let mut last_err = anyhow!("Nenhuma URL de download informada");
+    for url in urls {
+        for attempt in 1..=2 {
+            match client.get(*url).send().await {
+                Ok(resp) => match resp.error_for_status() {
+                    Ok(ok_resp) => match ok_resp.bytes().await {
+                        Ok(bytes) if bytes.len() >= min_bytes => return Ok(bytes),
+                        Ok(bytes) => {
+                            last_err = anyhow!(
+                                "Resposta incompleta de {url} ({} bytes)",
+                                bytes.len()
+                            );
+                        }
+                        Err(e) => last_err = anyhow!("Erro ao baixar {url} (tentativa {attempt}): {e}"),
+                    },
+                    Err(e) => last_err = anyhow!("HTTP erro em {url} (tentativa {attempt}): {e}"),
+                },
+                Err(e) => last_err = anyhow!("Falha de rede em {url} (tentativa {attempt}): {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        }
+    }
+    Err(last_err)
+}
+
 pub async fn install_yt_dlp(client: &Client) -> Result<PathBuf> {
     let dir = bin_dir();
     tokio::fs::create_dir_all(&dir).await?;
     let dest = dir.join("yt-dlp.exe");
-    let url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
-    let bytes = client.get(url).send().await?.error_for_status()?.bytes().await?;
+    let dl_client = build_tool_download_client(client);
+    let bytes = download_bytes_with_retries(
+        &dl_client,
+        &["https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"],
+        512 * 1024,
+    )
+    .await?;
     let tmp = dir.join("yt-dlp.exe.tmp");
     tokio::fs::write(&tmp, &bytes).await?;
+    let _ = tokio::fs::remove_file(&dest).await;
     tokio::fs::rename(&tmp, &dest).await?;
     Ok(dest)
 }
@@ -82,9 +151,19 @@ pub async fn install_yt_dlp(client: &Client) -> Result<PathBuf> {
 pub async fn install_ffmpeg_essentials(client: &Client) -> Result<PathBuf> {
     let dir = bin_dir();
     tokio::fs::create_dir_all(&dir).await?;
-    let url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
-    let bytes = client.get(url).send().await?.error_for_status()?.bytes().await?;
-    let zip_path = dir.join("ffmpeg-essentials.zip");
+    let dl_client = build_tool_download_client(client);
+    let bytes = download_bytes_with_retries(
+        &dl_client,
+        &[
+            "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+            "https://github.com/GyanD/codexffmpeg/releases/latest/download/ffmpeg-release-essentials.zip",
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+        ],
+        5 * 1024 * 1024,
+    )
+    .await?;
+
+    let zip_path = dir.join("ffmpeg-essentials.zip.tmp");
     tokio::fs::write(&zip_path, &bytes).await?;
 
     let extract_dir = dir.join("ffmpeg_tmp");
@@ -105,6 +184,8 @@ pub async fn install_ffmpeg_essentials(client: &Client) -> Result<PathBuf> {
         .await?;
 
     if !out.status.success() {
+        let _ = tokio::fs::remove_file(&zip_path).await;
+        let _ = tokio::fs::remove_dir_all(&extract_dir).await;
         return Err(anyhow!(
             "Falha ao extrair ffmpeg: {}",
             String::from_utf8_lossy(&out.stderr)
@@ -124,13 +205,23 @@ pub async fn install_ffmpeg_essentials(client: &Client) -> Result<PathBuf> {
     }
 
     let ffmpeg_dest = dir.join("ffmpeg.exe");
+    let ffmpeg_tmp = dir.join("ffmpeg.exe.tmp");
     if let Some(src) = found_ffmpeg {
-        tokio::fs::copy(&src, &ffmpeg_dest).await?;
+        tokio::fs::copy(&src, &ffmpeg_tmp).await?;
+        let _ = tokio::fs::remove_file(&ffmpeg_dest).await;
+        tokio::fs::rename(&ffmpeg_tmp, &ffmpeg_dest).await?;
     } else {
+        let _ = tokio::fs::remove_file(&zip_path).await;
+        let _ = tokio::fs::remove_dir_all(&extract_dir).await;
         return Err(anyhow!("ffmpeg.exe não encontrado dentro do pacote baixado"));
     }
     if let Some(src) = found_ffprobe {
-        let _ = tokio::fs::copy(&src, dir.join("ffprobe.exe")).await;
+        let ffprobe_dest = dir.join("ffprobe.exe");
+        let ffprobe_tmp = dir.join("ffprobe.exe.tmp");
+        if tokio::fs::copy(&src, &ffprobe_tmp).await.is_ok() {
+            let _ = tokio::fs::remove_file(&ffprobe_dest).await;
+            let _ = tokio::fs::rename(&ffprobe_tmp, &ffprobe_dest).await;
+        }
     }
 
     let _ = tokio::fs::remove_file(&zip_path).await;
@@ -381,7 +472,9 @@ async fn run_yt_dlp_probe(
 ) -> Result<std::process::Output> {
     let mut cmd = Command::new(yt_dlp_path);
     crate::extractor::configure_silent_command(&mut cmd);
-    cmd.args(["-J", "--no-warnings"]);
+    cmd.env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .args(["-J", "--no-warnings"]);
     if single_video {
         cmd.arg("--no-playlist");
     } else {
@@ -653,6 +746,8 @@ where
     let mut cmd = Command::new(yt_dlp_path);
     crate::extractor::configure_silent_command(&mut cmd);
     cmd.env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
         .arg("--newline")
         .arg("--no-quiet")
         .arg("--progress")
@@ -711,12 +806,21 @@ where
     let stderr_buf = Arc::new(parking_lot::Mutex::new(String::new()));
     let stderr_clone = stderr_buf.clone();
     tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let mut g = stderr_clone.lock();
-            if g.len() < 4096 {
-                g.push_str(&line);
-                g.push('\n');
+        let mut reader = BufReader::new(stderr);
+        let mut buf = Vec::with_capacity(512);
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf);
+                    let line = line.trim_end_matches(['\r', '\n']);
+                    let mut g = stderr_clone.lock();
+                    if g.len() < 4096 {
+                        g.push_str(line);
+                        g.push('\n');
+                    }
+                }
             }
         }
     });
@@ -731,8 +835,10 @@ where
         None,
     );
 
-    let mut lines = BufReader::new(stdout).lines();
+    let mut stdout_reader = BufReader::new(stdout);
+    let mut line_buf = Vec::with_capacity(1024);
     let mut final_path: Option<PathBuf> = None;
+    let mut fallback_path: Option<PathBuf> = None;
     let mut completed_streams_bytes: u64 = 0;
     let mut current_stream_total: Option<u64> = None;
 
@@ -741,16 +847,20 @@ where
             let _ = child.kill().await;
             break;
         }
-        let line_opt = tokio::select! {
-            res = lines.next_line() => res?,
+        line_buf.clear();
+        let read_res = tokio::select! {
+            res = stdout_reader.read_until(b'\n', &mut line_buf) => res?,
             _ = cancel.notify.notified() => {
                 let _ = child.kill().await;
                 break;
             }
         };
-        let Some(line) = line_opt else {
+        if read_res == 0 {
             break;
-        };
+        }
+        let line = String::from_utf8_lossy(&line_buf)
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
 
         if let Some(p) = line.strip_prefix("VORTEX_FINAL_PATH:") {
             let pb = PathBuf::from(p.trim());
@@ -768,6 +878,9 @@ where
                 completed_streams_bytes = completed_streams_bytes.saturating_add(prev_tot);
             }
             let pb = PathBuf::from(dest.trim());
+            if !is_ytdlp_intermediate_stream(&pb) || fallback_path.is_none() {
+                fallback_path = Some(pb.clone());
+            }
             if let Some(name) = pb.file_name().and_then(|n| n.to_str()) {
                 item.filename = name.to_string();
                 on_progress(
@@ -780,6 +893,45 @@ where
                     None,
                 );
             }
+            continue;
+        }
+
+        if let Some(pb) = parse_ytdlp_already_downloaded(&line) {
+            if !is_ytdlp_intermediate_stream(&pb) || fallback_path.is_none() {
+                fallback_path = Some(pb.clone());
+            }
+            if let Some(name) = pb.file_name().and_then(|n| n.to_str()) {
+                item.filename = name.to_string();
+                item.category = FileCategory::from_filename(&item.filename);
+                on_progress(
+                    None,
+                    Some(item.filename.clone()),
+                    Some(pb),
+                    item.downloaded_bytes,
+                    item.total_bytes,
+                    0,
+                    None,
+                );
+            }
+            continue;
+        }
+
+        if let Some(pb) = parse_ytdlp_merger_path(&line).or_else(|| parse_ytdlp_extract_audio_path(&line)) {
+            fallback_path = Some(pb.clone());
+            if let Some(name) = pb.file_name().and_then(|n| n.to_str()) {
+                item.filename = name.to_string();
+                item.category = FileCategory::from_filename(&item.filename);
+            }
+            item.file_path = pb.clone();
+            on_progress(
+                Some(DownloadStatus::Merging),
+                Some(item.filename.clone()),
+                Some(pb),
+                item.downloaded_bytes,
+                item.total_bytes,
+                0,
+                None,
+            );
             continue;
         }
 
@@ -831,7 +983,18 @@ where
         return Err(anyhow!("yt-dlp falhou ({status}): {}", err_txt.trim()));
     }
 
-    if let Some(pb) = final_path {
+    if let Some(pb) = resolve_ytdlp_final_path(
+        final_path.as_deref(),
+        fallback_path.as_deref(),
+        Some(item.file_path.as_path()),
+        &item.save_dir,
+        &item.url,
+    ) {
+        if let Some(name) = pb.file_name().and_then(|n| n.to_str()) {
+            item.filename = name.to_string();
+        }
+        item.category = FileCategory::from_filename(&item.filename);
+        item.file_path = pb.clone();
         if let Ok(meta) = tokio::fs::metadata(&pb).await {
             item.total_bytes = Some(meta.len());
             item.downloaded_bytes = meta.len();
@@ -842,6 +1005,122 @@ where
     item.eta_seconds = Some(0);
     item.completed_at = Some(chrono::Utc::now());
     Ok(())
+}
+
+fn parse_ytdlp_already_downloaded(line: &str) -> Option<PathBuf> {
+    let rest = line.strip_prefix("[download] ")?;
+    let path = rest.strip_suffix(" has already been downloaded")?;
+    let trimmed = path.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+fn parse_ytdlp_merger_path(line: &str) -> Option<PathBuf> {
+    let rest = line.strip_prefix("[Merger] Merging formats into ")?;
+    let trimmed = rest.trim().trim_matches('"');
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+fn parse_ytdlp_extract_audio_path(line: &str) -> Option<PathBuf> {
+    let rest = line.strip_prefix("[ExtractAudio] Destination:")?;
+    let trimmed = rest.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+fn is_ytdlp_intermediate_stream(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let Some((_, tail)) = stem.rsplit_once(".f") else {
+        return false;
+    };
+    !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit())
+}
+
+fn extract_bracket_id(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let open = name.rfind('[')?;
+    let close = name[open + 1..].find(']')?;
+    let id = &name[open + 1..open + 1 + close];
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+fn extract_url_media_id(url: &str) -> Option<String> {
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        for (k, v) in parsed.query_pairs() {
+            if k == "v" && !v.is_empty() {
+                return Some(v.into_owned());
+            }
+        }
+        if let Some(host) = parsed.host_str() {
+            if host.contains("youtu.be") {
+                if let Some(seg) = parsed.path_segments().and_then(|mut s| s.next()) {
+                    if !seg.is_empty() {
+                        return Some(seg.to_string());
+                    }
+                }
+            }
+            if host.contains("youtube.com") {
+                let segs: Vec<&str> = parsed.path_segments()?.collect();
+                if segs.len() >= 2 && matches!(segs[0], "shorts" | "embed" | "live") && !segs[1].is_empty() {
+                    return Some(segs[1].to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_ytdlp_final_path(
+    final_path: Option<&Path>,
+    fallback_path: Option<&Path>,
+    current_path: Option<&Path>,
+    save_dir: &Path,
+    url: &str,
+) -> Option<PathBuf> {
+    for candidate in [final_path, fallback_path, current_path].into_iter().flatten() {
+        if !candidate.as_os_str().is_empty() && candidate.is_file() {
+            return Some(candidate.to_path_buf());
+        }
+    }
+
+    let id_token = final_path
+        .and_then(extract_bracket_id)
+        .or_else(|| fallback_path.and_then(extract_bracket_id))
+        .or_else(|| current_path.and_then(extract_bracket_id))
+        .or_else(|| extract_url_media_id(url))?;
+    let needle = format!("[{id_token}]");
+
+    let entries = std::fs::read_dir(save_dir).ok()?;
+    let mut best: Option<(bool, std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".part") || lower.ends_with(".ytdl") || lower.ends_with(".tmp") {
+            continue;
+        }
+        if !name.contains(&needle) {
+            continue;
+        }
+        let is_final = !is_ytdlp_intermediate_stream(&path);
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let replace = match &best {
+            None => true,
+            Some((best_final, best_mod, _)) => (is_final, modified) > (*best_final, *best_mod),
+        };
+        if replace {
+            best = Some((is_final, modified, path));
+        }
+    }
+    best.map(|(_, _, p)| p)
 }
 
 fn parse_ytdlp_progress(line: &str) -> Option<(f64, Option<u64>, u64, Option<u64>)> {
@@ -1185,6 +1464,904 @@ fn parse_hls_segments(base: &url::Url, playlist: &str) -> Vec<url::Url> {
     segs
 }
 
+pub fn resolve_ffprobe_path(ffmpeg_path: Option<&str>) -> Option<String> {
+    if let Some(ff) = ffmpeg_path {
+        let p = Path::new(ff);
+        if let Some(parent) = p.parent() {
+            for name in ["ffprobe.exe", "ffprobe"] {
+                let candidate = parent.join(name);
+                if candidate.exists() {
+                    return Some(candidate.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    find_binary_everywhere(&["ffprobe.exe", "ffprobe"])
+}
+
+fn parse_ffprobe_rate(rate: &str) -> Option<f64> {
+    let trimmed = rate.trim();
+    if trimmed.is_empty() || trimmed == "0/0" {
+        return None;
+    }
+    if let Some((num, den)) = trimmed.split_once('/') {
+        let n: f64 = num.trim().parse().ok()?;
+        let d: f64 = den.trim().parse().ok()?;
+        if d > 0.0 && n > 0.0 {
+            return Some(n / d);
+        }
+        return None;
+    }
+    let val: f64 = trimmed.parse().ok()?;
+    if val > 0.0 { Some(val) } else { None }
+}
+
+pub async fn probe_video_file(path: &Path, ffmpeg_path: Option<&str>) -> Result<VideoProbeInfo> {
+    if !path.exists() {
+        return Err(anyhow!("Arquivo não encontrado: {}", path.display()));
+    }
+    let meta = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("Não foi possível ler metadados de {}", path.display()))?;
+    let file_size_bytes = meta.len();
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("video.mp4")
+        .to_string();
+
+    if let Some(ffprobe) = resolve_ffprobe_path(ffmpeg_path) {
+        let mut cmd = Command::new(&ffprobe);
+        crate::extractor::configure_silent_command(&mut cmd);
+        let out = cmd
+            .args([
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                &path.to_string_lossy(),
+            ])
+            .output()
+            .await
+            .context("Falha ao executar ffprobe")?;
+
+        if out.status.success() {
+            if let Ok(json) = serde_json::from_slice::<Value>(&out.stdout) {
+                let streams = json["streams"].as_array();
+                let video_stream = streams.and_then(|arr| {
+                    arr.iter()
+                        .find(|s| s["codec_type"].as_str() == Some("video"))
+                });
+                let audio_stream = streams.and_then(|arr| {
+                    arr.iter()
+                        .find(|s| s["codec_type"].as_str() == Some("audio"))
+                });
+
+                let duration_secs = json["format"]["duration"]
+                    .as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| {
+                        video_stream
+                            .and_then(|s| s["duration"].as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                    })
+                    .unwrap_or(0.0);
+
+                let width = video_stream
+                    .and_then(|s| s["width"].as_u64())
+                    .unwrap_or(0) as u32;
+                let height = video_stream
+                    .and_then(|s| s["height"].as_u64())
+                    .unwrap_or(0) as u32;
+                let fps = video_stream
+                    .and_then(|s| {
+                        s["avg_frame_rate"]
+                            .as_str()
+                            .and_then(parse_ffprobe_rate)
+                            .or_else(|| s["r_frame_rate"].as_str().and_then(parse_ffprobe_rate))
+                    })
+                    .unwrap_or(30.0)
+                    .clamp(1.0, 240.0);
+
+                let video_codec = video_stream
+                    .and_then(|s| s["codec_name"].as_str())
+                    .unwrap_or("desconhecido")
+                    .to_string();
+
+                let total_bitrate_bps = json["format"]["bit_rate"]
+                    .as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .filter(|&b| b > 0)
+                    .unwrap_or_else(|| {
+                        if duration_secs > 0.2 {
+                            ((file_size_bytes as f64 * 8.0) / duration_secs) as u64
+                        } else {
+                            0
+                        }
+                    });
+
+                let has_audio = audio_stream.is_some();
+                let audio_codec = audio_stream
+                    .and_then(|s| s["codec_name"].as_str())
+                    .map(|s| s.to_string());
+                let audio_bitrate_bps = audio_stream
+                    .and_then(|s| s["bit_rate"].as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .filter(|&b| b > 0);
+
+                return Ok(VideoProbeInfo {
+                    path: path.to_path_buf(),
+                    filename,
+                    file_size_bytes,
+                    duration_secs,
+                    width,
+                    height,
+                    fps,
+                    video_codec,
+                    total_bitrate_bps,
+                    has_audio,
+                    audio_codec,
+                    audio_bitrate_bps,
+                });
+            }
+        }
+    }
+
+    // Fallback: inspect via `ffmpeg -i` stderr when ffprobe is unavailable
+    let ffmpeg = ffmpeg_path
+        .map(|s| s.to_string())
+        .or_else(|| find_binary_everywhere(&["ffmpeg.exe", "ffmpeg"]))
+        .ok_or_else(|| anyhow!("FFmpeg / ffprobe não encontrado. Instale na barra superior da aba Mídia."))?;
+
+    let mut cmd = Command::new(&ffmpeg);
+    crate::extractor::configure_silent_command(&mut cmd);
+    let out = cmd.args(["-i", &path.to_string_lossy()]).output().await?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let duration_secs = regex::Regex::new(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+        .ok()
+        .and_then(|re| re.captures(&stderr))
+        .map(|c| {
+            let h: f64 = c[1].parse().unwrap_or(0.0);
+            let m: f64 = c[2].parse().unwrap_or(0.0);
+            let s: f64 = c[3].parse().unwrap_or(0.0);
+            h * 3600.0 + m * 60.0 + s
+        })
+        .unwrap_or(0.0);
+
+    let (width, height) = regex::Regex::new(r"Video:.*?,\s*(\d{2,5})x(\d{2,5})")
+        .ok()
+        .and_then(|re| re.captures(&stderr))
+        .map(|c| (c[1].parse().unwrap_or(0), c[2].parse().unwrap_or(0)))
+        .unwrap_or((0, 0));
+
+    let total_bitrate_bps = if duration_secs > 0.2 {
+        ((file_size_bytes as f64 * 8.0) / duration_secs) as u64
+    } else {
+        0
+    };
+
+    Ok(VideoProbeInfo {
+        path: path.to_path_buf(),
+        filename,
+        file_size_bytes,
+        duration_secs,
+        width,
+        height,
+        fps: 30.0,
+        video_codec: "video".to_string(),
+        total_bitrate_bps,
+        has_audio: stderr.contains("Audio:"),
+        audio_codec: None,
+        audio_bitrate_bps: None,
+    })
+}
+
+fn round_even(v: u32) -> u32 {
+    let clamped = v.max(2);
+    if clamped % 2 == 0 {
+        clamped
+    } else {
+        clamped - 1
+    }
+}
+
+fn scale_keeping_aspect_by_short_side(src_w: u32, src_h: u32, target_short: u32) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 {
+        return (0, 0);
+    }
+    let src_short = src_w.min(src_h);
+    if target_short >= src_short {
+        return (round_even(src_w), round_even(src_h));
+    }
+    if src_w >= src_h {
+        let out_h = round_even(target_short);
+        let out_w = round_even(((src_w as f64) * (out_h as f64) / (src_h as f64)).round() as u32);
+        (out_w, out_h)
+    } else {
+        let out_w = round_even(target_short);
+        let out_h = round_even(((src_h as f64) * (out_w as f64) / (src_w as f64)).round() as u32);
+        (out_w, out_h)
+    }
+}
+
+pub fn plan_video_compression(
+    probe: &VideoProbeInfo,
+    target_ratio: f32,
+    codec: VideoCompressionCodec,
+    auto_downscale: bool,
+) -> VideoCompressionPlan {
+    let ratio = target_ratio.clamp(0.10, 0.95);
+    let min_bytes = probe.file_size_bytes.min(64 * 1024);
+    let target_bytes = ((probe.file_size_bytes as f64) * (ratio as f64))
+        .round()
+        .max(min_bytes as f64) as u64;
+
+    let t = ((0.95 - ratio) / (0.95 - 0.10)).clamp(0.0, 1.0);
+    let crf_fallback = match codec {
+        VideoCompressionCodec::Hevc => (18.0 + t * 14.0).round() as u8,
+        VideoCompressionCodec::H264 => (17.0 + t * 15.0).round() as u8,
+    };
+
+    let two_pass = probe.duration_secs > 0.25 && probe.file_size_bytes > 0;
+    const CONTAINER_EFFICIENCY: f64 = 0.982;
+
+    let (video_bitrate_bps, audio_bitrate_bps, copy_audio, estimated_bytes) = if two_pass {
+        let usable_total_bps =
+            ((target_bytes as f64 * 8.0) / probe.duration_secs) * CONTAINER_EFFICIENCY;
+
+        let (audio_bps, copy_audio) = if !probe.has_audio {
+            (0u64, false)
+        } else {
+            // Prioritize audio clarity: preserve >=128 kbps whenever the budget allows it,
+            // and stream-copy existing AAC audio directly whenever it fits comfortably so
+            // there is zero generational quality loss.
+            let tier_bps: u64 = if usable_total_bps >= 1_400_000.0 {
+                192_000
+            } else if usable_total_bps >= 700_000.0 {
+                160_000
+            } else if usable_total_bps >= 300_000.0 {
+                128_000
+            } else if usable_total_bps >= 180_000.0 {
+                96_000
+            } else {
+                64_000
+            };
+            let max_audio_share = (usable_total_bps * 0.40) as u64;
+            let floor_audio = if usable_total_bps >= 200_000.0 {
+                64_000
+            } else {
+                48_000
+            };
+            let chosen_audio = if let Some(src_abps) = probe.audio_bitrate_bps {
+                tier_bps
+                    .min(src_abps.max(floor_audio))
+                    .min(max_audio_share.max(floor_audio))
+            } else {
+                tier_bps.min(max_audio_share.max(floor_audio))
+            };
+
+            if let Some(src_abps) = probe.audio_bitrate_bps {
+                let is_aac = probe
+                    .audio_codec
+                    .as_deref()
+                    .map(|c| c.eq_ignore_ascii_case("aac"))
+                    .unwrap_or(false);
+                if is_aac
+                    && src_abps <= 192_000
+                    && src_abps <= max_audio_share.max(128_000)
+                    && usable_total_bps >= (src_abps as f64) + 140_000.0
+                {
+                    (src_abps, true)
+                } else {
+                    (chosen_audio, false)
+                }
+            } else {
+                (chosen_audio, false)
+            }
+        };
+
+        let video_bps = (usable_total_bps.round() as u64)
+            .saturating_sub(audio_bps)
+            .max(40_000);
+        let est_bytes = (((video_bps + audio_bps) as f64 / 8.0) * probe.duration_secs
+            / CONTAINER_EFFICIENCY)
+            .round() as u64;
+        (video_bps, audio_bps, copy_audio, est_bytes)
+    } else {
+        let fallback_audio = if probe.has_audio { 160_000 } else { 0 };
+        (1_500_000, fallback_audio, false, target_bytes)
+    };
+
+    let src_w = round_even(probe.width);
+    let src_h = round_even(probe.height);
+    let fps = probe.fps.clamp(12.0, 120.0);
+    let min_bpp = match codec {
+        VideoCompressionCodec::Hevc => 0.042,
+        VideoCompressionCodec::H264 => 0.068,
+    };
+
+    let mut out_w = src_w;
+    let mut out_h = src_h;
+    if auto_downscale && two_pass && probe.width > 0 && probe.height > 0 {
+        let native_bpp = (video_bitrate_bps as f64) / ((src_w as f64) * (src_h as f64) * fps);
+        if native_bpp < min_bpp {
+            let src_short = src_w.min(src_h);
+            let mut chosen = (src_w, src_h);
+            let candidates = [2160u32, 1440, 1080, 900, 720, 540, 480, 360];
+            let mut matched = false;
+            for cand_short in candidates {
+                if cand_short >= src_short {
+                    continue;
+                }
+                let (cw, ch) = scale_keeping_aspect_by_short_side(src_w, src_h, cand_short);
+                if cw == 0 || ch == 0 {
+                    continue;
+                }
+                let bpp = (video_bitrate_bps as f64) / ((cw as f64) * (ch as f64) * fps);
+                chosen = (cw, ch);
+                if bpp >= min_bpp {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched && src_short > 360 {
+                chosen = scale_keeping_aspect_by_short_side(src_w, src_h, 360);
+            }
+            out_w = chosen.0;
+            out_h = chosen.1;
+        }
+    }
+
+    let downscaled = probe.width > 0 && probe.height > 0 && (out_w != src_w || out_h != src_h);
+    let reduction_percent = if probe.file_size_bytes > 0 && estimated_bytes < probe.file_size_bytes {
+        (((probe.file_size_bytes - estimated_bytes) as f64 / probe.file_size_bytes as f64) * 100.0)
+            .round()
+            .clamp(0.0, 99.0) as u8
+    } else {
+        0
+    };
+
+    let quality_note = if !two_pass {
+        format!(
+            "CRF {} {} (duração não informada; qualidade perceptual adaptativa)",
+            crf_fallback,
+            codec.short_label()
+        )
+    } else if downscaled {
+        format!(
+            "2-Pass {} · Resolução ajustada para {}x{} para evitar pixelização neste tamanho",
+            codec.short_label(),
+            out_w,
+            out_h
+        )
+    } else if ratio >= 0.70 {
+        format!(
+            "2-Pass {} · Resolução nativa com bitrate otimizado por cena (fidelidade máxima)",
+            codec.short_label()
+        )
+    } else {
+        format!(
+            "2-Pass {} · Alocação inteligente de bits por cena para máxima nitidez neste tamanho",
+            codec.short_label()
+        )
+    };
+
+    VideoCompressionPlan {
+        target_bytes,
+        estimated_bytes,
+        reduction_percent,
+        video_bitrate_bps,
+        audio_bitrate_bps,
+        copy_audio,
+        out_width: out_w,
+        out_height: out_h,
+        downscaled,
+        codec,
+        two_pass,
+        crf_fallback,
+        quality_note,
+    }
+}
+
+pub fn unique_compressed_output_path(input: &Path) -> PathBuf {
+    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("video");
+    let first = parent.join(format!("{stem}_comprimido.mp4"));
+    if !first.exists() {
+        return first;
+    }
+    for i in 2..=999 {
+        let cand = parent.join(format!("{stem}_comprimido_{i}.mp4"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    parent.join(format!("{stem}_comprimido_{}.mp4", uuid::Uuid::new_v4()))
+}
+
+fn parse_ffmpeg_progress_kv(line: &str) -> Option<(&str, &str)> {
+    let (k, v) = line.split_once('=')?;
+    Some((k.trim(), v.trim()))
+}
+
+fn parse_ffmpeg_speed_x(val: &str) -> Option<f32> {
+    val.trim().trim_end_matches('x').parse::<f32>().ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn compress_video_file<F>(
+    ffmpeg_path: &str,
+    job_id: uuid::Uuid,
+    input_path: &Path,
+    output_path: &Path,
+    probe: &VideoProbeInfo,
+    plan: &VideoCompressionPlan,
+    replace_original: bool,
+    cancel: Arc<AtomicBool>,
+    on_progress: F,
+) -> Result<(PathBuf, u64)>
+where
+    F: Fn(CompressionJobStatus, f32, Option<f32>, Option<u64>) + Send + Sync + Clone + 'static,
+{
+    if !input_path.exists() {
+        return Err(anyhow!(
+            "Arquivo de origem não encontrado: {}",
+            input_path.display()
+        ));
+    }
+
+    if let Some(parent) = output_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let work_dir = std::env::temp_dir().join(format!("vortex_compress_{job_id}"));
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    tokio::fs::create_dir_all(&work_dir).await?;
+
+    let tmp_output = output_path.with_extension("vortex_tmp.mp4");
+    let _ = tokio::fs::remove_file(&tmp_output).await;
+
+    let run_result = run_ffmpeg_compression_passes(
+        ffmpeg_path,
+        &work_dir,
+        input_path,
+        &tmp_output,
+        probe,
+        plan,
+        &cancel,
+        &on_progress,
+    )
+    .await;
+
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(err) = run_result {
+        let _ = tokio::fs::remove_file(&tmp_output).await;
+        return Err(err);
+    }
+
+    let final_target = if replace_original {
+        let backup = input_path.with_extension("vortex_orig.bak");
+        let _ = tokio::fs::remove_file(&backup).await;
+        if input_path != tmp_output {
+            tokio::fs::rename(input_path, &backup).await?;
+            match tokio::fs::rename(&tmp_output, output_path).await {
+                Ok(()) => {
+                    let _ = tokio::fs::remove_file(&backup).await;
+                }
+                Err(e) => {
+                    let _ = tokio::fs::rename(&backup, input_path).await;
+                    return Err(e.into());
+                }
+            }
+        }
+        output_path.to_path_buf()
+    } else {
+        if output_path.exists() {
+            let _ = tokio::fs::remove_file(output_path).await;
+        }
+        tokio::fs::rename(&tmp_output, output_path).await?;
+        output_path.to_path_buf()
+    };
+
+    let final_size = tokio::fs::metadata(&final_target).await?.len();
+    on_progress(CompressionJobStatus::Completed, 1.0, None, Some(0));
+    Ok((final_target, final_size))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_ffmpeg_compression_passes<F>(
+    ffmpeg_path: &str,
+    work_dir: &Path,
+    input_path: &Path,
+    tmp_output: &Path,
+    probe: &VideoProbeInfo,
+    plan: &VideoCompressionPlan,
+    cancel: &Arc<AtomicBool>,
+    on_progress: &F,
+) -> Result<()>
+where
+    F: Fn(CompressionJobStatus, f32, Option<f32>, Option<u64>) + Send + Sync + Clone + 'static,
+{
+    let video_k = (plan.video_bitrate_bps / 1000).max(40);
+    let maxrate_k = ((video_k as f64) * 1.45).round() as u64;
+    let bufsize_k = ((video_k as f64) * 2.5).round() as u64;
+    let vf_arg = if plan.downscaled && plan.out_width > 0 && plan.out_height > 0 {
+        Some(format!("scale={}:{}:flags=lanczos", plan.out_width, plan.out_height))
+    } else {
+        None
+    };
+
+    if plan.two_pass {
+        on_progress(CompressionJobStatus::Pass1Analyzing, 0.01, None, None);
+        let mut p1_args: Vec<String> = vec![
+            "-y".into(),
+            "-i".into(),
+            input_path.to_string_lossy().to_string(),
+        ];
+        if let Some(ref vf) = vf_arg {
+            p1_args.push("-vf".into());
+            p1_args.push(vf.clone());
+        }
+        match plan.codec {
+            VideoCompressionCodec::Hevc => {
+                p1_args.extend([
+                    "-c:v".into(),
+                    "libx265".into(),
+                    "-preset".into(),
+                    "medium".into(),
+                    "-b:v".into(),
+                    format!("{video_k}k"),
+                    "-maxrate".into(),
+                    format!("{maxrate_k}k"),
+                    "-bufsize".into(),
+                    format!("{bufsize_k}k"),
+                    "-x265-params".into(),
+                    "pass=1:stats=x265_2pass.log:aq-mode=3:psy-rd=2.0:no-info=1".into(),
+                ]);
+            }
+            VideoCompressionCodec::H264 => {
+                p1_args.extend([
+                    "-c:v".into(),
+                    "libx264".into(),
+                    "-preset".into(),
+                    "slow".into(),
+                    "-b:v".into(),
+                    format!("{video_k}k"),
+                    "-maxrate".into(),
+                    format!("{maxrate_k}k"),
+                    "-bufsize".into(),
+                    format!("{bufsize_k}k"),
+                    "-aq-mode".into(),
+                    "3".into(),
+                    "-pass".into(),
+                    "1".into(),
+                    "-passlogfile".into(),
+                    "x264_2pass".into(),
+                ]);
+            }
+        }
+        let null_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        p1_args.extend([
+            "-an".into(),
+            "-f".into(),
+            "null".into(),
+            "-progress".into(),
+            "pipe:1".into(),
+            "-nostats".into(),
+            null_sink.into(),
+        ]);
+
+        run_ffmpeg_single_invocation(
+            ffmpeg_path,
+            work_dir,
+            &p1_args,
+            probe.duration_secs,
+            0.0,
+            0.35,
+            CompressionJobStatus::Pass1Analyzing,
+            cancel,
+            on_progress,
+        )
+        .await?;
+
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!("Compressão cancelada pelo usuário."));
+        }
+
+        on_progress(CompressionJobStatus::Pass2Encoding, 0.35, None, None);
+        let mut p2_args: Vec<String> = vec![
+            "-y".into(),
+            "-i".into(),
+            input_path.to_string_lossy().to_string(),
+        ];
+        if let Some(ref vf) = vf_arg {
+            p2_args.push("-vf".into());
+            p2_args.push(vf.clone());
+        }
+        match plan.codec {
+            VideoCompressionCodec::Hevc => {
+                p2_args.extend([
+                    "-c:v".into(),
+                    "libx265".into(),
+                    "-preset".into(),
+                    "medium".into(),
+                    "-b:v".into(),
+                    format!("{video_k}k"),
+                    "-maxrate".into(),
+                    format!("{maxrate_k}k"),
+                    "-bufsize".into(),
+                    format!("{bufsize_k}k"),
+                    "-x265-params".into(),
+                    "pass=2:stats=x265_2pass.log:aq-mode=3:psy-rd=2.0:no-info=1".into(),
+                    "-tag:v".into(),
+                    "hvc1".into(),
+                ]);
+            }
+            VideoCompressionCodec::H264 => {
+                p2_args.extend([
+                    "-c:v".into(),
+                    "libx264".into(),
+                    "-preset".into(),
+                    "slow".into(),
+                    "-b:v".into(),
+                    format!("{video_k}k"),
+                    "-maxrate".into(),
+                    format!("{maxrate_k}k"),
+                    "-bufsize".into(),
+                    format!("{bufsize_k}k"),
+                    "-aq-mode".into(),
+                    "3".into(),
+                    "-pass".into(),
+                    "2".into(),
+                    "-passlogfile".into(),
+                    "x264_2pass".into(),
+                ]);
+            }
+        }
+        append_audio_and_mux_args(&mut p2_args, probe, plan, tmp_output);
+
+        run_ffmpeg_single_invocation(
+            ffmpeg_path,
+            work_dir,
+            &p2_args,
+            probe.duration_secs,
+            0.35,
+            1.0,
+            CompressionJobStatus::Pass2Encoding,
+            cancel,
+            on_progress,
+        )
+        .await
+    } else {
+        on_progress(CompressionJobStatus::Encoding, 0.02, None, None);
+        let mut args: Vec<String> = vec![
+            "-y".into(),
+            "-i".into(),
+            input_path.to_string_lossy().to_string(),
+        ];
+        if let Some(ref vf) = vf_arg {
+            args.push("-vf".into());
+            args.push(vf.clone());
+        }
+        match plan.codec {
+            VideoCompressionCodec::Hevc => {
+                args.extend([
+                    "-c:v".into(),
+                    "libx265".into(),
+                    "-preset".into(),
+                    "medium".into(),
+                    "-crf".into(),
+                    plan.crf_fallback.to_string(),
+                    "-x265-params".into(),
+                    "aq-mode=3:psy-rd=2.0:no-info=1".into(),
+                    "-tag:v".into(),
+                    "hvc1".into(),
+                ]);
+            }
+            VideoCompressionCodec::H264 => {
+                args.extend([
+                    "-c:v".into(),
+                    "libx264".into(),
+                    "-preset".into(),
+                    "slow".into(),
+                    "-crf".into(),
+                    plan.crf_fallback.to_string(),
+                    "-aq-mode".into(),
+                    "3".into(),
+                ]);
+            }
+        }
+        append_audio_and_mux_args(&mut args, probe, plan, tmp_output);
+
+        run_ffmpeg_single_invocation(
+            ffmpeg_path,
+            work_dir,
+            &args,
+            probe.duration_secs,
+            0.0,
+            1.0,
+            CompressionJobStatus::Encoding,
+            cancel,
+            on_progress,
+        )
+        .await
+    }
+}
+
+fn append_audio_and_mux_args(
+    args: &mut Vec<String>,
+    probe: &VideoProbeInfo,
+    plan: &VideoCompressionPlan,
+    tmp_output: &Path,
+) {
+    args.extend(["-pix_fmt".into(), "yuv420p".into()]);
+    if !probe.has_audio {
+        args.push("-an".into());
+    } else if plan.copy_audio {
+        args.extend(["-c:a".into(), "copy".into()]);
+    } else {
+        let ak = (plan.audio_bitrate_bps / 1000).clamp(32, 320);
+        args.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-ac".into(),
+            "2".into(),
+            "-b:a".into(),
+            format!("{ak}k"),
+        ]);
+    }
+    args.extend([
+        "-map_metadata".into(),
+        "0".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        "-f".into(),
+        "mp4".into(),
+        "-progress".into(),
+        "pipe:1".into(),
+        "-nostats".into(),
+        tmp_output.to_string_lossy().to_string(),
+    ]);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_ffmpeg_single_invocation<F>(
+    ffmpeg_path: &str,
+    work_dir: &Path,
+    args: &[String],
+    duration_secs: f64,
+    frac_start: f32,
+    frac_end: f32,
+    status: CompressionJobStatus,
+    cancel: &Arc<AtomicBool>,
+    on_progress: &F,
+) -> Result<()>
+where
+    F: Fn(CompressionJobStatus, f32, Option<f32>, Option<u64>) + Send + Sync,
+{
+    let mut cmd = Command::new(ffmpeg_path);
+    crate::extractor::configure_silent_command(&mut cmd);
+    cmd.current_dir(work_dir)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    let mut child = cmd.spawn().context("Falha ao iniciar FFmpeg")?;
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("Sem stdout do FFmpeg"))?;
+    let stderr = child.stderr.take().ok_or_else(|| anyhow!("Sem stderr do FFmpeg"))?;
+
+    let stderr_tail = Arc::new(parking_lot::Mutex::new(String::new()));
+    let stderr_clone = stderr_tail.clone();
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let mut g = stderr_clone.lock();
+            if g.len() > 6144 {
+                let keep_from = g.len().saturating_sub(3072);
+                let tail = g[keep_from..].to_string();
+                *g = tail;
+            }
+            g.push_str(&line);
+            g.push('\n');
+        }
+    });
+
+    let mut lines = BufReader::new(stdout).lines();
+    let mut cur_speed: Option<f32> = None;
+    let mut cur_out_secs: f64 = 0.0;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill().await;
+            return Err(anyhow!("Compressão cancelada pelo usuário."));
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = child.kill().await;
+                    return Err(anyhow!("Compressão cancelada pelo usuário."));
+                }
+            }
+            res = lines.next_line() => {
+                match res {
+                    Ok(Some(line)) => {
+                        if let Some((k, v)) = parse_ffmpeg_progress_kv(&line) {
+                            match k {
+                                "out_time_us" | "out_time_ms" => {
+                                    if let Ok(us) = v.parse::<f64>() {
+                                        if us >= 0.0 {
+                                            cur_out_secs = us / 1_000_000.0;
+                                        }
+                                    }
+                                }
+                                "speed" => {
+                                    cur_speed = parse_ffmpeg_speed_x(v);
+                                }
+                                "progress" => {
+                                    let local_frac = if duration_secs > 0.1 {
+                                        (cur_out_secs / duration_secs).clamp(0.0, 1.0) as f32
+                                    } else {
+                                        0.5
+                                    };
+                                    let total_frac = frac_start + local_frac * (frac_end - frac_start);
+                                    let eta_secs = match cur_speed {
+                                        Some(spd) if spd > 0.05 && duration_secs > 0.1 => {
+                                            let rem_media = (duration_secs - cur_out_secs).max(0.0);
+                                            let rem_pass = rem_media / (spd as f64);
+                                            let scale_remaining = if frac_end < 0.99 {
+                                                rem_pass + (duration_secs / (spd as f64))
+                                            } else {
+                                                rem_pass
+                                            };
+                                            Some(scale_remaining.ceil() as u64)
+                                        }
+                                        _ => None,
+                                    };
+                                    on_progress(status.clone(), total_frac, cur_speed, eta_secs);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(anyhow!("Erro ao ler progresso do FFmpeg: {e}")),
+                }
+            }
+        }
+    }
+
+    let exit = child.wait().await?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err(anyhow!("Compressão cancelada pelo usuário."));
+    }
+    if !exit.success() {
+        let err_txt = stderr_tail.lock().clone();
+        let last_lines: Vec<&str> = err_txt
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(4)
+            .collect();
+        let summary = last_lines.into_iter().rev().collect::<Vec<_>>().join(" | ");
+        return Err(anyhow!("FFmpeg falhou: {summary}"));
+    }
+
+    on_progress(status, frac_end, cur_speed, None);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1279,5 +2456,193 @@ mod tests {
             detect_media_url("https://github.com/org/repo/archive/main.zip"),
             None
         );
+    }
+
+    #[test]
+    fn compression_plan_preserves_native_resolution_at_high_ratio() {
+        let probe = VideoProbeInfo {
+            path: PathBuf::from("clip.mp4"),
+            filename: "clip.mp4".into(),
+            file_size_bytes: 100 * 1024 * 1024, // 100 MiB
+            duration_secs: 60.0,
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            video_codec: "h264".into(),
+            total_bitrate_bps: 13_981_013,
+            has_audio: true,
+            audio_codec: Some("aac".into()),
+            audio_bitrate_bps: Some(128_000),
+        };
+
+        let plan = plan_video_compression(&probe, 0.75, VideoCompressionCodec::Hevc, true);
+        assert!(plan.two_pass);
+        assert!(!plan.downscaled);
+        assert_eq!(plan.out_width, 1920);
+        assert_eq!(plan.out_height, 1080);
+        assert!(plan.estimated_bytes <= 78 * 1024 * 1024);
+        assert!(plan.estimated_bytes >= 72 * 1024 * 1024);
+        assert!(plan.copy_audio);
+        assert!(plan.reduction_percent >= 20 && plan.reduction_percent <= 30);
+    }
+
+    #[test]
+    fn compression_plan_downscales_portrait_and_landscape_gracefully() {
+        let portrait = VideoProbeInfo {
+            path: PathBuf::from("reel.mp4"),
+            filename: "reel.mp4".into(),
+            file_size_bytes: 120 * 1024 * 1024,
+            duration_secs: 300.0, // 5 min -> ~3.35 Mbps source
+            width: 1080,
+            height: 1920,
+            fps: 60.0,
+            video_codec: "h264".into(),
+            total_bitrate_bps: 3_355_000,
+            has_audio: true,
+            audio_codec: Some("aac".into()),
+            audio_bitrate_bps: Some(192_000),
+        };
+
+        // 15% of 120 MiB over 300s at 60fps: ~500 kbps -> too low for 1080x1920@60fps, should downscale keeping 9:16
+        let aggressive = plan_video_compression(&portrait, 0.15, VideoCompressionCodec::H264, true);
+        assert!(aggressive.downscaled);
+        assert!(aggressive.out_width < 1080);
+        assert!(aggressive.out_height < 1920);
+        assert!(aggressive.out_height > aggressive.out_width);
+        assert_eq!(aggressive.out_width % 2, 0);
+        assert_eq!(aggressive.out_height % 2, 0);
+
+        // When auto_downscale is disabled, keeps 1080x1920
+        let keep_res = plan_video_compression(&portrait, 0.15, VideoCompressionCodec::H264, false);
+        assert!(!keep_res.downscaled);
+        assert_eq!(keep_res.out_width, 1080);
+        assert_eq!(keep_res.out_height, 1920);
+    }
+
+    #[test]
+    fn unique_compressed_output_path_handles_collisions() {
+        let dir = std::env::temp_dir().join(format!("vortex_test_out_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("demo.mkv");
+        std::fs::write(&src, b"x").unwrap();
+
+        let p1 = unique_compressed_output_path(&src);
+        assert_eq!(p1, dir.join("demo_comprimido.mp4"));
+        std::fs::write(&p1, b"y").unwrap();
+
+        let p2 = unique_compressed_output_path(&src);
+        assert_eq!(p2, dir.join("demo_comprimido_2.mp4"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_ffmpeg_progress_and_speed() {
+        assert_eq!(
+            parse_ffmpeg_progress_kv("out_time_us=12500000"),
+            Some(("out_time_us", "12500000"))
+        );
+        assert_eq!(parse_ffmpeg_speed_x(" 2.45x "), Some(2.45));
+        assert_eq!(parse_ffmpeg_speed_x("N/A"), None);
+    }
+
+    #[test]
+    fn parses_ytdlp_output_paths_and_resolves_unicode_disk_file() {
+        assert_eq!(
+            parse_ytdlp_already_downloaded(
+                "[download] D:\\Videos\\Demo [PNcRsZYsNJc].mp4 has already been downloaded"
+            ),
+            Some(PathBuf::from("D:\\Videos\\Demo [PNcRsZYsNJc].mp4"))
+        );
+        assert_eq!(
+            parse_ytdlp_merger_path(
+                "[Merger] Merging formats into \"D:\\Videos\\Demo [PNcRsZYsNJc].mp4\""
+            ),
+            Some(PathBuf::from("D:\\Videos\\Demo [PNcRsZYsNJc].mp4"))
+        );
+        assert_eq!(
+            parse_ytdlp_extract_audio_path(
+                "[ExtractAudio] Destination: D:\\Videos\\Demo [PNcRsZYsNJc].mp3"
+            ),
+            Some(PathBuf::from("D:\\Videos\\Demo [PNcRsZYsNJc].mp3"))
+        );
+
+        let dir = std::env::temp_dir().join(format!("vortex_yt_resolve_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let intermediate = dir.join("Madeline Goldstein\u{ff1a} My Own Design [PNcRsZYsNJc].f401.mp4");
+        let actual = dir.join("Madeline Goldstein\u{ff1a} My Own Design [PNcRsZYsNJc].mp4");
+        std::fs::write(&intermediate, b"partial").unwrap();
+        std::fs::write(&actual, b"merged-video").unwrap();
+
+        // Simulate cp1252-mangled stdout path missing U+FF1A
+        let mangled = dir.join("Madeline Goldstein My Own Design [PNcRsZYsNJc].mp4");
+        let resolved = resolve_ytdlp_final_path(
+            Some(&mangled),
+            None,
+            None,
+            &dir,
+            "https://www.youtube.com/watch?v=PNcRsZYsNJc",
+        );
+        assert_eq!(resolved.as_deref(), Some(actual.as_path()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compression_plan_prioritizes_audio_quality_and_copies_aac_when_fitting() {
+        let music_video = VideoProbeInfo {
+            path: PathBuf::from("music.mp4"),
+            filename: "music.mp4".into(),
+            file_size_bytes: 36 * 1024 * 1024,
+            duration_secs: 270.0,
+            width: 1280,
+            height: 720,
+            fps: 24.0,
+            video_codec: "h264".into(),
+            total_bitrate_bps: 1_100_000,
+            has_audio: true,
+            audio_codec: Some("aac".into()),
+            audio_bitrate_bps: Some(128_000),
+        };
+
+        // At 40% (-60%) on a 36 MB music video, original 128 kbps AAC should be stream-copied untouched
+        let copy_plan = plan_video_compression(&music_video, 0.40, VideoCompressionCodec::Hevc, true);
+        assert!(copy_plan.copy_audio);
+        assert_eq!(copy_plan.audio_bitrate_bps, 128_000);
+
+        // Even when source audio is Opus (must transcode to AAC), audio stays >= 128 kbps
+        let mut opus_video = music_video;
+        opus_video.audio_codec = Some("opus".into());
+        opus_video.audio_bitrate_bps = Some(160_000);
+        let transcode_plan =
+            plan_video_compression(&opus_video, 0.40, VideoCompressionCodec::Hevc, true);
+        assert!(!transcode_plan.copy_audio);
+        assert!(transcode_plan.audio_bitrate_bps >= 128_000);
+    }
+
+    #[test]
+    fn find_binary_with_dirs_checks_bundled_exe_bin_and_prefers_user_bin() {
+        let root = std::env::temp_dir().join(format!("vortex_bin_lookup_{}", uuid::Uuid::new_v4()));
+        let user_bin = root.join("user_bin");
+        let exe_dir = root.join("app");
+        let exe_bin = exe_dir.join("bin");
+        std::fs::create_dir_all(&user_bin).unwrap();
+        std::fs::create_dir_all(&exe_bin).unwrap();
+
+        let bundled_ff = exe_bin.join("ffmpeg.exe");
+        std::fs::write(&bundled_ff, b"bundled").unwrap();
+        assert_eq!(
+            find_binary_with_dirs(&["ffmpeg.exe"], &user_bin, Some(&exe_dir)).as_deref(),
+            Some(bundled_ff.to_string_lossy().as_ref())
+        );
+
+        let user_ff = user_bin.join("ffmpeg.exe");
+        std::fs::write(&user_ff, b"updated").unwrap();
+        assert_eq!(
+            find_binary_with_dirs(&["ffmpeg.exe"], &user_bin, Some(&exe_dir)).as_deref(),
+            Some(user_ff.to_string_lossy().as_ref())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

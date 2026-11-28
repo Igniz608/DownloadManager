@@ -7,3 +7,4 @@ pub mod model;
 pub mod package_grabber;
 pub mod state;
 pub mod torrent_engine;
+pub mod updater;

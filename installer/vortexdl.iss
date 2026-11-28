@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.0"
+  #define MyAppVersion "0.1.1"
 #endif
 
 #ifndef RepoRoot
@@ -12,6 +12,10 @@
 
 #ifndef OutputDir
   #define OutputDir "..\dist"
+#endif
+
+#ifndef BundleBinDir
+  #define BundleBinDir "..\build\bundle-bin"
 #endif
 
 [Setup]
@@ -36,6 +40,7 @@ DisableProgramGroupPage=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=yes
+CloseApplicationsFilter=*.exe,*.dll
 RestartApplications=no
 
 [Languages]
@@ -53,6 +58,7 @@ Source: "{#ReleaseDir}\WebView2Loader.dll"; DestDir: "{app}"; Flags: ignoreversi
 Source: "{#RepoRoot}\installer\vortexdl.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\installer\vortexdl-firefox.xpi"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\extension\*"; DestDir: "{app}\extension"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#BundleBinDir}\*"; DestDir: "{app}\bin"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\VortexDL"; Filename: "{app}\vortex-gui.exe"; IconFilename: "{app}\vortexdl.ico"
@@ -67,10 +73,94 @@ Filename: "{app}\vortex-gui.exe"; Description: "Abrir o VortexDL"; Flags: postin
 [UninstallRun]
 Filename: "{app}\vortex-gui.exe"; Parameters: "--no-gui --uninstall-integration"; Flags: runhidden waituntilterminated; RunOnceId: "VortexDLUninstallIntegration"
 
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}"
+Type: filesandordirs; Name: "{localappdata}\VortexDL"
+Type: filesandordirs; Name: "{userappdata}\VortexDL"
+
 [Code]
 var
   BrowserPage: TInputOptionWizardPage;
   BrowserIds: array[0..5] of String;
+
+function IsVortexRunning(const AppDir: String): Boolean;
+var
+  ResultCode: Integer;
+  PsCmd: String;
+begin
+  Result := CheckForMutexes('Local\VortexDLRunningMutex');
+  if Result then Exit;
+
+  PsCmd :=
+    '-NoProfile -NonInteractive -WindowStyle Hidden -Command "' +
+    '$p = Get-Process -Name ''vortex-gui'',''vortex-native-host'' -ErrorAction SilentlyContinue | ' +
+    'Where-Object { $_.Path -and $_.Path.StartsWith(''' + AppDir + ''', [System.StringComparison]::OrdinalIgnoreCase) }; ' +
+    'if ($p) { exit 0 } else { exit 1 }"';
+  if Exec('powershell.exe', PsCmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Result := (ResultCode = 0);
+end;
+
+procedure CloseRunningVortexProcesses(const AppDir: String);
+var
+  ResultCode: Integer;
+  PsCmd: String;
+begin
+  PsCmd :=
+    '-NoProfile -NonInteractive -WindowStyle Hidden -Command "' +
+    '$procs = Get-Process -Name ''vortex-gui'',''vortex-native-host'' -ErrorAction SilentlyContinue; ' +
+    'if (-not $procs) { exit 0 }; ' +
+    '$procs | ForEach-Object { try { if ($_.MainWindowHandle -ne 0) { $_.CloseMainWindow() | Out-Null } } catch {} }; ' +
+    'Start-Sleep -Milliseconds 700; ' +
+    'Get-Process -Name ''vortex-gui'',''vortex-native-host'',''yt-dlp'',''ffmpeg'',''ffprobe'' -ErrorAction SilentlyContinue | ' +
+    'Where-Object { (-not $_.Path) -or $_.Path.StartsWith(''' + AppDir + ''', [System.StringComparison]::OrdinalIgnoreCase) -or ($_.ProcessName -like ''vortex-*'') } | ' +
+    'Stop-Process -Force -ErrorAction SilentlyContinue"';
+  Exec('powershell.exe', PsCmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(400);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  AppDir: String;
+begin
+  Result := '';
+  AppDir := ExpandConstant('{app}');
+  if IsVortexRunning(AppDir) then
+    CloseRunningVortexProcesses(AppDir);
+end;
+
+function InitializeUninstall(): Boolean;
+var
+  AppDir: String;
+begin
+  Result := True;
+  AppDir := ExpandConstant('{app}');
+  if IsVortexRunning(AppDir) then
+  begin
+    if not UninstallSilent then
+      MsgBox('O VortexDL está em execução. Ele será fechado automaticamente para concluir a desinstalação e remover todos os resíduos.', mbInformation, MB_OK);
+    CloseRunningVortexProcesses(AppDir);
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  AppDir, LocalDataDir, RoamingDataDir, TempUpdateDir: String;
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    AppDir := ExpandConstant('{app}');
+    CloseRunningVortexProcesses(AppDir);
+
+    LocalDataDir := ExpandConstant('{localappdata}\VortexDL');
+    RoamingDataDir := ExpandConstant('{userappdata}\VortexDL');
+    TempUpdateDir := AddBackslash(ExtractFileDir(RemoveBackslashUnlessRoot(ExpandConstant('{tmp}')))) + 'VortexDL-Update';
+
+    if DirExists(LocalDataDir) then DelTree(LocalDataDir, True, True, True);
+    if DirExists(RoamingDataDir) then DelTree(RoamingDataDir, True, True, True);
+    if DirExists(AppDir) then DelTree(AppDir, True, True, True);
+    if DirExists(TempUpdateDir) then DelTree(TempUpdateDir, True, True, True);
+  end;
+end;
 
 function IsBrowserInstalled(const ExeName, RelPath1, RelPath2: String): Boolean;
 var

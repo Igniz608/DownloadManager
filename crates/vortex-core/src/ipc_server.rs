@@ -923,7 +923,11 @@ pub fn unregister_browser_integration() {
             r"Software\Microsoft\Edge\NativeMessagingHosts\com.vortexdl.host",
             r"Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.vortexdl.host",
             r"Software\Vivaldi\NativeMessagingHosts\com.vortexdl.host",
+            r"Software\Opera Software\NativeMessagingHosts\com.vortexdl.host",
             r"Software\Mozilla\NativeMessagingHosts\com.vortexdl.host",
+            r"Software\Waterfox\NativeMessagingHosts\com.vortexdl.host",
+            r"Software\LibreWolf\NativeMessagingHosts\com.vortexdl.host",
+            r"Software\VortexDL",
         ] {
             let _ = hkcu.delete_subkey_all(key_path);
         }

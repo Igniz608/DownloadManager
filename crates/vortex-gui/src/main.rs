@@ -303,6 +303,9 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    #[cfg(windows)]
+    let _running_mutex = create_running_instance_mutex();
+
     if !cli_args.is_empty() {
         let port = load_settings().ipc_port;
         let forwarded_any = cli_args
@@ -375,4 +378,35 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(windows)]
+struct RunningInstanceMutex(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for RunningInstanceMutex {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe extern "system" {
+                fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            }
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_running_instance_mutex() -> RunningInstanceMutex {
+    unsafe extern "system" {
+        fn CreateMutexW(
+            lpMutexAttributes: *const std::ffi::c_void,
+            bInitialOwner: i32,
+            lpName: *const u16,
+        ) -> *mut std::ffi::c_void;
+    }
+    let name: Vec<u16> = "Local\\VortexDLRunningMutex\0".encode_utf16().collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    RunningInstanceMutex(handle)
 }

@@ -385,6 +385,7 @@ mod tests {
             created_at: Utc::now(),
             completed_at: None,
             error: None,
+            priority: 0,
         }
     }
 

@@ -343,53 +343,10 @@ impl DownloadManager {
     }
 
     pub fn pump_queue(self: &Arc<Self>) {
-        const MAX_ACTIVE_PER_HOST: usize = 2;
         let max_concurrent = self.settings.read().max_concurrent_downloads.max(1);
         let to_start: Vec<DownloadId> = {
             let dls = self.downloads.read();
-            let mut active_total = 0usize;
-            let mut active_per_host: HashMap<String, usize> = HashMap::new();
-            for d in dls.iter() {
-                if matches!(
-                    d.status,
-                    DownloadStatus::Probing | DownloadStatus::Downloading | DownloadStatus::Merging
-                ) {
-                    active_total += 1;
-                    if d.kind == DownloadKind::Http {
-                        if let Some(host) = url::Url::parse(&d.url)
-                            .ok()
-                            .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
-                        {
-                            *active_per_host.entry(host).or_insert(0) += 1;
-                        }
-                    }
-                }
-            }
-            if active_total >= max_concurrent {
-                return;
-            }
-            let mut remaining_slots = max_concurrent - active_total;
-            let mut chosen = Vec::new();
-            for d in dls.iter().filter(|d| d.status == DownloadStatus::Queued) {
-                if remaining_slots == 0 {
-                    break;
-                }
-                if d.kind == DownloadKind::Http {
-                    if let Some(host) = url::Url::parse(&d.url)
-                        .ok()
-                        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
-                    {
-                        let count = active_per_host.get(&host).copied().unwrap_or(0);
-                        if count >= MAX_ACTIVE_PER_HOST {
-                            continue;
-                        }
-                        active_per_host.insert(host, count + 1);
-                    }
-                }
-                chosen.push(d.id);
-                remaining_slots -= 1;
-            }
-            chosen
+            select_queued_downloads_to_start(&dls, max_concurrent)
         };
 
         for id in to_start {
@@ -486,6 +443,7 @@ impl DownloadManager {
             created_at: Utc::now(),
             completed_at: None,
             error: None,
+            priority: 0,
         };
 
         self.downloads.write().insert(0, item);
@@ -579,6 +537,7 @@ impl DownloadManager {
             created_at: Utc::now(),
             completed_at: None,
             error: None,
+            priority: 0,
         };
 
         self.downloads.write().insert(0, item);
@@ -688,6 +647,7 @@ impl DownloadManager {
             created_at: Utc::now(),
             completed_at: None,
             error: None,
+            priority: 0,
         };
 
         self.downloads.write().insert(0, item);
@@ -1252,6 +1212,7 @@ impl DownloadManager {
                     created_at: Utc::now(),
                     completed_at: None,
                     error: None,
+                    priority: 0,
                 };
                 self.downloads.write().insert(0, item);
                 added_count += 1;
@@ -2263,6 +2224,23 @@ impl DownloadManager {
         }
     }
 
+    pub fn adjust_download_priority(self: &Arc<Self>, id: DownloadId, delta: i32) -> Option<i32> {
+        let updated = {
+            let mut dls = self.downloads.write();
+            let item = dls.iter_mut().find(|d| d.id == id)?;
+            let next = (item.priority + delta)
+                .clamp(crate::model::MIN_DOWNLOAD_PRIORITY, crate::model::MAX_DOWNLOAD_PRIORITY);
+            if next == item.priority {
+                return Some(next);
+            }
+            item.priority = next;
+            next
+        };
+        self.persist_now();
+        self.pump_queue();
+        Some(updated)
+    }
+
     pub fn remove_download(&self, id: DownloadId, delete_disk_file: bool) {
         let was_active = {
             let handles = self.cancel_handles.read();
@@ -2625,6 +2603,60 @@ pub fn is_torrent_request(url: &str, filename_hint: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+fn select_queued_downloads_to_start(dls: &[DownloadItem], max_concurrent: usize) -> Vec<DownloadId> {
+    const MAX_ACTIVE_PER_HOST: usize = 2;
+    let max_concurrent = max_concurrent.max(1);
+    let mut active_total = 0usize;
+    let mut active_per_host: HashMap<String, usize> = HashMap::new();
+    for d in dls.iter() {
+        if matches!(
+            d.status,
+            DownloadStatus::Probing | DownloadStatus::Downloading | DownloadStatus::Merging
+        ) {
+            active_total += 1;
+            if d.kind == DownloadKind::Http {
+                if let Some(host) = url::Url::parse(&d.url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+                {
+                    *active_per_host.entry(host).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    if active_total >= max_concurrent {
+        return Vec::new();
+    }
+    let mut remaining_slots = max_concurrent - active_total;
+    let mut queued: Vec<&DownloadItem> = dls
+        .iter()
+        .filter(|d| d.status == DownloadStatus::Queued)
+        .collect();
+    queued.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+    let mut chosen = Vec::new();
+    for d in queued {
+        if remaining_slots == 0 {
+            break;
+        }
+        if d.kind == DownloadKind::Http {
+            if let Some(host) = url::Url::parse(&d.url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+            {
+                let count = active_per_host.get(&host).copied().unwrap_or(0);
+                if count >= MAX_ACTIVE_PER_HOST {
+                    continue;
+                }
+                active_per_host.insert(host, count + 1);
+            }
+        }
+        chosen.push(d.id);
+        remaining_slots -= 1;
+    }
+    chosen
+}
+
 fn merge_completed_download_item(live_slot: &DownloadItem, mut updated: DownloadItem) -> DownloadItem {
     updated.auto_extract = live_slot.auto_extract;
     updated.extractor_override = live_slot.extractor_override.clone();
@@ -2635,6 +2667,7 @@ fn merge_completed_download_item(live_slot: &DownloadItem, mut updated: Download
     updated.extracted_to = live_slot.extracted_to.clone();
     updated.extraction_status = live_slot.extraction_status.clone();
     updated.extraction_progress = live_slot.extraction_progress;
+    updated.priority = live_slot.priority;
     updated
 }
 
@@ -2932,11 +2965,13 @@ mod tests {
             created_at: now,
             completed_at: None,
             error: None,
+            priority: 0,
         };
 
         let mut live_slot = initial.clone();
         live_slot.extractor_override = Some("windows_native".into());
         live_slot.extract_password = Some("secret123".into());
+        live_slot.priority = 2;
 
         let mut worker_finished = initial;
         worker_finished.status = DownloadStatus::Completed;
@@ -2948,6 +2983,7 @@ mod tests {
         assert_eq!(merged.downloaded_bytes, 1000);
         assert_eq!(merged.extractor_override.as_deref(), Some("windows_native"));
         assert_eq!(merged.extract_password.as_deref(), Some("secret123"));
+        assert_eq!(merged.priority, 2);
         assert!(merged.auto_extract);
     }
 
@@ -3024,6 +3060,7 @@ mod tests {
             created_at: Utc::now(),
             completed_at: None,
             error: None,
+            priority: 0,
         };
 
         assert!(delete_non_torrent_files_from_disk(&item));
@@ -3111,6 +3148,7 @@ mod tests {
             created_at: Utc::now(),
             completed_at: None,
             error: None,
+            priority: 0,
         };
 
         delete_torrent_files_from_disk(&item);
@@ -3259,5 +3297,61 @@ mod tests {
         assert!(!should_keep_grabbed_link(&non_part_link, true));
         assert!(should_keep_grabbed_link(&part_link, false));
         assert!(should_keep_grabbed_link(&non_part_link, false));
+    }
+
+    #[tokio::test]
+    async fn queue_selection_prefers_higher_priority_and_clamps_adjustments() {
+        let mgr = DownloadManager::new(tokio::runtime::Handle::current());
+        let mk_dl = |name: &str, url: &str, priority: i32| DownloadItem {
+            id: Uuid::new_v4(),
+            package_id: None,
+            part_index: None,
+            part_total: None,
+            kind: DownloadKind::Http,
+            status: DownloadStatus::Queued,
+            url: url.into(),
+            filename: name.into(),
+            save_dir: PathBuf::from("."),
+            file_path: PathBuf::from(name),
+            category: FileCategory::Other,
+            total_bytes: None,
+            downloaded_bytes: 0,
+            uploaded_bytes: 0,
+            speed_bps: 0,
+            upload_speed_bps: 0,
+            eta_seconds: None,
+            connections: 1,
+            supports_ranges: true,
+            segments: Vec::new(),
+            etag: None,
+            last_modified: None,
+            headers: HashMap::new(),
+            checksum_expected: None,
+            checksum_verified: None,
+            media_info: None,
+            torrent_info: None,
+            auto_extract: false,
+            extractor_override: None,
+            extract_password: None,
+            extracted_to: None,
+            extraction_status: None,
+            extraction_progress: None,
+            created_at: Utc::now(),
+            completed_at: None,
+            error: None,
+            priority,
+        };
+
+        let low = mk_dl("low.bin", "https://a.example/low.bin", -1);
+        let normal = mk_dl("normal.bin", "https://b.example/normal.bin", 0);
+        let high = mk_dl("high.bin", "https://c.example/high.bin", 2);
+        let picked = select_queued_downloads_to_start(&[low.clone(), normal.clone(), high.clone()], 2);
+        assert_eq!(picked, vec![high.id, normal.id]);
+
+        *mgr.downloads.write() = vec![normal.clone()];
+        assert_eq!(mgr.adjust_download_priority(normal.id, 1), Some(1));
+        assert_eq!(mgr.adjust_download_priority(normal.id, 5), Some(2));
+        assert_eq!(mgr.adjust_download_priority(normal.id, -10), Some(-2));
+        assert_eq!(mgr.downloads.read()[0].priority, -2);
     }
 }

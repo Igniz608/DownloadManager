@@ -25,9 +25,9 @@ use vortex_core::manager::{DownloadManager, ManagerSnapshot, default_torrent_dir
 use vortex_core::media_engine::plan_video_compression;
 use vortex_core::model::{
     CloseToTrayMode, CompressionJobSnapshot, DownloadId, DownloadItem, DownloadKind,
-    DownloadStatus, ExtractorKind, ExtractorProfile, FileCategory, MediaProbeResult,
-    NewDownloadRequest, NewMediaRequest, PackageId, ThemeConfig, VideoCompressionCodec,
-    VideoCompressionLevel, VideoProbeInfo,
+    DownloadStatus, ExtractorKind, ExtractorProfile, FileCategory, MAX_DOWNLOAD_PRIORITY,
+    MIN_DOWNLOAD_PRIORITY, MediaProbeResult, NewDownloadRequest, NewMediaRequest, PackageId,
+    ThemeConfig, VideoCompressionCodec, VideoCompressionLevel, VideoProbeInfo,
 };
 use vortex_core::package_grabber::extract_urls_from_text;
 use vortex_core::updater::{
@@ -1230,7 +1230,7 @@ impl VortexApp {
         ui.add_space(8.0);
 
         let q = self.search_query.to_lowercase();
-        let items: Vec<&DownloadItem> = snap
+        let mut items: Vec<&DownloadItem> = snap
             .downloads
             .iter()
             .filter(|d| match self.active_tab {
@@ -1246,6 +1246,7 @@ impl VortexApp {
                     || d.url.to_lowercase().contains(&q)
             })
             .collect();
+        sort_items_for_display(&mut items);
 
         if items.is_empty() {
             render_empty_state(
@@ -1310,13 +1311,15 @@ impl VortexApp {
             .show(ui, |ui| {
                 let avail_w = ui.available_width();
                 let scale = theme.font_scale.clamp(0.8, 1.4);
-                let single_row_needed = if is_archive {
+                let prio_extra = if !item.status.is_finished() { 64.0 } else { 0.0 };
+                let single_row_needed = (if is_archive {
                     830.0
                 } else if is_compressible_video {
                     730.0
                 } else {
                     630.0
-                } * scale;
+                } + prio_extra)
+                    * scale;
 
                 let render_action = |app: &mut Self, ui: &mut Ui, action: u8| match action {
                     0 => {
@@ -1491,6 +1494,35 @@ impl VortexApp {
                     }
                     _ => {}
                 };
+                let render_priority_controls = |app: &mut Self, ui: &mut Ui| {
+                    if item.status.is_finished() {
+                        return;
+                    }
+                    let cur_label = item.priority_label();
+                    let can_up = item.priority < MAX_DOWNLOAD_PRIORITY;
+                    let can_down = item.priority > MIN_DOWNLOAD_PRIORITY;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        if priority_arrow_button(
+                            ui,
+                            false,
+                            can_down,
+                            &format!("Diminuir prioridade (Atual: {cur_label})"),
+                            theme,
+                        ) {
+                            app.manager.adjust_download_priority(item.id, -1);
+                        }
+                        if priority_arrow_button(
+                            ui,
+                            true,
+                            can_up,
+                            &format!("Aumentar prioridade (Atual: {cur_label})"),
+                            theme,
+                        ) {
+                            app.manager.adjust_download_priority(item.id, 1);
+                        }
+                    });
+                };
 
                 if avail_w >= single_row_needed {
                     let mut toggle_select = false;
@@ -1507,6 +1539,19 @@ impl VortexApp {
                                 );
                             }
                             pill(ui, item.status.label(), status_color, theme);
+                            if !item.status.is_finished() && item.priority != 0 {
+                                let prio_color = if item.priority > 0 {
+                                    to_c32(theme.success)
+                                } else {
+                                    to_c32(theme.text_muted)
+                                };
+                                pill(
+                                    ui,
+                                    &format!("Prioridade: {}", item.priority_label()),
+                                    prio_color,
+                                    theme,
+                                );
+                            }
                             if ui
                                 .add(
                                     egui::Label::new(
@@ -1527,6 +1572,7 @@ impl VortexApp {
                             for action in [6, 5, 4, 7, 3, 2, 1, 0] {
                                 render_action(self, ui, action);
                             }
+                            render_priority_controls(self, ui);
                         },
                     );
                     if toggle_select {
@@ -1558,9 +1604,23 @@ impl VortexApp {
                                 );
                             }
                             pill(ui, item.status.label(), status_color, theme);
+                            if !item.status.is_finished() && item.priority != 0 {
+                                let prio_color = if item.priority > 0 {
+                                    to_c32(theme.success)
+                                } else {
+                                    to_c32(theme.text_muted)
+                                };
+                                pill(
+                                    ui,
+                                    &format!("Prioridade: {}", item.priority_label()),
+                                    prio_color,
+                                    theme,
+                                );
+                            }
                         });
                         ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
+                            render_priority_controls(self, ui);
                             for action in [0, 1, 2, 3, 7, 4, 5, 6] {
                                 render_action(self, ui, action);
                             }
@@ -2577,9 +2637,11 @@ impl VortexApp {
                                             pill(ui, "Resolvendo...", to_c32(theme.accent), theme);
                                         } else {
                                             match link.online {
-                                                Some(true) => pill(ui, "Online", to_c32(theme.success), theme),
+                                                Some(true) => {
+                                                    pill(ui, "Online", to_c32(theme.success), theme);
+                                                }
                                                 Some(false) => {
-                                                    pill(ui, "Offline/Erro", to_c32(theme.error), theme)
+                                                    pill(ui, "Offline/Erro", to_c32(theme.error), theme);
                                                 }
                                                 None => {}
                                             }
@@ -2653,9 +2715,11 @@ impl VortexApp {
                                         pill(ui, "Resolvendo...", to_c32(theme.accent), theme);
                                     } else {
                                         match link.online {
-                                            Some(true) => pill(ui, "Online", to_c32(theme.success), theme),
+                                            Some(true) => {
+                                                pill(ui, "Online", to_c32(theme.success), theme);
+                                            }
                                             Some(false) => {
-                                                pill(ui, "Offline/Erro", to_c32(theme.error), theme)
+                                                pill(ui, "Offline/Erro", to_c32(theme.error), theme);
                                             }
                                             None => {}
                                         }
@@ -3157,179 +3221,271 @@ impl VortexApp {
         ui.heading("Extensão do Navegador & Native Messaging");
         ui.label(
             RichText::new(
-                "Capture downloads automaticamente, detecte vídeos e streams (.m3u8/.mpd/.mp4) de qualquer página e envie todos os links para o LinkGrabber com cookies e headers de sessão.",
+                "Capture downloads automaticamente, detecte vídeos e streams (.m3u8/.mpd/.mp4) e envie links ao LinkGrabber com cookies e headers.",
             )
             .small()
             .color(to_c32(theme.text_muted)),
         );
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
         let port = self.manager.settings.read().ipc_port;
         let gui_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("vortex-gui.exe"));
         let ext_dir = resolve_extension_dir(Some(&gui_exe));
         let portable = is_portable_mode();
+        let edge_auto_registered = is_edge_store_extension_registered();
+        let edge_suppressed = is_edge_store_extension_suppressed();
+        let firefox_xpi_path = resolve_firefox_xpi_path(Some(&gui_exe));
+        let magnet_registered = is_magnet_protocol_registered(&gui_exe);
+        let avail_w = ui.available_width();
+        let scale = theme.font_scale.clamp(0.8, 1.4);
 
-        Frame::new()
-            .fill(to_c32(theme.bg_card))
-            .stroke(Stroke::new(1.0, to_c32(theme.border)))
-            .corner_radius(CornerRadius::same(theme.corner_radius as u8))
-            .inner_margin(Margin::same(14))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    pill(ui, &format!("API Local Ativa: http://127.0.0.1:{port}"), to_c32(theme.success), theme);
+        let card = || {
+            Frame::new()
+                .fill(to_c32(theme.bg_card))
+                .stroke(Stroke::new(1.0, to_c32(theme.border)))
+                .corner_radius(CornerRadius::same(theme.corner_radius as u8))
+                .inner_margin(Margin::symmetric(14, 10))
+        };
+
+        ScrollArea::vertical().show(ui, |ui| {
+            // Card 1: Status geral & instalação rápida em lojas
+            card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let render_status_pills = |ui: &mut Ui| {
+                    pill(
+                        ui,
+                        &format!("API Local: 127.0.0.1:{port}"),
+                        to_c32(theme.success),
+                        theme,
+                    );
                     if portable {
-                        pill(ui, "Modo Portable (dados em ./data)", to_c32(theme.accent), theme);
+                        pill(ui, "Modo Portable (./data)", to_c32(theme.accent), theme);
                     } else {
                         pill(ui, "Modo Instalado", to_c32(theme.text_muted), theme);
                     }
-                    ui.label(
-                        RichText::new("A extensão funciona via API Local e Native Messaging Host (abre o VortexDL automaticamente se estiver fechado).")
-                            .small()
-                            .color(to_c32(theme.text_muted)),
-                    );
-                });
-
-                ui.add_space(10.0);
-                let edge_auto_registered = is_edge_store_extension_registered();
-                let edge_suppressed = is_edge_store_extension_suppressed();
-                let firefox_xpi_path = resolve_firefox_xpi_path(Some(&gui_exe));
-                ui.horizontal_wrapped(|ui| {
-                    if edge_auto_registered && edge_suppressed {
-                        pill(
-                            ui,
-                            "Edge: bloqueio de remoção anterior (clique em Abrir na Edge Add-ons -> Obter)",
-                            to_c32(theme.warning),
-                            theme,
-                        );
-                    } else if edge_auto_registered {
-                        pill(
-                            ui,
-                            &format!("Edge Store Auto-Install Ativo ({EDGE_STORE_EXTENSION_ID})"),
-                            to_c32(theme.success),
-                            theme,
-                        );
+                    if magnet_registered {
+                        pill(ui, "magnet:// associado", to_c32(theme.success), theme);
                     } else {
-                        pill(
-                            ui,
-                            &format!("Edge Store ID: {EDGE_STORE_EXTENSION_ID}"),
-                            to_c32(theme.text_muted),
-                            theme,
-                        );
+                        pill(ui, "magnet:// não associado", to_c32(theme.text_muted), theme);
                     }
-                    if ui.small_button("Abrir na Microsoft Edge Add-ons").clicked() {
-                        match open_edge_store_listing() {
-                            Ok(()) => {
-                                self.ext_reg_status = Some(
-                                    "Página da extensão aberta no Microsoft Edge Add-ons.".to_string(),
-                                );
-                            }
-                            Err(e) => {
-                                self.ext_reg_status = Some(format!("Erro ao abrir Edge Store: {e}"));
-                            }
-                        }
-                    }
-                });
+                };
+                if avail_w >= 760.0 * scale {
+                    egui::Sides::new().shrink_left().truncate().show(
+                        ui,
+                        |ui| {
+                            render_status_pills(ui);
+                        },
+                        |ui| {
+                            ui.label(
+                                RichText::new("Native Messaging abre o VortexDL automaticamente")
+                                    .small()
+                                    .color(to_c32(theme.text_muted)),
+                            );
+                        },
+                    );
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        render_status_pills(ui);
+                    });
+                }
 
                 ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    if firefox_xpi_path.is_some() {
-                        pill(
-                            ui,
-                            &format!("Firefox XPI Assinado Pronto ({FIREFOX_EXTENSION_ID})"),
-                            to_c32(theme.success),
-                            theme,
-                        );
-                    } else {
-                        pill(
-                            ui,
-                            &format!("Firefox ID: {FIREFOX_EXTENSION_ID}"),
-                            to_c32(theme.text_muted),
-                            theme,
-                        );
-                    }
-                    if ui
-                        .add_enabled(
-                            firefox_xpi_path.is_some(),
-                            egui::Button::new("Instalar no Firefox / Zen (.xpi)").small(),
-                        )
-                        .clicked()
-                    {
-                        match open_firefox_xpi_installer(Some(&gui_exe)) {
-                            Ok(path) => {
-                                self.ext_reg_status = Some(format!(
-                                    "Instalador 1-clique aberto ({}). Clique em 'Adicionar' no popup.",
-                                    path.display()
-                                ));
-                            }
-                            Err(e) => {
-                                self.ext_reg_status =
-                                    Some(format!("Erro ao abrir .xpi: {e}"));
-                            }
-                        }
-                    }
-                });
+                ui.separator();
+                ui.add_space(4.0);
 
-                ui.add_space(10.0);
-                ui.label(RichText::new("1. Selecione os navegadores para integrar:").strong());
-                ui.horizontal_wrapped(|ui| {
-                    for kind in BrowserKind::ALL {
-                        let installed = self.detected_browsers.iter().any(|b| b.kind == kind);
-                        let mut checked = self.selected_browsers.contains(&kind);
-                        let label = if installed {
-                            kind.display_name().to_string()
-                        } else {
-                            format!("{} (não detectado)", kind.display_name())
-                        };
-                        if ui.checkbox(&mut checked, label).changed() {
-                            if checked {
-                                self.selected_browsers.insert(kind);
-                            } else {
-                                self.selected_browsers.remove(&kind);
-                            }
-                        }
-                    }
-                    if ui.small_button("Redetectar").clicked() {
-                        self.detected_browsers = detect_installed_browsers();
-                        self.selected_browsers =
-                            self.detected_browsers.iter().map(|b| b.kind).collect();
-                    }
-                });
-
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("ID Fixo da Extensão (Chromium local):");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.chrome_ext_id_input)
-                            .hint_text(DEFAULT_CHROME_EXTENSION_ID)
-                            .desired_width(300.0),
-                    );
-                    if self.chrome_ext_id_input != DEFAULT_CHROME_EXTENSION_ID
-                        && ui.small_button("Restaurar Padrão").clicked()
-                    {
-                        self.chrome_ext_id_input = DEFAULT_CHROME_EXTENSION_ID.to_string();
-                    }
-                });
-
-                ui.add_space(8.0);
-                if let Some(ref dir) = ext_dir {
+                let render_edge_row = |app: &mut Self, ui: &mut Ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Pasta da extensão (para outros navegadores):").strong());
-                        ui.monospace(dir.display().to_string());
-                        if ui.small_button("Copiar caminho").clicked() {
-                            if let Ok(mut cb) = arboard::Clipboard::new() {
-                                if cb.set_text(dir.to_string_lossy().to_string()).is_ok() {
-                                    self.ext_reg_status = Some(format!(
-                                        "Caminho copiado: {}",
-                                        dir.display()
-                                    ));
+                        ui.label(RichText::new("Microsoft Edge").strong());
+                        if edge_auto_registered && edge_suppressed {
+                            pill(
+                                ui,
+                                "Remoção bloqueada — clique em Obter",
+                                to_c32(theme.warning),
+                                theme,
+                            );
+                        } else if edge_auto_registered {
+                            pill(ui, "Store Auto-Install Ativo", to_c32(theme.success), theme)
+                                .on_hover_text(format!("Edge Store ID: {EDGE_STORE_EXTENSION_ID}"));
+                        } else {
+                            pill(
+                                ui,
+                                &format!("Store ID: {EDGE_STORE_EXTENSION_ID}"),
+                                to_c32(theme.text_muted),
+                                theme,
+                            );
+                        }
+                        if ui.small_button("Abrir na Microsoft Edge Add-ons").clicked() {
+                            match open_edge_store_listing() {
+                                Ok(()) => {
+                                    app.ext_reg_status = Some(
+                                        "Página da extensão aberta no Microsoft Edge Add-ons."
+                                            .to_string(),
+                                    );
+                                }
+                                Err(e) => {
+                                    app.ext_reg_status =
+                                        Some(format!("Erro ao abrir Edge Store: {e}"));
                                 }
                             }
                         }
                     });
+                };
+
+                let render_firefox_row = |app: &mut Self, ui: &mut Ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Firefox / Zen").strong());
+                        if firefox_xpi_path.is_some() {
+                            pill(ui, "XPI Assinado Pronto", to_c32(theme.success), theme)
+                                .on_hover_text(format!("Firefox ID: {FIREFOX_EXTENSION_ID}"));
+                        } else {
+                            pill(
+                                ui,
+                                &format!("ID: {FIREFOX_EXTENSION_ID}"),
+                                to_c32(theme.text_muted),
+                                theme,
+                            );
+                        }
+                        if ui
+                            .add_enabled(
+                                firefox_xpi_path.is_some(),
+                                egui::Button::new("Instalar no Firefox / Zen (.xpi)").small(),
+                            )
+                            .clicked()
+                        {
+                            match open_firefox_xpi_installer(Some(&gui_exe)) {
+                                Ok(path) => {
+                                    app.ext_reg_status = Some(format!(
+                                        "Instalador 1-clique aberto ({}). Clique em 'Adicionar' no popup.",
+                                        path.display()
+                                    ));
+                                }
+                                Err(e) => {
+                                    app.ext_reg_status = Some(format!("Erro ao abrir .xpi: {e}"));
+                                }
+                            }
+                        }
+                    });
+                };
+
+                if avail_w >= 860.0 * scale {
+                    ui.columns(2, |cols| {
+                        render_edge_row(self, &mut cols[0]);
+                        render_firefox_row(self, &mut cols[1]);
+                    });
+                } else {
+                    render_edge_row(self, ui);
+                    ui.add_space(4.0);
+                    render_firefox_row(self, ui);
                 }
+            });
+
+            ui.add_space(8.0);
+
+            // Card 2: Seleção de navegadores, configuração e ações
+            card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::Sides::new().shrink_left().truncate().show(
+                    ui,
+                    |ui| {
+                        ui.label(RichText::new("Navegadores para integrar").strong());
+                    },
+                    |ui| {
+                        if ui.small_button("Redetectar").clicked() {
+                            self.detected_browsers = detect_installed_browsers();
+                            self.selected_browsers =
+                                self.detected_browsers.iter().map(|b| b.kind).collect();
+                        }
+                    },
+                );
+                ui.add_space(6.0);
+
+                let grid_cols = if avail_w >= 720.0 * scale { 3 } else { 2 };
+                egui::Grid::new("ext_browsers_grid")
+                    .num_columns(grid_cols)
+                    .spacing([18.0, 4.0])
+                    .show(ui, |ui| {
+                        for (idx, kind) in BrowserKind::ALL.iter().copied().enumerate() {
+                            let installed =
+                                self.detected_browsers.iter().any(|b| b.kind == kind);
+                            let mut checked = self.selected_browsers.contains(&kind);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                if ui.checkbox(&mut checked, kind.display_name()).changed() {
+                                    if checked {
+                                        self.selected_browsers.insert(kind);
+                                    } else {
+                                        self.selected_browsers.remove(&kind);
+                                    }
+                                }
+                                if !installed {
+                                    ui.label(
+                                        RichText::new("(não detectado)")
+                                            .small()
+                                            .color(to_c32(theme.text_muted)),
+                                    );
+                                }
+                            });
+                            if (idx + 1) % grid_cols == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                egui::Grid::new("ext_config_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("ID Fixo (Chromium local):")
+                                .color(to_c32(theme.text_muted)),
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.chrome_ext_id_input)
+                                    .hint_text(DEFAULT_CHROME_EXTENSION_ID)
+                                    .desired_width(280.0),
+                            );
+                            if self.chrome_ext_id_input != DEFAULT_CHROME_EXTENSION_ID
+                                && ui.small_button("Restaurar Padrão").clicked()
+                            {
+                                self.chrome_ext_id_input =
+                                    DEFAULT_CHROME_EXTENSION_ID.to_string();
+                            }
+                        });
+                        ui.end_row();
+
+                        if let Some(ref dir) = ext_dir {
+                            let dir_str = dir.display().to_string();
+                            ui.label(
+                                RichText::new("Pasta da extensão:")
+                                    .color(to_c32(theme.text_muted)),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&dir_str).monospace().small(),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&dir_str);
+                                if ui.small_button("Copiar caminho").clicked() {
+                                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                                        if cb.set_text(dir_str.clone()).is_ok() {
+                                            self.ext_reg_status =
+                                                Some(format!("Caminho copiado: {dir_str}"));
+                                        }
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
 
                 ui.add_space(8.0);
-                let magnet_registered = is_magnet_protocol_registered(&gui_exe);
                 let chosen_browsers: Vec<BrowserKind> = BrowserKind::ALL
                     .into_iter()
                     .filter(|k| self.selected_browsers.contains(k))
@@ -3357,7 +3513,8 @@ impl VortexApp {
                                 Some(&chosen_browsers),
                             ) {
                                 Ok(browsers) => {
-                                    let includes_edge = chosen_browsers.contains(&BrowserKind::Edge);
+                                    let includes_edge =
+                                        chosen_browsers.contains(&BrowserKind::Edge);
                                     let includes_firefox =
                                         chosen_browsers.contains(&BrowserKind::Firefox);
                                     let firefox_has_xpi =
@@ -3367,14 +3524,16 @@ impl VortexApp {
                                         .copied()
                                         .filter(|k| {
                                             *k != BrowserKind::Edge
-                                                && !(*k == BrowserKind::Firefox && firefox_has_xpi)
+                                                && !(*k == BrowserKind::Firefox
+                                                    && firefox_has_xpi)
                                         })
                                         .collect();
 
                                     if !manual_browsers.is_empty() {
                                         if let Some(ref dir) = ext_dir {
                                             if let Ok(mut cb) = arboard::Clipboard::new() {
-                                                let _ = cb.set_text(dir.to_string_lossy().to_string());
+                                                let _ = cb
+                                                    .set_text(dir.to_string_lossy().to_string());
                                             }
                                         }
                                     }
@@ -3421,7 +3580,8 @@ impl VortexApp {
                                     self.ext_reg_status = Some(parts.join(" • "));
                                 }
                                 Err(e) => {
-                                    self.ext_reg_status = Some(format!("Erro ao registrar: {e}"));
+                                    self.ext_reg_status =
+                                        Some(format!("Erro ao registrar: {e}"));
                                 }
                             }
                         }
@@ -3465,29 +3625,56 @@ impl VortexApp {
                                 ));
                             }
                             Err(e) => {
-                                self.ext_reg_status = Some(format!("Erro ao associar magnet://: {e}"));
+                                self.ext_reg_status =
+                                    Some(format!("Erro ao associar magnet://: {e}"));
                             }
                         }
                     }
-
-                    if magnet_registered {
-                        pill(ui, "magnet:// associado", to_c32(theme.success), theme);
-                    } else {
-                        pill(ui, "magnet:// não associado", to_c32(theme.text_muted), theme);
-                    }
                 });
+
                 if let Some(ref st) = self.ext_reg_status {
                     ui.add_space(6.0);
                     ui.label(RichText::new(st).small().color(to_c32(theme.accent)));
                 }
-
-                ui.add_space(12.0);
-                ui.separator();
-                ui.label(RichText::new("Como funciona a instalação em cada navegador:").strong());
-                ui.label("• Microsoft Edge (Automático via Edge Add-ons Store): o Setup e o botão 'Integrar Selecionados' registram a extensão da loja automaticamente — sem Modo do Desenvolvedor. Basta reiniciar o Edge (ou clicar em 'Abrir na Microsoft Edge Add-ons').");
-                ui.label("• Mozilla Firefox (1 clique via .xpi assinado pela Mozilla): o VortexDL abre o pacote assinado vortexdl-firefox.xpi direto no Firefox para aparecer o popup nativo 'Adicionar' — sem about:debugging.");
-                ui.label("• Chrome / Brave / Vivaldi / Opera (sem loja): ao clicar em 'Integrar Selecionados', o caminho da pasta extension/ vai copiado para a área de transferência; ative o 'Modo do desenvolvedor', clique em 'Carregar sem compactação' e pressione Ctrl+V.");
             });
+
+            ui.add_space(8.0);
+
+            // Card 3: Guia compacto por navegador
+            card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("Como funciona a instalação em cada navegador").strong());
+                ui.add_space(4.0);
+                egui::Grid::new("ext_guide_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Microsoft Edge").strong().small().color(to_c32(theme.accent)));
+                        ui.label(
+                            RichText::new("Automático via Edge Add-ons Store (sem Modo do Desenvolvedor). Basta reiniciar o Edge ou clicar em 'Abrir na Microsoft Edge Add-ons'.")
+                                .small()
+                                .color(to_c32(theme.text_muted)),
+                        );
+                        ui.end_row();
+
+                        ui.label(RichText::new("Firefox / Zen").strong().small().color(to_c32(theme.accent)));
+                        ui.label(
+                            RichText::new("1 clique via pacote assinado vortexdl-firefox.xpi — aparece o popup nativo 'Adicionar', sem about:debugging.")
+                                .small()
+                                .color(to_c32(theme.text_muted)),
+                        );
+                        ui.end_row();
+
+                        ui.label(RichText::new("Chrome / Brave / Vivaldi / Opera").strong().small().color(to_c32(theme.accent)));
+                        ui.label(
+                            RichText::new("Ao clicar em 'Integrar Selecionados', o caminho de extension/ vai copiado; ative 'Modo do desenvolvedor', clique em 'Carregar sem compactação' e cole (Ctrl+V).")
+                                .small()
+                                .color(to_c32(theme.text_muted)),
+                        );
+                        ui.end_row();
+                    });
+            });
+        });
     }
 
     fn render_themes_view(&mut self, ui: &mut Ui, theme: &ThemeConfig) {
@@ -5123,8 +5310,8 @@ fn pill_with_size(
     response
 }
 
-fn pill(ui: &mut Ui, text: &str, color: Color32, _theme: &ThemeConfig) {
-    pill_with_size(ui, text, color, egui::vec2(6.0, 2.0), 0.0, 6);
+fn pill(ui: &mut Ui, text: &str, color: Color32, _theme: &ThemeConfig) -> egui::Response {
+    pill_with_size(ui, text, color, egui::vec2(6.0, 2.0), 0.0, 6)
 }
 
 fn ui_button_height(ui: &Ui) -> f32 {
@@ -5691,6 +5878,131 @@ mod tests {
         assert!(ok_urls.is_empty());
         assert!(!ok_waiting);
     }
+
+    #[test]
+    fn sort_items_for_display_keeps_higher_priority_unfinished_items_on_top() {
+        let now = chrono::Utc::now();
+        let mk = |name: &str, status: DownloadStatus, priority: i32| DownloadItem {
+            id: Uuid::new_v4(),
+            package_id: None,
+            part_index: None,
+            part_total: None,
+            kind: DownloadKind::Http,
+            status,
+            url: format!("https://example.com/{name}"),
+            filename: name.into(),
+            save_dir: PathBuf::from("."),
+            file_path: PathBuf::from(name),
+            category: FileCategory::Other,
+            total_bytes: None,
+            downloaded_bytes: 0,
+            uploaded_bytes: 0,
+            speed_bps: 0,
+            upload_speed_bps: 0,
+            eta_seconds: None,
+            connections: 1,
+            supports_ranges: true,
+            segments: Vec::new(),
+            etag: None,
+            last_modified: None,
+            headers: HashMap::new(),
+            checksum_expected: None,
+            checksum_verified: None,
+            media_info: None,
+            torrent_info: None,
+            auto_extract: false,
+            extractor_override: None,
+            extract_password: None,
+            extracted_to: None,
+            extraction_status: None,
+            extraction_progress: None,
+            created_at: now,
+            completed_at: None,
+            error: None,
+            priority,
+        };
+
+        let a_done_high = mk("done.zip", DownloadStatus::Completed, 2);
+        let b_low = mk("low.zip", DownloadStatus::Queued, -1);
+        let c_normal = mk("normal.zip", DownloadStatus::Downloading, 0);
+        let d_high = mk("high.zip", DownloadStatus::Queued, 2);
+
+        let mut refs = vec![&a_done_high, &b_low, &c_normal, &d_high];
+        sort_items_for_display(&mut refs);
+        let names: Vec<&str> = refs.iter().map(|i| i.filename.as_str()).collect();
+        assert_eq!(names, vec!["high.zip", "done.zip", "normal.zip", "low.zip"]);
+    }
+}
+
+fn sort_items_for_display(items: &mut [&DownloadItem]) {
+    items.sort_by_key(|d| {
+        let effective = if d.status.is_finished() { 0 } else { d.priority };
+        std::cmp::Reverse(effective)
+    });
+}
+
+fn priority_arrow_button(
+    ui: &mut Ui,
+    up: bool,
+    enabled: bool,
+    tooltip: &str,
+    theme: &ThemeConfig,
+) -> bool {
+    let size = Vec2::new(22.0, 21.0);
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    if ui.is_rect_visible(rect) {
+        let bg = if !enabled {
+            to_c32(theme.bg_secondary).gamma_multiply(0.55)
+        } else if response.is_pointer_button_down_on() {
+            to_c32(theme.accent).gamma_multiply(0.32)
+        } else if response.hovered() {
+            to_c32(theme.bg_secondary)
+        } else {
+            to_c32(theme.bg_primary)
+        };
+        let border = if enabled && response.hovered() {
+            to_c32(theme.accent)
+        } else {
+            to_c32(theme.border)
+        };
+        let painter = ui.painter();
+        painter.rect(
+            rect,
+            CornerRadius::same(4),
+            bg,
+            Stroke::new(1.0, border),
+            egui::StrokeKind::Inside,
+        );
+
+        let fg = if !enabled {
+            to_c32(theme.text_muted).gamma_multiply(0.45)
+        } else if response.hovered() {
+            to_c32(theme.accent)
+        } else {
+            to_c32(theme.text_primary)
+        };
+        let c = rect.center();
+        let dx = 4.0;
+        let dy = 3.0;
+        let pts = if up {
+            vec![
+                egui::pos2(c.x, c.y - dy),
+                egui::pos2(c.x + dx, c.y + dy),
+                egui::pos2(c.x - dx, c.y + dy),
+            ]
+        } else {
+            vec![
+                egui::pos2(c.x - dx, c.y - dy),
+                egui::pos2(c.x + dx, c.y - dy),
+                egui::pos2(c.x, c.y + dy),
+            ]
+        };
+        painter.add(egui::Shape::convex_polygon(pts, fg, Stroke::NONE));
+    }
+    let clicked = enabled && response.clicked();
+    response.on_hover_text(tooltip);
+    clicked
 }
 
 struct DomainGrabbedGroup<'a> {

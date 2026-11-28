@@ -7,6 +7,9 @@ use uuid::Uuid;
 pub type DownloadId = Uuid;
 pub type PackageId = Uuid;
 
+pub const MIN_DOWNLOAD_PRIORITY: i32 = -2;
+pub const MAX_DOWNLOAD_PRIORITY: i32 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DownloadKind {
     Http,
@@ -223,9 +226,21 @@ pub struct DownloadItem {
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub priority: i32,
 }
 
 impl DownloadItem {
+    pub fn priority_label(&self) -> &'static str {
+        match self.priority {
+            p if p >= 2 => "Máxima",
+            1 => "Alta",
+            0 => "Normal",
+            -1 => "Baixa",
+            _ => "Mínima",
+        }
+    }
+
     pub fn progress_fraction(&self) -> f32 {
         match self.total_bytes {
             Some(total) if total > 0 => (self.downloaded_bytes as f64 / total as f64).clamp(0.0, 1.0) as f32,

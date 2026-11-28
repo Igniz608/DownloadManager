@@ -243,6 +243,118 @@ where
 }
 
 #[cfg(windows)]
+fn build_windows_update_script(
+    pid: u32,
+    exe_dir: &Path,
+    asset_path: &Path,
+    update_dir: &Path,
+    src_root: Option<&Path>,
+) -> String {
+    if let Some(src_root) = src_root {
+        format!(
+            r#"$ErrorActionPreference = 'SilentlyContinue'
+$pidToWait = {pid}
+$targetDir = {target_dir}
+$srcRoot = {src_root}
+$updateDir = {update_dir}
+$logFile = Join-Path $env:TEMP 'VortexDL-Update.log'
+function Write-Log([string]$msg) {{
+    try {{ Add-Content -LiteralPath $logFile -Value ("$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg") -Encoding UTF8 }} catch {{}}
+}}
+Set-Content -LiteralPath $logFile -Value ("$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Starting portable update (pid=$pidToWait, target=$targetDir)") -Encoding UTF8
+for ($i = 0; $i -lt 30; $i++) {{
+    if (-not (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)) {{ break }}
+    Start-Sleep -Milliseconds 300
+}}
+if (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) {{
+    Write-Log "Force stopping pid $pidToWait"
+    Stop-Process -Id $pidToWait -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 400
+}}
+Get-Process | Where-Object {{ $_.Path -and $_.Path.StartsWith($targetDir, [System.StringComparison]::OrdinalIgnoreCase) }} | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 300
+Get-ChildItem -LiteralPath $srcRoot -Force | ForEach-Object {{
+    if ($_.Name -ieq 'data' -or $_.Name -ieq 'portable.flag') {{ return }}
+    $dest = Join-Path $targetDir $_.Name
+    if ($_.PSIsContainer) {{
+        Copy-Item -LiteralPath $_.FullName -Destination $dest -Recurse -Force
+    }} else {{
+        Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
+    }}
+}}
+$gui = Join-Path $targetDir 'vortex-gui.exe'
+if (Test-Path $gui) {{
+    Write-Log "Relaunching $gui"
+    Start-Process -FilePath $gui -WorkingDirectory $targetDir
+}} else {{
+    Write-Log "GUI binary missing after copy: $gui"
+}}
+Start-Sleep -Seconds 2
+Remove-Item -LiteralPath $updateDir -Recurse -Force -ErrorAction SilentlyContinue
+Write-Log "Portable update finished"
+"#,
+            pid = pid,
+            target_dir = ps_single_quote(&exe_dir.to_string_lossy()),
+            src_root = ps_single_quote(&src_root.to_string_lossy()),
+            update_dir = ps_single_quote(&update_dir.to_string_lossy()),
+        )
+    } else {
+        format!(
+            r#"$ErrorActionPreference = 'SilentlyContinue'
+$pidToWait = {pid}
+$targetDir = {target_dir}
+$setupExe = {setup_exe}
+$updateDir = {update_dir}
+$logFile = Join-Path $env:TEMP 'VortexDL-Update.log'
+$setupLog = Join-Path $updateDir 'setup.log'
+function Write-Log([string]$msg) {{
+    try {{ Add-Content -LiteralPath $logFile -Value ("$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg") -Encoding UTF8 }} catch {{}}
+}}
+Set-Content -LiteralPath $logFile -Value ("$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Starting setup update (pid=$pidToWait, target=$targetDir, setup=$setupExe)") -Encoding UTF8
+for ($i = 0; $i -lt 30; $i++) {{
+    if (-not (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)) {{ break }}
+    Start-Sleep -Milliseconds 300
+}}
+if (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) {{
+    Write-Log "Force stopping pid $pidToWait"
+    Stop-Process -Id $pidToWait -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 400
+}}
+Get-Process | Where-Object {{ $_.Path -and $_.Path.StartsWith($targetDir, [System.StringComparison]::OrdinalIgnoreCase) }} | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 300
+$dirArg = '/DIR=' + '"' + $targetDir + '"'
+$logArg = '/LOG=' + '"' + $setupLog + '"'
+Write-Log "Launching Inno Setup"
+$proc = Start-Process -FilePath $setupExe -ArgumentList @('/SP-', '/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CLOSEAPPLICATIONS', $dirArg, $logArg) -Wait -PassThru
+$exitCode = if ($proc) {{ $proc.ExitCode }} else {{ -1 }}
+Write-Log "Setup finished with exitCode=$exitCode"
+$gui = Join-Path $targetDir 'vortex-gui.exe'
+if (Test-Path $gui) {{
+    Write-Log "Relaunching $gui"
+    Start-Process -FilePath $gui -WorkingDirectory $targetDir
+}} else {{
+    Write-Log "GUI binary missing after setup: $gui"
+}}
+Start-Sleep -Seconds 2
+if ($exitCode -eq 0) {{
+    Remove-Item -LiteralPath $updateDir -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Log "Cleaned up $updateDir"
+}} else {{
+    Write-Log "Preserving $updateDir for troubleshooting (exitCode=$exitCode)"
+}}
+"#,
+            pid = pid,
+            target_dir = ps_single_quote(&exe_dir.to_string_lossy()),
+            setup_exe = ps_single_quote(&asset_path.to_string_lossy()),
+            update_dir = ps_single_quote(&update_dir.to_string_lossy()),
+        )
+    }
+}
+
+#[cfg(windows)]
+const WINDOWS_UPDATER_CREATION_FLAGS: u32 = 0x0800_0000 | 0x0000_0200; // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+
+#[cfg(windows)]
 async fn launch_windows_updater(
     update_dir: &Path,
     asset_path: &Path,
@@ -256,7 +368,7 @@ async fn launch_windows_updater(
     let pid = std::process::id();
     let script_path = update_dir.join("apply_update.ps1");
 
-    let script = if is_zip {
+    let src_root = if is_zip {
         let extract_dir = update_dir.join("extracted");
         tokio::fs::create_dir_all(&extract_dir).await?;
         let tar_bin = crate::extractor::find_windows_tar().unwrap_or_else(|| "tar.exe".to_string());
@@ -278,83 +390,21 @@ async fn launch_windows_updater(
             ));
         }
 
-        let src_root = find_extracted_app_root(&extract_dir)
-            .ok_or_else(|| anyhow!("vortex-gui.exe não encontrado dentro do pacote ZIP"))?;
-
-        format!(
-            r#"$ErrorActionPreference = 'SilentlyContinue'
-$pidToWait = {pid}
-$targetDir = {target_dir}
-$srcRoot = {src_root}
-$updateDir = {update_dir}
-for ($i = 0; $i -lt 30; $i++) {{
-    if (-not (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)) {{ break }}
-    Start-Sleep -Milliseconds 300
-}}
-if (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) {{
-    Stop-Process -Id $pidToWait -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 400
-}}
-Get-Process | Where-Object {{ $_.Path -and $_.Path.StartsWith($targetDir, [System.StringComparison]::OrdinalIgnoreCase) }} | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 300
-Get-ChildItem -LiteralPath $srcRoot -Force | ForEach-Object {{
-    if ($_.Name -ieq 'data' -or $_.Name -ieq 'portable.flag') {{ return }}
-    $dest = Join-Path $targetDir $_.Name
-    if ($_.PSIsContainer) {{
-        Copy-Item -LiteralPath $_.FullName -Destination $dest -Recurse -Force
-    }} else {{
-        Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
-    }}
-}}
-$gui = Join-Path $targetDir 'vortex-gui.exe'
-if (Test-Path $gui) {{
-    Start-Process -FilePath $gui -WorkingDirectory $targetDir
-}}
-Start-Sleep -Seconds 2
-Remove-Item -LiteralPath $updateDir -Recurse -Force -ErrorAction SilentlyContinue
-"#,
-            pid = pid,
-            target_dir = ps_single_quote(&exe_dir.to_string_lossy()),
-            src_root = ps_single_quote(&src_root.to_string_lossy()),
-            update_dir = ps_single_quote(&update_dir.to_string_lossy()),
+        Some(
+            find_extracted_app_root(&extract_dir)
+                .ok_or_else(|| anyhow!("vortex-gui.exe não encontrado dentro do pacote ZIP"))?,
         )
     } else {
-        format!(
-            r#"$ErrorActionPreference = 'SilentlyContinue'
-$pidToWait = {pid}
-$targetDir = {target_dir}
-$setupExe = {setup_exe}
-$updateDir = {update_dir}
-for ($i = 0; $i -lt 30; $i++) {{
-    if (-not (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)) {{ break }}
-    Start-Sleep -Milliseconds 300
-}}
-if (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) {{
-    Stop-Process -Id $pidToWait -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 400
-}}
-Get-Process | Where-Object {{ $_.Path -and $_.Path.StartsWith($targetDir, [System.StringComparison]::OrdinalIgnoreCase) }} | Stop-Process -Force -ErrorAction SilentlyContinue
-$dirArg = '/DIR=' + '"' + $targetDir + '"'
-$proc = Start-Process -FilePath $setupExe -ArgumentList @('/SP-', '/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CLOSEAPPLICATIONS', $dirArg) -Wait -PassThru
-$gui = Join-Path $targetDir 'vortex-gui.exe'
-if (Test-Path $gui) {{
-    Start-Process -FilePath $gui -WorkingDirectory $targetDir
-}}
-Start-Sleep -Seconds 2
-Remove-Item -LiteralPath $updateDir -Recurse -Force -ErrorAction SilentlyContinue
-"#,
-            pid = pid,
-            target_dir = ps_single_quote(&exe_dir.to_string_lossy()),
-            setup_exe = ps_single_quote(&asset_path.to_string_lossy()),
-            update_dir = ps_single_quote(&update_dir.to_string_lossy()),
-        )
+        None
     };
+
+    let script =
+        build_windows_update_script(pid, &exe_dir, asset_path, update_dir, src_root.as_deref());
 
     tokio::fs::write(&script_path, script).await?;
 
     use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    const DETACHED_PROCESS: u32 = 0x00000008;
+    use std::process::Stdio;
     std::process::Command::new("powershell.exe")
         .args([
             "-NoProfile",
@@ -366,7 +416,11 @@ Remove-Item -LiteralPath $updateDir -Recurse -Force -ErrorAction SilentlyContinu
             "-File",
             &script_path.to_string_lossy(),
         ])
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(WINDOWS_UPDATER_CREATION_FLAGS)
         .spawn()
         .context("Falha ao iniciar processo de atualização")?;
 
@@ -442,5 +496,40 @@ mod tests {
             portable.as_ref().map(|a| a.name.as_str()),
             Some("VortexDL-Portable-v0.1.1-win64.zip")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_updater_uses_valid_creation_flags_and_scripts() {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+        assert_eq!(
+            WINDOWS_UPDATER_CREATION_FLAGS,
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        );
+        assert_eq!(WINDOWS_UPDATER_CREATION_FLAGS & DETACHED_PROCESS, 0);
+
+        let setup_script = build_windows_update_script(
+            4242,
+            Path::new(r"D:\Program Files\Vortex's App"),
+            Path::new(r"D:\Temp\VortexDL-Update\VortexDL-Setup.exe"),
+            Path::new(r"D:\Temp\VortexDL-Update"),
+            None,
+        );
+        assert!(setup_script.contains("D:\\Program Files\\Vortex''s App"));
+        assert!(setup_script.contains("Start-Process -FilePath $setupExe"));
+        assert!(setup_script.contains("VortexDL-Update.log"));
+
+        let portable_script = build_windows_update_script(
+            4242,
+            Path::new(r"D:\Portable\VortexDL"),
+            Path::new(r"D:\Temp\VortexDL-Update\VortexDL-Portable.zip"),
+            Path::new(r"D:\Temp\VortexDL-Update"),
+            Some(Path::new(r"D:\Temp\VortexDL-Update\extracted")),
+        );
+        assert!(portable_script.contains("Copy-Item -LiteralPath $_.FullName"));
+        assert!(portable_script.contains("portable.flag"));
     }
 }
